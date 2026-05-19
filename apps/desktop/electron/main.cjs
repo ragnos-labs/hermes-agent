@@ -35,7 +35,7 @@ const {
 let nodePty = null
 
 try {
-  nodePty = require('@homebridge/node-pty-prebuilt-multiarch')
+  nodePty = require('node-pty')
 } catch {
   // Packaged builds set `files:` in package.json, which excludes node_modules
   // from the asar.  Workspace dedup also hoists this native dep to the repo
@@ -49,7 +49,7 @@ try {
     const resourcesPath = process.resourcesPath
     if (resourcesPath) {
       nodePty = require(
-        path.join(resourcesPath, 'native-deps', '@homebridge', 'node-pty-prebuilt-multiarch')
+        path.join(resourcesPath, 'native-deps', 'node-pty')
       )
     }
   } catch {

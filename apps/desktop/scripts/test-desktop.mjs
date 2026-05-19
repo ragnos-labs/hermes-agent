@@ -84,16 +84,16 @@ function exists(target) {
 }
 
 // Match nodepty native binding location to what main.cjs's resolver fallback
-// expects (apps/desktop/electron/main.cjs, packaged-build branch).
+// expects (apps/desktop/electron/main.cjs, packaged-build branch).  Upstream
+// node-pty 1.x is N-API based and ships per-arch prebuilts under
+// prebuilds/<platform>-<arch>/ instead of build/Release/.  We check the
+// per-arch dir since that's what stage-native-deps actually copies.
 function expectedNativeDepPaths() {
-  const root = path.join(APP.resourcesPath, 'native-deps', '@homebridge', 'node-pty-prebuilt-multiarch')
-  const releaseDir = path.join(root, 'build', 'Release')
-  // Just check the package.json exists; the actual .node binary names vary
-  // (pty.node + conpty.node on Windows; pty.node on Unix), so we let the
-  // existence-of-the-directory + a non-empty list be enough.
+  const root = path.join(APP.resourcesPath, 'native-deps', 'node-pty')
+  const prebuildsDir = path.join(root, 'prebuilds', `${PLATFORM}-${ARCH}`)
   return {
     packageJson: path.join(root, 'package.json'),
-    releaseDir,
+    prebuildsDir,
     libIndex: path.join(root, 'lib', 'index.js')
   }
 }
@@ -325,12 +325,20 @@ function validateBundle() {
   if (!exists(native.libIndex)) {
     die(`Missing node-pty lib/index.js in resources/native-deps: ${native.libIndex}`)
   }
-  if (!exists(native.releaseDir)) {
-    die(`Missing node-pty build/Release directory: ${native.releaseDir}`)
+  if (!exists(native.prebuildsDir)) {
+    die(`Missing node-pty prebuilds dir for ${PLATFORM}-${ARCH}: ${native.prebuildsDir}`)
   }
-  const nodeBinaries = fs.readdirSync(native.releaseDir).filter(name => name.endsWith('.node'))
+  const nodeBinaries = fs.readdirSync(native.prebuildsDir).filter(name => name.endsWith('.node'))
   if (nodeBinaries.length === 0) {
-    die(`No .node native binaries found in: ${native.releaseDir}`)
+    die(`No .node native binaries found in: ${native.prebuildsDir}`)
+  }
+  // Darwin requires a runtime-execed spawn-helper alongside pty.node; missing
+  // it manifests as "ENOENT: spawn-helper" on first pty.spawn() call.
+  if (PLATFORM === 'darwin') {
+    const spawnHelper = path.join(native.prebuildsDir, 'spawn-helper')
+    if (!exists(spawnHelper)) {
+      die(`Missing node-pty spawn-helper (required on darwin): ${spawnHelper}`)
+    }
   }
 
   // Renderer payload check (either unpacked or in the asar)
