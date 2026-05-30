@@ -517,11 +517,17 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, messageText, on
     <div className="relative flex w-full shrink-0 justify-end">
       <ActionBarPrimitive.Root
         className={cn(
+          // NOTE: intentionally NOT `hideWhenRunning`. That prop unmounts the
+          // bar while the thread streams, which collapses every completed
+          // assistant message's footer by this bar's height and shifts the
+          // whole conversation when the turn resolves. The bar is already
+          // invisible by default (opacity-0 + pointer-events-none, reveals on
+          // hover), so keeping it mounted reserves stable layout height with
+          // no visual change during streaming.
           'relative flex flex-row items-center justify-end gap-2 py-1.5 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
           menuOpen && 'pointer-events-auto opacity-100 [&_button]:opacity-100'
         )}
         data-slot="aui_msg-actions"
-        hideWhenRunning
       >
         <CopyButton appearance="icon" buttonSize="icon" disabled={!messageText} label="Copy" text={messageText} />
         <ActionBarPrimitive.Reload asChild>

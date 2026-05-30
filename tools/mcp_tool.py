@@ -1654,10 +1654,10 @@ class MCPServerTask:
                 self.name,
             )
 
-        # Validate remote URL once, up front. Raising here (rather than
+        # Validate remote URL once, up front.  Raising here (rather than
         # letting it blow up inside the SDK's httpx layer on every retry)
         # means a typo in config.yaml fails fast with a clear error — and
-        # critically, no reconnect-backoff burn. (Ported from
+        # critically, no reconnect-backoff burn.  (Ported from
         # anomalyco/opencode#25019.)
         if self._is_http():
             try:
