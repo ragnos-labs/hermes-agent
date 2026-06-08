@@ -199,6 +199,49 @@ describe('session store — subagents (Phase 5e agents dashboard)', () => {
   })
 })
 
+describe('session store — session chrome / status bar (item 14)', () => {
+  test('session.info populates model/effort/cwd/branch and nested usage context', () => {
+    const store = createSessionStore()
+    store.apply({
+      type: 'session.info',
+      payload: {
+        model: 'anthropic/claude-opus-4-8',
+        reasoning_effort: 'high',
+        fast: true,
+        cwd: '/home/x/proj',
+        branch: 'main',
+        running: false,
+        usage: { context_used: 42000, context_max: 200000, context_percent: 21 }
+      }
+    })
+    const info = store.state.info
+    expect(info.model).toBe('anthropic/claude-opus-4-8')
+    expect(info.effort).toBe('high')
+    expect(info.fast).toBe(true)
+    expect(info.cwd).toBe('/home/x/proj')
+    expect(info.branch).toBe('main')
+    expect(info.contextPercent).toBe(21)
+    expect(info.contextMax).toBe(200000)
+  })
+
+  test('message.start sets running, message.complete clears it + refreshes usage', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    expect(store.state.info.running).toBe(true)
+    store.apply({ type: 'message.delta', payload: { text: 'hi' } })
+    store.apply({ type: 'message.complete', payload: { usage: { context_percent: 33 } } })
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.info.contextPercent).toBe(33)
+  })
+
+  test('applyInfo merges a session.create info patch without clobbering prior fields', () => {
+    const store = createSessionStore()
+    store.applyInfo({ model: 'gpt-5.4', cwd: '/tmp' })
+    store.applyInfo({ branch: 'dev' }) // partial patch — model/cwd must survive
+    expect(store.state.info).toMatchObject({ model: 'gpt-5.4', cwd: '/tmp', branch: 'dev' })
+  })
+})
+
 describe('session store — resume hydrate (Phase 4b)', () => {
   test('beginBuffer + commitSnapshot replaces history then replays events buffered across the resume', () => {
     const store = createSessionStore()

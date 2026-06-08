@@ -58,7 +58,9 @@ const MessageDelta = Schema.Struct({
 const MessageComplete = Schema.Struct({
   type: Schema.Literal('message.complete'),
   session_id: opt(Str),
-  payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str) }))
+  // `usage` carries the post-turn token/context totals → refreshes the status bar
+  // (item 14). Kept loose (Record) — the chrome reader narrows what it needs.
+  payload: opt(Schema.Struct({ text: opt(Str), rendered: opt(Str), usage: opt(Schema.Record(Str, Schema.Unknown)) }))
 })
 
 // reasoning / thinking — toTaggedUnion needs ONE literal per member, so the

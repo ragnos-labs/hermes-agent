@@ -100,7 +100,7 @@ describe('App render (Phase 1, themed)', () => {
           <App store={store} />
         </ThemeProvider>
       ),
-      { until: 'Approval required', width: 72, height: 18 }
+      { until: 'Approval required', width: 72, height: 24 }
     )
 
     expect(frame).toContain('Approval required')
@@ -175,6 +175,34 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).toContain('/compact') // candidate
     expect(frame).toContain('compress context') // its meta
     expect(frame).toContain('Tab complete') // dropdown hint
+  })
+
+  test('the status bar renders model · context% · cwd (item 14)', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({
+      type: 'session.info',
+      payload: {
+        model: 'anthropic/claude-opus-4-8',
+        cwd: '/tmp/proj',
+        branch: 'main',
+        usage: { context_percent: 42 }
+      }
+    })
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'claude-opus', width: 72, height: 18 }
+    )
+
+    expect(frame).toContain('claude-opus-4-8') // model (provider prefix trimmed)
+    expect(frame).toContain('42%') // context usage percent
+    expect(frame).toContain('/tmp/proj') // cwd
+    expect(frame).toContain('main') // branch
   })
 
   test('the agents dashboard renders the subagent tree and replaces the transcript', async () => {

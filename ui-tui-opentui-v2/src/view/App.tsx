@@ -23,7 +23,9 @@ import { Pager } from './overlays/pager.tsx'
 import { Picker } from './overlays/picker.tsx'
 import { SessionSwitcher } from './overlays/sessionSwitcher.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
+import { StatusBar } from './statusBar.tsx'
 import { StatusLine } from './statusLine.tsx'
+import { useTheme } from './theme.tsx'
 import { Transcript } from './transcript.tsx'
 
 export interface AppProps {
@@ -41,6 +43,7 @@ const NOOP_RESUME = () => {}
 const NO_SESSION = () => undefined
 
 export function App(props: AppProps) {
+  const theme = useTheme()
   const blocked = () => props.store.state.prompt !== undefined
   const pager = () => props.store.state.pager
   const dashboard = () => props.store.state.dashboard
@@ -65,41 +68,51 @@ export function App(props: AppProps) {
         fallback={
           <>
             <Transcript store={props.store} />
+            {/* transient busy face floats at the bottom of the transcript area */}
             <StatusLine store={props.store} />
-            <Switch
-              fallback={
-                <Composer
-                  onSubmit={props.onSubmit ?? NOOP}
-                  onType={props.onType}
-                  completions={() => props.store.state.completions ?? []}
-                  onDismiss={() => props.store.clearCompletions()}
-                />
-              }
+            {/* input region — a top-edge rule separates the status bar + textbox from the
+                transcript above; the status bar sits directly ABOVE the composer (item 14). */}
+            <box
+              border={['top']}
+              borderColor={theme().color.border}
+              style={{ flexShrink: 0, flexDirection: 'column' }}
             >
-              <Match when={blocked()}>
-                <PromptOverlay
-                  store={props.store}
-                  onRespond={props.onRespond ?? NOOP_RESPOND}
-                  sessionId={props.sessionId ?? NO_SESSION}
-                />
-              </Match>
-              <Match when={switcher()}>
-                {sessions => <SessionSwitcher sessions={sessions()} onPick={resume} onClose={closeSwitcher} />}
-              </Match>
-              <Match when={picker()}>
-                {p => (
-                  <Picker
-                    title={p().title}
-                    items={p().items}
-                    onPick={value => {
-                      p().onPick(value)
-                      closePicker()
-                    }}
-                    onClose={closePicker}
+              <StatusBar store={props.store} />
+              <Switch
+                fallback={
+                  <Composer
+                    onSubmit={props.onSubmit ?? NOOP}
+                    onType={props.onType}
+                    completions={() => props.store.state.completions ?? []}
+                    onDismiss={() => props.store.clearCompletions()}
                   />
-                )}
-              </Match>
-            </Switch>
+                }
+              >
+                <Match when={blocked()}>
+                  <PromptOverlay
+                    store={props.store}
+                    onRespond={props.onRespond ?? NOOP_RESPOND}
+                    sessionId={props.sessionId ?? NO_SESSION}
+                  />
+                </Match>
+                <Match when={switcher()}>
+                  {sessions => <SessionSwitcher sessions={sessions()} onPick={resume} onClose={closeSwitcher} />}
+                </Match>
+                <Match when={picker()}>
+                  {p => (
+                    <Picker
+                      title={p().title}
+                      items={p().items}
+                      onPick={value => {
+                        p().onPick(value)
+                        closePicker()
+                      }}
+                      onClose={closePicker}
+                    />
+                  )}
+                </Match>
+              </Switch>
+            </box>
           </>
         }
       >

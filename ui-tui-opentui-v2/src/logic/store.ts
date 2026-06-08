@@ -105,6 +105,26 @@ export interface SubagentInfo {
   lastTool?: string
 }
 
+/**
+ * Live session chrome (the status bar — item 14). Sourced from the `session.info`
+ * event (and the `session.create`/`resume` result's `info`), refreshed whenever
+ * the gateway's agent/config state changes. `running` is the turn-active flag the
+ * Ctrl-C interrupt (item 11) reads; we also flip it locally on message.start/
+ * complete so the bar reacts instantly even if a `session.info` lags.
+ */
+export interface SessionInfo {
+  model?: string
+  effort?: string
+  fast?: boolean
+  cwd?: string
+  branch?: string
+  running?: boolean
+  contextUsed?: number
+  contextMax?: number
+  contextPercent?: number
+  compressions?: number
+}
+
 export interface StoreState {
   ready: boolean
   messages: Message[]
@@ -126,6 +146,8 @@ export interface StoreState {
   /** Transient busy indicator (the kaomoji face/verb from `thinking.delta`/`status.update`);
    *  shown above the composer WHILE a turn runs, cleared on `message.complete`. NOT transcript. */
   status: string | undefined
+  /** Live session chrome for the status bar (model/effort/cwd/branch/context/running). */
+  info: SessionInfo
 }
 
 const LRU_LIMIT = 1000
@@ -140,6 +162,51 @@ function readStr(payload: { readonly [k: string]: unknown }, key: string): strin
 function readNum(payload: { readonly [k: string]: unknown }, key: string): number {
   const v = payload[key]
   return typeof v === 'number' ? v : 0
+}
+
+/** Read an optional number (undefined when absent) — distinguishes "0" from "missing". */
+function readOptNum(payload: { readonly [k: string]: unknown }, key: string): number | undefined {
+  const v = payload[key]
+  return typeof v === 'number' ? v : undefined
+}
+
+/** Read a boolean field (undefined when absent). */
+function readOptBool(payload: { readonly [k: string]: unknown }, key: string): boolean | undefined {
+  const v = payload[key]
+  return typeof v === 'boolean' ? v : undefined
+}
+
+/**
+ * Fold a `session.info` / `session.create.info` / `session.usage` payload into a
+ * partial SessionInfo, reading context/usage fields from either a nested `usage`
+ * object or the top level (the gateway shapes vary by RPC vs event — §gateway map).
+ */
+function readInfoPatch(payload: { readonly [k: string]: unknown }): Partial<SessionInfo> {
+  const usageRaw = payload['usage']
+  const usage: { readonly [k: string]: unknown } =
+    usageRaw && typeof usageRaw === 'object' ? (usageRaw as { readonly [k: string]: unknown }) : {}
+  const patch: Partial<SessionInfo> = {}
+  const model = readStr(payload, 'model')
+  if (model) patch.model = model
+  const effort = readStr(payload, 'reasoning_effort')
+  if (effort) patch.effort = effort
+  const fast = readOptBool(payload, 'fast')
+  if (fast !== undefined) patch.fast = fast
+  const cwd = readStr(payload, 'cwd')
+  if (cwd) patch.cwd = cwd
+  const branch = readStr(payload, 'branch')
+  if (branch) patch.branch = branch
+  const running = readOptBool(payload, 'running')
+  if (running !== undefined) patch.running = running
+  const used = readOptNum(usage, 'context_used') ?? readOptNum(payload, 'context_used')
+  if (used !== undefined) patch.contextUsed = used
+  const max = readOptNum(usage, 'context_max') ?? readOptNum(payload, 'context_max')
+  if (max !== undefined) patch.contextMax = max
+  const pct = readOptNum(usage, 'context_percent') ?? readOptNum(payload, 'context_percent')
+  if (pct !== undefined) patch.contextPercent = pct
+  const comp = readOptNum(usage, 'compressions') ?? readOptNum(payload, 'compressions')
+  if (comp !== undefined) patch.compressions = comp
+  return patch
 }
 
 /** The subagent status implied by an event type (an explicit payload `status` wins). */
@@ -163,7 +230,8 @@ export function createSessionStore() {
     completions: undefined,
     subagents: [],
     dashboard: false,
-    status: undefined
+    status: undefined,
+    info: {}
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -296,6 +364,12 @@ export function createSessionStore() {
     setState('picker', undefined)
   }
 
+  /** Merge a session-info patch into the chrome state (status bar — item 14). */
+  function applyInfo(raw: { readonly [k: string]: unknown }): void {
+    const patch = readInfoPatch(raw)
+    if (Object.keys(patch).length) setState('info', prev => ({ ...prev, ...patch }))
+  }
+
   /** Set / clear the live slash-completion candidates (composer dropdown). */
   function setCompletions(items: CompletionItem[]) {
     setState('completions', items.length ? items : undefined)
@@ -322,8 +396,12 @@ export function createSessionStore() {
       case 'skin.changed':
         setSkin(event.payload)
         break
+      case 'session.info':
+        applyInfo(event.payload)
+        break
       case 'message.start':
         setState('status', undefined)
+        setState('info', prev => ({ ...prev, running: true }))
         setState(
           produce(draft => {
             draft.messages.push({ role: 'assistant', text: '', parts: [], streaming: true })
@@ -355,6 +433,9 @@ export function createSessionStore() {
           })
         )
         setState('status', undefined)
+        setState('info', prev => ({ ...prev, running: false }))
+        // message.complete carries the latest usage/context — refresh the bar.
+        if (event.payload) applyInfo(event.payload)
         break
       // thinking.delta / status.update are the TRANSIENT busy indicator (kaomoji
       // face/verb) — route them to the status line, NOT the transcript (gotcha: Ink
@@ -516,6 +597,7 @@ export function createSessionStore() {
     closePicker,
     setCompletions,
     clearCompletions,
+    applyInfo,
     openDashboard,
     closeDashboard,
     hydrate,

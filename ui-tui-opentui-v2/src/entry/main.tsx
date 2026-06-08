@@ -60,10 +60,14 @@ const resumeInto = (gateway: GatewayServiceShape, store: SessionStore, sid: stri
   Effect.gen(function* () {
     store.beginBuffer()
     const t0 = Date.now()
-    const resumed = yield* gateway.request<{ messages?: unknown }>('session.resume', { cols, session_id: sid })
+    const resumed = yield* gateway.request<{ messages?: unknown; info?: Record<string, unknown> }>('session.resume', {
+      cols,
+      session_id: sid
+    })
     const t1 = Date.now()
     const snapshot = mapResumeHistory(resumed?.messages)
     store.commitSnapshot(snapshot)
+    if (resumed?.info) store.applyInfo(resumed.info)
     getLog().info('bootstrap', 'session resumed', {
       count: snapshot.length,
       hydrate_ms: Date.now() - t1,
@@ -106,12 +110,16 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
       }
       yield* resumeInto(gateway, store, sid, input.cols)
     } else {
-      const created = yield* gateway.request<{ session_id?: string }>('session.create', { cols: input.cols })
+      const created = yield* gateway.request<{ session_id?: string; info?: Record<string, unknown> }>(
+        'session.create',
+        { cols: input.cols }
+      )
       sid = created?.session_id ?? gateway.sessionId()
       if (!sid) {
         log.warn('bootstrap', 'session.create returned no session_id')
         return
       }
+      if (created?.info) store.applyInfo(created.info)
       log.info('bootstrap', 'session created', { sid })
     }
 
