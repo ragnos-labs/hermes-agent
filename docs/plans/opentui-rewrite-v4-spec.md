@@ -564,6 +564,13 @@ two gates run every phase.
   `internalBlockMode="top-level"` deferred paint headlessly) + a theme-derived `SyntaxStyle.fromStyles`
   (`view/markdown.tsx`). Live: a markdown reply renders with `**` concealed (smoke P2b). **Phase 2 is
   complete** — smoke steps 1–4 run live.
-- **Next — Phase 3 — blocking prompts** 🔴 (deadlock-critical): clarify / approval / sudo / secret /
-  confirm overlays + the `*.respond` RPCs + Esc/Ctrl+C cancel paths (gate the global Ctrl+C-quit on
-  `!blocked`). Makes real interactive sessions usable. Then Phase 4 (slash system + session lifecycle).
+- **Phase 3 — blocking prompts: ✅** (this commit) 🔴 deadlock-critical. The 4 gateway `*.request`
+  events drive an overlay that REPLACES the composer (`store.state.prompt`), answered via the matching
+  `*.respond` RPC; Esc/Ctrl+C → deny/empty; global Ctrl+C-quit gated on `!blocked` (`renderer.ts`).
+  Native paradigm (glitch's steer): native `<select>` for approval/clarify choices + native `<input>`
+  for clarify free-text + a masked `useKeyboard` buffer for sudo/secret (native `<input>` has no mask).
+  Live-verified end to end: approval → approve/deny/Ctrl+C-cancel all UNBLOCK the agent, no deadlock
+  (smoke P3). `confirm` is local (non-gateway) — lands with the slash commands that trigger it (P4).
+- **Next — Phase 4 — session lifecycle + slash system:** create/resume (incl. resumed tool rows
+  `{name,context}`) + the slash-command SYSTEM (`commands.catalog` RPC + the dispatch ladder +
+  the 13 TUI-only client commands) + the local `confirm` dialog for `/new`,`/clear`.

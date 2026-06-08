@@ -83,10 +83,14 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
 export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
   yield* Effect.scoped(
     Effect.gen(function* () {
-      const { renderer, shutdown } = yield* acquireRenderer({ mouse: input.mouse })
-
       // Solid side: the store + reducer. Created here, lives in Solid-land.
       const store = createSessionStore()
+
+      // A blocking prompt owns Ctrl+C (→ cancel) — suppress the global quit while one is up.
+      const { renderer, shutdown } = yield* acquireRenderer({
+        mouse: input.mouse,
+        isBlocked: () => store.state.prompt !== undefined
+      })
 
       // Contact point #2: boundary pushes decoded events into the Solid store.
       const gateway = yield* GatewayService
@@ -111,6 +115,20 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         )
       }
 
+      // Blocking-prompt replies (clarify/approval/sudo/secret `*.respond`). Same
+      // detached-runFork pattern; failures logged, never thrown into the view.
+      const respond = (method: string, params: Record<string, unknown>) => {
+        Effect.runFork(
+          gateway
+            .request(method, params)
+            .pipe(
+              Effect.catchCause(cause =>
+                Effect.sync(() => getLog().warn('respond', 'failed', { cause: String(cause), method }))
+              )
+            )
+        )
+      }
+
       // Live backend: drive a session (create + optional initial prompt) concurrently.
       if (!input.fake) yield* Effect.forkScoped(bootstrapSession(gateway, store, input))
 
@@ -120,7 +138,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         render(
           () => (
             <ThemeProvider theme={() => store.state.theme}>
-              <App store={store} onSubmit={submit} />
+              <App store={store} onSubmit={submit} onRespond={respond} sessionId={() => gateway.sessionId()} />
             </ThemeProvider>
           ),
           renderer

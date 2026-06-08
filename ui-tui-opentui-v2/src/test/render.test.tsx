@@ -82,4 +82,25 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).toContain('alpha.txt') // envelope-stripped output, block-rendered
     expect(frame).not.toContain('exit_code') // the {output,exit_code} envelope is stripped
   })
+
+  test('an approval prompt replaces the composer (blocked) and renders the options', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'approval.request', payload: { command: 'rm -rf /tmp/x', description: 'Delete temp dir' } })
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'Approval required', width: 72, height: 18 }
+    )
+
+    expect(frame).toContain('Approval required')
+    expect(frame).toContain('rm -rf /tmp/x') // the command under review
+    expect(frame).toContain('Approve once') // native <select> option
+    expect(frame).toContain('Deny')
+    expect(frame).not.toContain('Type your message') // composer is hidden while blocked
+  })
 })

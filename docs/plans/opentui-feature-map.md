@@ -74,8 +74,22 @@ A row is ✅ only when it has a test (Layer 1–4) AND a smoke-doc check. The ju
 | Frame helper settles async markdown (`flush` + `waitForFrame`/`until`) | — | `test/cli/tui/*` | `test/lib/render.ts` | ✅ | (all frame tests) |
 
 **Phase 2 complete** — smoke steps 1–4 run live (launch → type/submit → streamed markdown reply →
-inline tool render). _Later phases (blocking prompts, slash/session, overlays/pickers, chrome, agent
-features) are added as each lands — the §1–§4 Ink inventory below is the per-phase source._
+inline tool render).
+
+### Phase 3 — blocking prompts 🔴 (deadlock-critical)
+Native paradigm (glitch's steer): native `<select>` (approval/clarify choices) + native `<input>`
+(clarify free-text) + masked-buffer via `useKeyboard` (sudo/secret — `<input>` has no native mask).
+Composer↔overlay swap on `store.state.prompt`; global Ctrl+C-quit gated on `!blocked`.
+| Concern | Ink ref | opencode ref | v2 build | Status | Test · smoke |
+|---|---|---|---|---|---|
+| Prompt state + composer↔overlay swap; Ctrl+C-quit gated on `!blocked` | `overlayStore.ts`, `appLayout.tsx:273` | `permission.tsx` | `logic/store.ts`, `view/App.tsx`, `boundary/renderer.ts` | ✅ | `store.test.ts` + `render.test.tsx` · smoke P3 |
+| `approval.request` → `<select>` (once/session/always/deny) → `approval.respond {choice, session_id}`; Esc/Ctrl+C→deny | `cgeh.ts:722` | `permission.tsx` | `view/prompts/approvalPrompt.tsx` | ✅ | `render.test.tsx` · **smoke P3 (live: approve + deny + Ctrl+C-cancel, no deadlock)** |
+| `clarify.request` → `<select>` choices + "✎ Other…"→`<input>` free-text → `clarify.respond {answer, request_id}`; Esc→empty | `cgeh.ts:2225` | — | `view/prompts/clarifyPrompt.tsx` | ✅ | `store.test.ts` · smoke P3 (shared infra) |
+| `sudo.request`/`secret.request` → masked buffer → `sudo/secret.respond {password/value, request_id}`; Esc/Ctrl+C→'' | `cgeh.ts` | — | `view/prompts/maskedPrompt.tsx` | ✅ | `store.test.ts` · smoke P3 (shared infra) |
+| `confirm` (local, non-gateway Y/N) | `prompts.tsx` ConfirmPrompt | — | (Phase 4 — triggered by `/new`,`/clear`) | ❌ | — |
+
+_Later phases (slash/session lifecycle, overlays/pickers, chrome, agent features) are added as each
+lands — the §1–§4 Ink inventory below is the per-phase source._
 
 ---
 

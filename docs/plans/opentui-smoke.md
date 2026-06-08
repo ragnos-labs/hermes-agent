@@ -207,8 +207,41 @@ settles — also makes it headless-capturable). Completes smoke step 3 (markdown
 **Phase 2 is complete** (2a shell + 2b-i ordered parts/tool render + 2b-ii markdown). Smoke steps
 1–4 run live; step 5+ (modals/overlays), step 6 (blocking prompts), step 7 (resume) are later phases.
 
-### Phase 3 — blocking prompts
-_(append: step 6 — all 4 prompts + confirm + cancel paths; verify no deadlock)_
+### Phase 3 — blocking prompts (🔴 deadlock-critical)
+
+The 4 gateway `*.request` events now drive a blocking-prompt overlay that REPLACES the composer
+(`store.state.prompt` → App `<Show>` swap), answered via the matching `*.respond` RPC; Esc/Ctrl+C
+sends deny/empty so the agent unblocks. The global Ctrl+C-quit is gated on `!blocked`
+(`renderer.ts` `isBlocked`). Native paradigm (per glitch's steer): native `<select>` for
+approval/clarify choices, native `<input>` for clarify free-text, masked-buffer (`useKeyboard`) for
+sudo/secret (native `<input>` has no mask). Adds smoke step 6.
+
+- *Run log (2026-06-08, PASS):*
+  - Headless gate `bun run check` → **green** (28 tests / 5 files). New: store reducer tests (all 4
+    `*.request` set `store.state.prompt`; `clearPrompt` clears; clarify null-choices→free-text) + a
+    frame test (approval overlay renders the command + all 4 options as a bordered modal AND the
+    composer placeholder is GONE while blocked).
+  - **Live tmux (real TTY):** `Use your terminal tool to run: rm -rf /tmp/hermes-approval-probe` →
+    the gateway emitted `approval.request` and the overlay rendered inline below the running
+    `⚡terminal` row:
+    ```
+     ┌─ ⚠ Approval required ───────────────────────────────────────┐
+     │ rm -rf /tmp/hermes-approval-probe                           │
+     │ delete in root path                                         │
+     │  ▶ Approve once  / Approve for session / Always / Deny      │
+     │ ↑↓ select · Enter confirm · Esc/Ctrl+C deny                 │
+     └─────────────────────────────────────────────────────────────┘
+    ```
+    - **Approve once (Enter):** agent UNBLOCKED — command ran (exit 0), prompt cleared, composer
+      returned, assistant continued.
+    - **Deny (Esc):** agent UNBLOCKED — tool result `[error] BLOCKED: Command denied by user`, then
+      the assistant continued. No deadlock.
+    - **Ctrl+C WHILE BLOCKED:** process stayed ALIVE (did NOT quit — `isBlocked` gate) and the prompt
+      cancelled (→ deny) + composer returned. **Ctrl+C when NOT blocked:** clean quit, child reaped,
+      no orphan.
+  - Coverage note: approval was the live-driven representative; clarify/sudo/secret share the
+    identical overlay-swap + `useKeyboard` cancel + `*.respond` wiring (reducer + render tested).
+    `confirm` is local (non-gateway) and lands with the slash commands that trigger it (Phase 4).
 
 ### Phase 4 — session lifecycle + slash system
 _(append: step 7 resume; slash dispatch + the 13 TUI-only commands)_

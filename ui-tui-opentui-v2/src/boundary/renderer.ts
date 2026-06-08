@@ -17,6 +17,8 @@ import { RendererError } from './errors.ts'
 export interface RendererOptions {
   /** Mouse tracking on/off (from decoded display config). */
   readonly mouse: boolean
+  /** When true, a blocking prompt owns Ctrl+C (cancel) — the global quit is suppressed (gotcha §8 #6). */
+  readonly isBlocked?: () => boolean
 }
 
 /**
@@ -47,13 +49,15 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
     Deferred.doneUnsafe(shutdown, Effect.void)
   })
 
-  // Minimal global quit (Phase 1). `exitOnCtrlC:false` hands Ctrl+C to us as a key
-  // event (not SIGINT), so destroying here fires 'destroy' → resolves `shutdown` →
-  // the entry scope closes → finalizers run: renderer teardown + the gateway layer's
-  // `client.stop()` EOFs the Python child's stdin so it exits (no orphan). Prompts
-  // gate this on `!blocked` once they own Ctrl+C (Phase 3, gotcha §8 #6).
+  // Global quit on Ctrl+C. `exitOnCtrlC:false` hands Ctrl+C to us as a key event
+  // (not SIGINT), so destroying here fires 'destroy' → resolves `shutdown` → the
+  // entry scope closes → finalizers run: renderer teardown + the gateway layer's
+  // `client.stop()` EOFs the Python child's stdin so it exits (no orphan). When a
+  // blocking prompt is up, it owns Ctrl+C (→ deny/cancel) so we suppress the quit
+  // (gotcha §8 #6) — the prompt's own handler sends the cancel reply.
+  const isBlocked = options.isBlocked ?? (() => false)
   renderer.keyInput.on('keypress', (key: KeyEvent) => {
-    if (key.ctrl && key.name === 'c' && !renderer.isDestroyed) renderer.destroy()
+    if (key.ctrl && key.name === 'c' && !isBlocked() && !renderer.isDestroyed) renderer.destroy()
   })
 
   return { renderer, shutdown } as const

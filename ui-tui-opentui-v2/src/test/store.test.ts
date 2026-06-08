@@ -119,3 +119,37 @@ describe('session store — ordered parts (Phase 2b)', () => {
     expect(parts[0]).toMatchObject({ type: 'reasoning', text: 'thinking hard' })
   })
 })
+
+describe('session store — blocking prompts (Phase 3)', () => {
+  test('approval.request sets an approval prompt; clearPrompt clears it', () => {
+    const store = createSessionStore()
+    expect(store.state.prompt).toBeUndefined()
+    store.apply({ type: 'approval.request', payload: { command: 'rm -rf /tmp/x', description: 'delete temp' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'approval', command: 'rm -rf /tmp/x', description: 'delete temp' })
+    store.clearPrompt()
+    expect(store.state.prompt).toBeUndefined()
+  })
+
+  test('clarify.request carries question + choices + request_id', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Which?', choices: ['a', 'b'], request_id: 'r1' } })
+    const p = store.state.prompt
+    expect(p).toMatchObject({ kind: 'clarify', question: 'Which?', requestId: 'r1' })
+    if (p?.kind === 'clarify') expect(p.choices).toEqual(['a', 'b'])
+  })
+
+  test('clarify.request with null choices → free-text only', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'clarify.request', payload: { question: 'Name?', choices: null, request_id: 'r2' } })
+    const p = store.state.prompt
+    if (p?.kind === 'clarify') expect(p.choices).toBeNull()
+  })
+
+  test('sudo.request + secret.request set masked prompts', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'sudo.request', payload: { request_id: 's1' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'sudo', requestId: 's1' })
+    store.apply({ type: 'secret.request', payload: { env_var: 'API_KEY', prompt: 'Enter key', request_id: 's2' } })
+    expect(store.state.prompt).toMatchObject({ kind: 'secret', envVar: 'API_KEY', requestId: 's2' })
+  })
+})

@@ -46,10 +46,22 @@ export interface Message {
   streaming?: boolean
 }
 
+/**
+ * A BLOCKING interactive request from the agent (spec §8 #6 — unhandled = deadlock).
+ * Each is answered via the matching `*.respond` RPC; Esc/Ctrl+C sends deny/empty.
+ */
+export type ActivePrompt =
+  | { kind: 'clarify'; question: string; choices: string[] | null; requestId: string }
+  | { kind: 'approval'; command: string; description: string }
+  | { kind: 'sudo'; requestId: string }
+  | { kind: 'secret'; envVar: string; prompt: string; requestId: string }
+
 export interface StoreState {
   ready: boolean
   messages: Message[]
   theme: Theme
+  /** The active blocking prompt (composer is hidden while set); undefined when none. */
+  prompt: ActivePrompt | undefined
 }
 
 const LRU_LIMIT = 1000
@@ -64,7 +76,8 @@ export function createSessionStore() {
   const [state, setState] = createStore<StoreState>({
     ready: false,
     messages: [],
-    theme: DEFAULT_THEME
+    theme: DEFAULT_THEME,
+    prompt: undefined
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -238,9 +251,38 @@ export function createSessionStore() {
         )
         break
       }
-      // Other event types (prompts, chrome, subagents) are reduced in later phases;
+      // ── blocking prompts (spec §8 #6 — unhandled = the agent deadlocks) ──
+      case 'clarify.request':
+        setState('prompt', {
+          kind: 'clarify',
+          question: event.payload.question ?? '',
+          // decoded choices are readonly — copy to the store's mutable string[]
+          choices: event.payload.choices ? [...event.payload.choices] : null,
+          requestId: event.payload.request_id
+        })
+        break
+      case 'approval.request':
+        setState('prompt', { kind: 'approval', command: event.payload.command, description: event.payload.description })
+        break
+      case 'sudo.request':
+        setState('prompt', { kind: 'sudo', requestId: event.payload.request_id })
+        break
+      case 'secret.request':
+        setState('prompt', {
+          kind: 'secret',
+          envVar: event.payload.env_var,
+          prompt: event.payload.prompt,
+          requestId: event.payload.request_id
+        })
+        break
+      // Other event types (chrome, subagents) are reduced in later phases;
       // unhandled members are intentionally ignored here.
     }
+  }
+
+  /** Clear the active blocking prompt (after it's answered/cancelled). */
+  function clearPrompt(): void {
+    setState('prompt', undefined)
   }
 
   /**
@@ -257,7 +299,7 @@ export function createSessionStore() {
     for (const event of pending) applyNow(event)
   }
 
-  return { state, apply, pushUser, hydrate, duplicate } as const
+  return { state, apply, pushUser, hydrate, duplicate, clearPrompt } as const
 }
 
 export type SessionStore = ReturnType<typeof createSessionStore>
