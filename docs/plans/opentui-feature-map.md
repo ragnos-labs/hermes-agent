@@ -12,6 +12,48 @@ all remaining phases. Compiled 2026-06-08 from 3 parallel file:line-grounded rec
 
 Legend: ✅ done in OpenTUI · ⚠️ partial · ❌ missing · 🔴 blocking (unhandled = agent deadlock).
 
+> **Two builds — read this.** §0–§4 below are the original backlog for the **React** build
+> `ui-tui-opentui/` (now SUPERSEDED, reference-only). The ground-up **Solid + Effect-at-boundary**
+> rewrite `ui-tui-opentui-v2/` (spec `opentui-rewrite-v4-spec.md`) **starts from zero** — the React
+> ✅s do NOT transfer. Its progress is tracked in the **v4 parity matrix** immediately below; §1–§4
+> remain the authoritative Ink-side feature inventory each v4 phase ports from.
+
+---
+
+## v4 PARITY MATRIX — `ui-tui-opentui-v2` (Solid + Effect-at-boundary)
+
+3-way: **Ink** (source of truth) ↔ **opencode** (method ref) ↔ **v2 build** (status + new file:line).
+A row is ✅ only when it has a test (Layer 1–4) AND a smoke-doc check. The judge scores against this.
+
+### Phase 0 — scaffold (foundation; commit `a47c6df`)
+| Concern | opencode ref | v2 build | Status | Test · smoke |
+|---|---|---|---|---|
+| Effect runtime + `acquireRelease(createCliRenderer)` + one `render()` bridge | `app.tsx:177` | `boundary/renderer.ts`, `boundary/runtime.ts`, `entry/main.tsx` | ✅ | `render.test.tsx` · smoke P0 |
+| FakeGateway layer (injectable transport seam) | `test/fixture/tui-sdk.ts` | `entry/fakeGateway.ts` | ✅ | `gateway.test.ts` · — |
+| Headless frame gate (`captureCharFrame`) | `test/cli/tui/*.test.tsx` | `test/lib/render.ts` | ✅ | `render.test.tsx` · smoke P0 |
+| `testEffect`/`testLayer` (ManagedRuntime + TestClock, no `@effect/vitest`) | executor | `test/lib/effect.ts` | ✅ | used by `gateway.test.ts` |
+
+### Phase 1 — transport + store + theming (this phase)
+| Concern | Ink ref | opencode ref | v2 build | Status | Test · smoke |
+|---|---|---|---|---|---|
+| Live transport: spawn `tui_gateway`, JSON-RPC stdio framing, async-result map, exit→reject-all | `gatewayClient.ts` | `context/sdk.tsx` | `boundary/gateway/{client,liveGateway,python}.ts` | ✅ | `liveGateway.smoke.ts` (live) + `gateway.test.ts` · smoke P1 |
+| Principled python resolution (HERMES_PYTHON/PYTHON → $VIRTUAL_ENV → `<root>/.venv`→`venv` → bare) | `gatewayClient.ts:45` | — | `boundary/gateway/python.ts` | ✅ | (mirrors Ink 1:1) |
+| `GatewayEvent` Schema: decode-unknown ONCE, skip-unknown/malformed (`Option.none`), ~35 members | `gatewayTypes.ts:509` | `context/sdk.tsx` | `boundary/schema/GatewayEvent.ts` | ✅ | `schema.test.ts` · — |
+| 16ms event coalescing → Solid `batch()` (one repaint per burst) | — | `sdk.tsx:54` | `boundary/gateway/liveGateway.ts` | ✅ | (live smoke) |
+| Store reducer: streaming text concat (`message.start/delta/complete`, prefer `text`) | `cgeh.ts` | `context/sync-v2.tsx` | `logic/store.ts` | ✅ | `store.test.ts` + `render.test.tsx` · smoke P1 (`⚕ pong`) |
+| Lifecycle `gateway.ready` → ready flag | `cgeh.ts` | `sync-v2.tsx` | `logic/store.ts` | ✅ | smoke P1 (header `ready`) |
+| LRU id-dedup + hydrate-while-buffering (resume scaffold) | — | `sync-v2.tsx` | `logic/store.ts` | ✅ | `store.test.ts` |
+| Theming/skins: `fromSkin` + light/dark + ANSI-256 norm, 1:1 Ink port; `ThemeProvider`; NO hardcoded styles | `theme.ts`, `gatewayTypes.ts` | `context/theme.tsx` | `logic/theme.ts`, `view/theme.tsx`, `view/App.tsx` | ✅ | `store.test.ts` + `render.test.tsx` (re-skin) · — |
+| `gateway.ready{skin}` / `skin.changed` → reactive re-theme | `cgeh.ts` | `theme.tsx` | `logic/store.ts` | ✅ | `store.test.ts` |
+| Ctrl+C graceful quit + no-orphan child (renderer destroy → finalizers → `client.stop()`) | — | `app.tsx` | `boundary/renderer.ts` | ✅ | smoke P1 (PID teardown) |
+| Initial-prompt bootstrap (`session.create`→`prompt.submit`; Phase-2 composer stand-in) | `useSessionLifecycle.ts`, `useSubmission.ts` | — | `entry/main.tsx` | ✅ | smoke P1 |
+| Typed errors at the boundary (`RendererError`/`GatewayError`/`PythonResolutionError`) | — | — | `boundary/errors.ts` | ✅ | (compile + `gateway.test.ts`) |
+| Diagnostics log (ring + NDJSON file; console-safe) | — | `util/log.ts` | `boundary/log.ts` | ✅ | (live smoke tail) |
+
+_Phase 2+ rows (transcript scrollbox, ordered parts/tool render, markdown, composer, header/chrome,
+prompts, overlays/pickers, agent features) are added as each phase lands — the §1–§4 Ink inventory
+below is the per-phase source._
+
 ---
 
 ## 0. Current OpenTUI engine state (what exists today)

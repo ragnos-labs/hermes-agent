@@ -43,6 +43,7 @@ lineage) and the `ui-tui-opentui/` React build (reference-only; nothing carried 
 | `@opentui/*` versions | `core`+`keymap`+`solid` aligned (opencode pins 0.3.2) | lockstep |
 | `@effect/*` | all lockstep with `effect@beta` | effect-ts skill rule |
 | Design language | **our Ink TUI (for now)**; converge on opencode's good taste where clearly better | glitch's call — Ink-led look/layout/UX, opencode for METHOD/structure |
+| Theming | **fully skinnable — NO hardcoded styles**; mirror Ink's skin→Theme contract so existing skins work unchanged | glitch's call (2026-06-08) |
 | Branch | build on `feat/opentui-native-engine` (React pkg coexists, nuke at cutover) | glitch's call |
 | New package dir | `ui-tui-opentui-v2/` during build → rename at Phase 8 cutover | glitch's call |
 | Keymap | adopt `@opentui/keymap` host (mirror opencode) | glitch's call |
@@ -271,9 +272,12 @@ v3 "ignored cosmetic/deferred" set).
 
 The contract (from Ink `ui-tui/src/gatewayClient.ts`):
 - Spawn `python -m tui_gateway.entry` (`gatewayClient.ts:338`) with a **principled python
-  resolution**: `HERMES_PYTHON`/`PYTHON` env → worktree `.venv/bin/python(3)` → `venv` →
-  `~/.hermes/hermes-agent/venv` (`resolvePython`, `gatewayClient.ts:45-58`). **Never "probe any
-  python".** `HERMES_PYTHON_SRC_ROOT` pins the source root (`gatewayClient.ts:502`).
+  resolution** that mirrors Ink's `resolvePython` (`gatewayClient.ts:45-64`) **1:1**:
+  `HERMES_PYTHON`/`PYTHON` env → `$VIRTUAL_ENV/bin/python` (or `Scripts/python.exe`) →
+  `<root>/.venv/bin/python(3)` → `<root>/venv/bin/python(3)` → bare `python3` (`python` on win32).
+  **Never "probe any python".** `HERMES_PYTHON_SRC_ROOT` pins the source root. (Implemented in
+  `boundary/gateway/python.ts`; the earlier draft's `~/.hermes/hermes-agent/venv` step is NOT in Ink
+  and was dropped to keep the engines identical — add it later only if Ink gains it.)
 - JSON-RPC over the child's stdio (newline-delimited frames); `request(method, params)` returns a
   promise resolved by id; an `'event'` stream pushes `GatewayEvent`s.
 - Lifecycle: `new → start() → on('event') → drain`; reconnect with backoff (the Ink client buffers
@@ -393,10 +397,48 @@ a parser**. Reasoning bodies via `<code filetype="markdown" streaming>` (dimmer)
 
 ---
 
+## 7.5. Theming / skins (fully skinnable — NO hardcoded styles)
+
+**Requirement (glitch, 2026-06-08): the UI must be skinnable and honor EXISTING Hermes skins.** No
+hardcoded colors/styles in components. The Phase-0 `App.tsx` hexes (`#8BD5CA`, …) are placeholders
+to be removed the moment the theme layer lands (Phase 1).
+
+**Contract to mirror (authoritative = Ink `ui-tui/src/theme.ts` + `ui-tui/src/gatewayTypes.ts`):**
+- The gateway already emits the skin: `gateway.ready` carries `payload.skin?: GatewaySkin`, and
+  `skin.changed` carries a `GatewaySkin` payload. `GatewaySkin = { colors?: Record<string,string>,
+  branding?: Record<string,string>, banner_hero?, banner_logo?, help_header?, tool_prefix? }`.
+- Ink maps a skin → a `Theme` via `fromSkin(colors, branding, bannerLogo, bannerHero, toolPrefix,
+  helpHeader)`. `Theme = { color: ThemeColors (35 keys), brand: ThemeBrand (7 keys), bannerLogo,
+  bannerHero }`. The skin `colors` use keys like `ui_primary`, `ui_accent`, `banner_title`,
+  `banner_accent`, `ui_text`, `ui_border`, `ui_ok`/`ui_error`/`ui_warn`, `completion_menu_*`,
+  `selection_bg`, `shell_dollar`, `prompt`, `session_label/border`, `banner_dim` — each with a
+  documented fallback chain onto `DEFAULT_THEME`. Light/dark auto-detect (`detectLightMode` via
+  `HERMES_TUI_LIGHT`/`THEME`/`BACKGROUND`/`COLORFGBG`/`TERM_PROGRAM`) + an Apple-Terminal ANSI-256
+  normalization pass.
+
+**v4 implementation (pure scratch, idiomatic Solid — mirror opencode `context/theme.tsx`):**
+- **PORT `theme.ts` into the package** (`logic/theme.ts`) — it's pure TS, zero Ink dependency, so
+  re-author 1:1: `Theme`/`ThemeColors`/`ThemeBrand` types, `DARK_THEME`/`LIGHT_THEME`,
+  `detectLightMode`, the ANSI normalization, and `fromSkin`. This guarantees **existing skins work
+  unchanged** because the mapping is identical.
+- **Expose via a Solid `ThemeProvider` context** (`view/theme.tsx`) holding the current `Theme` as a
+  signal/store. The default is `DEFAULT_THEME`; on `gateway.ready{skin}` / `skin.changed` the
+  reducer calls `fromSkin(...)` and updates the theme signal → the whole view re-styles reactively
+  (fine-grained Solid repaint).
+- **Components read `theme.color.*` / `theme.brand.*` ONLY** — never literals. A lint guard
+  (custom rule or a grep gate in `check.sh`) forbids raw hex in `view/**` to keep it honest.
+- For the native `<markdown>`/`<code>` renderables, build the `SyntaxStyle.fromStyles({...})` from
+  `theme.color.*` too (one memoized per theme), so fenced-code highlighting tracks the skin.
+
+This is folded into **Phase 1** (theme module + provider + skin events wired) so no further view
+code accretes hardcoded styles; Phase 2's transcript/markdown consume it.
+
+---
+
 ## 8. Carry-forward render gotchas (verified in the React polish pass — re-apply in Solid)
 
 1. **Rich text** = `<b>`/`<i>`/`<span>` children, never `attributes={{bold:true}}` (it's a
-   `TextAttributes` BITMASK).
+   `TextAttributes` BITMASK). Inline color is `<span style={{ fg }}>`; `<text>` takes `fg` directly.
 2. **scrollbox:** `minHeight:0` on the scroll wrapper AND the scrollbox; do **NOT** set
    `flexDirection` on the `<scrollbox>` ROOT (internal viewport/content children — setting it there
    breaks content-height measurement → phantom scroll offset, clips the top, leaves a gap). Use
@@ -493,5 +535,21 @@ two gates run every phase.
 
 ---
 
-## 13. Immediate next step (AFTER review)
-Phase 0 scaffold (§11). No deep implementation until this spec + `opentui-smoke.md` are reviewed.
+## 13. Build status
+
+- **Phase 0 — scaffold: ✅** (commit `a47c6df`). Effect runtime + `acquireRelease(createCliRenderer)`
+  + the one `render()` bridge + `FakeGateway.layer` + headless frame gate; spec + `opentui-smoke.md`
+  reviewed by glitch (see §12).
+- **Phase 1 — transport + store + theming: ✅** (this commit). `GatewayService`/`liveGateway` over
+  the real `tui_gateway` (JSON-RPC stdio, 16ms→`batch()` coalesce, typed errors, decode-once
+  `GatewayEvent` Schema); the Solid `sync-v2`-style store (streaming concat + skin→theme + LRU dedup
+  + hydrate-while-buffering); the 1:1 `theme.ts` port + `ThemeProvider` (no hardcoded styles). Live
+  drive + headless gate logged in `opentui-smoke.md` (P1). The v4 parity matrix in
+  `opentui-feature-map.md` tracks each ✅ row (test + smoke). **Two items pulled forward from later
+  phases:** (a) a minimal **Ctrl+C graceful quit** (`boundary/renderer.ts`) so the live engine reaps
+  its own gateway child — the full keymap host + `!blocked` gating still land with prompts (Phase 3);
+  (b) an **initial-prompt bootstrap** (`HERMES_TUI_PROMPT` → `session.create`→`prompt.submit`) as the
+  Phase-2-composer stand-in so a streamed reply can be driven live now.
+- **Next — Phase 2 — core transcript:** `<scrollbox>` (§8 gotchas), ordered-parts `messageLine`
+  (§7), markdown→native `<markdown>`, the real composer (clear-on-submit, replacing the
+  initial-prompt stand-in), header skeleton. Frame-snapshot tests + smoke steps 3–4.

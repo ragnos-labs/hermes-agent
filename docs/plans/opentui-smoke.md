@@ -86,8 +86,46 @@ Each phase implements the slice it owns; by Phase 5e this entire sequence runs c
     you MUST `renderOnce()` before capturing.
 
 ### Phase 1 — transport + store
-_(append: connect to `tui_gateway`, see `gateway.ready`, submit a trivial prompt, watch a streamed
-reply land in the store/transcript — steps 1–3 minimal)_
+**New steps to add:** steps 1–3 against the REAL `tui_gateway` (connect → `gateway.ready` → submit
+a trivial prompt → watch a streamed reply land), plus a clean Ctrl+C quit that reaps the gateway
+child (newly wired this phase). The composer is Phase 2, so the prompt is driven via the
+`HERMES_TUI_PROMPT` initial-prompt bootstrap (`session.create` → `prompt.submit`).
+
+- *Drive:* live entry in tmux (real TTY, 100x28). The worktree `.venv` lacks `jsonrpcserver`, so the
+  drive uses the installed interpreter while running the worktree's `tui_gateway` via the source root:
+  ```
+  HERMES_PYTHON=~/.hermes/hermes-agent/venv/bin/python \
+  HERMES_PYTHON_SRC_ROOT=<worktree> \
+  HERMES_TUI_PROMPT='Respond with only the single word: pong' \
+  bun src/entry/main.tsx
+  ```
+  (default backend = live `liveGatewayLayer`; `HERMES_TUI_FAKE=1` selects the scripted hello instead.)
+- *Expect:* header flips to `ready` on `gateway.ready`; the user prompt lands (`❯ …`); the assistant
+  reply streams in (`⚕ …`); Ctrl+C tears down cleanly with no orphan `bun` or `tui_gateway` child.
+
+- *Run log (2026-06-08, PASS):*
+  - Headless gate `bun run check` → **green**: `tsc --noEmit` 0 errors, `eslint .` 0 errors,
+    `bun test` **12/12 pass** across 4 files (boundary FakeGateway · GatewayEvent decode · store
+    reducer skin/dedup/hydrate · themed App frame + reactive re-skin).
+  - Headless live-transport contract (`bun src/test/liveGateway.smoke.ts`, installed venv + worktree
+    srcRoot) → `PASS — gateway.ready seen, session.create ok (sid=…)`. Decode-once boundary +
+    handshake verified against the REAL server (skips gracefully without a venv/model).
+  - **Live tmux (real TTY, 100x28):** the frame painted, end to end through the live gateway:
+    ```
+     Hermes Agent · opentui · ready
+     ❯ Respond with only the single word: pong
+     ⚕ pong
+    ```
+    Log (`~/.hermes/logs/opentui-v2.log`, NDJSON ring+file sink) confirmed `bootstrap: session
+    created {sid:4e3ff31d}`. Theme is the default (no skin emitted by this gateway); `store.test`
+    + `render.test` cover the `gateway.ready{skin}` / `skin.changed` → `fromSkin` re-theme path.
+  - **Teardown:** Ctrl+C → my `bun` PID gone (graceful quit: renderer `destroy` → `shutdown` Deferred
+    → scope finalizers) AND its `tui_gateway` child gone (gateway layer release → `client.stop()` →
+    stdin EOF → child exits). Verified by exact-PID checks — **no orphan**. (`exitOnCtrlC:false` hands
+    Ctrl+C to an in-app key handler now; the `!blocked` gating for prompts lands in Phase 3.)
+  - DRIVING PITFALL recorded: never `pkill -f tui_gateway.entry` — it also kills the children of the
+    user's live Ink sessions (which auto-respawn). Track the spawned `bun` PID and kill only that;
+    its gateway child is reaped by the graceful-quit finalizer.
 
 ### Phase 2 — core transcript
 _(append: markdown rendering, inline ordered-parts tool render — steps 3–4 full)_
