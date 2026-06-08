@@ -108,8 +108,13 @@ Composer↔overlay swap on `store.state.prompt`; global Ctrl+C-quit gated on `!b
 | Long slash output → pager (Ink: >180 chars / >2 lines), titled by command; `/logs`→pager | `createSlashHandler.ts` `page()` | — | `logic/slash.ts` `present()` | ✅ | `slash.test.ts` · smoke P5a (`/version`,`/logs`) |
 | Unlocks `/status`,`/logs`,`/history`,`/tools` output | `appOverlays.tsx` | — | (via `present()`) | ✅ | smoke P5a |
 
-_Remaining: completions dropdown (5a), chrome (5b), pickers — model/session/skills (5c), agent
-features (5d), subagents/agents dashboard (5e). The §1–§4 Ink inventory below is the per-phase source._
+### Phase 5c — session switcher (§2b; first-class picker)
+| Concern | Ink ref | v2 build | Status | Test · smoke |
+|---|---|---|---|---|
+| Session switcher — `/sessions`/`/resume`/`/switch`/`/session` → `session.list` → `<select>` → resume (reuses Phase 4b hydrate) | `activeSessionSwitcher.tsx` (`appOverlays.tsx:145`) | `view/overlays/sessionSwitcher.tsx`, `logic/slash.ts`, `logic/resume.ts` `mapSessionList`, `entry` `resumeInto`/`onResume` | ✅ | `slash.test.ts` + `render.test.tsx` · **smoke P5c (live: list → pick → hydrate w/ tool row)** |
+
+_Remaining first-class surfaces: completions dropdown, model picker, skills hub, agents dashboard;
+plus chrome (5b) + agent features (5d). The §1–§4 Ink inventory below is the per-phase source._
 
 ---
 

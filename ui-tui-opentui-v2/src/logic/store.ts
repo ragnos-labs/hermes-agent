@@ -64,6 +64,14 @@ export interface PagerState {
   text: string
 }
 
+/** One row in the session switcher (from `session.list`). */
+export interface SessionItem {
+  id: string
+  title: string
+  preview: string
+  messageCount: number
+}
+
 export interface StoreState {
   ready: boolean
   messages: Message[]
@@ -72,6 +80,8 @@ export interface StoreState {
   prompt: ActivePrompt | undefined
   /** The open pager overlay (replaces the transcript while set); undefined when none. */
   pager: PagerState | undefined
+  /** The open session switcher (replaces the composer while set); undefined when none. */
+  switcher: SessionItem[] | undefined
 }
 
 const LRU_LIMIT = 1000
@@ -88,7 +98,8 @@ export function createSessionStore() {
     messages: [],
     theme: DEFAULT_THEME,
     prompt: undefined,
-    pager: undefined
+    pager: undefined,
+    switcher: undefined
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -190,6 +201,16 @@ export function createSessionStore() {
   /** Close the pager overlay. */
   function closePager() {
     setState('pager', undefined)
+  }
+
+  /** Open the session switcher with the given session rows (/sessions, /resume). */
+  function openSwitcher(sessions: SessionItem[]) {
+    setState('switcher', sessions)
+  }
+
+  /** Close the session switcher. */
+  function closeSwitcher() {
+    setState('switcher', undefined)
   }
 
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */
@@ -356,6 +377,8 @@ export function createSessionStore() {
     setConfirm,
     openPager,
     closePager,
+    openSwitcher,
+    closeSwitcher,
     hydrate,
     beginBuffer,
     commitSnapshot,

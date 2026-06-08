@@ -9,9 +9,10 @@
  *   2. `slash.exec {command, session_id}` → `{output, warning?}` → system line
  *   3. on reject → `command.dispatch {arg, name, session_id}` → typed action
  *      (exec/plugin → system · alias → re-dispatch · skill/send → submit a turn ·
- *       prefill → notice). Pager routing for long output lands with Phase 5a; for
- *      now long output is shown as a (multi-line) system message.
+ *       prefill → notice). Long output routes to the pager (Phase 5a).
  */
+import type { SessionItem } from './store.ts'
+
 export interface ParsedSlash {
   name: string
   arg: string
@@ -42,6 +43,10 @@ export interface SlashContext {
   readonly quit: () => void
   /** Recent log lines for `/logs` (the ring buffer). */
   readonly logTail: () => string[]
+  /** Fetch the resumable sessions (`session.list`) for the switcher. */
+  readonly listSessions: () => Promise<SessionItem[]>
+  /** Open the session switcher with the given rows. */
+  readonly openSwitcher: (sessions: SessionItem[]) => void
 }
 
 function readStr(value: unknown, key: string): string | undefined {
@@ -61,6 +66,7 @@ function present(ctx: SlashContext, title: string, text: string): void {
 
 const CLIENT_HELP = [
   '/help — list commands',
+  '/sessions, /resume — switch/resume a session',
   '/clear, /new — clear the transcript (confirm)',
   '/logs — recent engine log lines',
   '/quit, /exit — quit',
@@ -69,10 +75,21 @@ const CLIENT_HELP = [
 
 type ClientHandler = (arg: string, ctx: SlashContext) => void | Promise<void>
 
+/** Fetch sessions and open the switcher (shared by /sessions, /resume, /switch, /session). */
+const openSwitcher: ClientHandler = async (_arg, ctx) => {
+  const sessions = await ctx.listSessions()
+  if (sessions.length) ctx.openSwitcher(sessions)
+  else ctx.pushSystem('No sessions to resume.')
+}
+
 /** The TUI-only client commands (run in-process, never hit the gateway). */
 const CLIENT: Record<string, ClientHandler> = {
   clear: (_arg, ctx) => ctx.confirm('Clear the transcript?', ctx.clearTranscript),
   exit: (_arg, ctx) => ctx.quit(),
+  resume: openSwitcher,
+  session: openSwitcher,
+  sessions: openSwitcher,
+  switch: openSwitcher,
   help: async (_arg, ctx) => {
     // Prefer the live catalog; fall back to the client list if it's unavailable.
     try {

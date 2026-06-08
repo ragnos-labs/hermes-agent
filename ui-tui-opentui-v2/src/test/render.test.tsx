@@ -125,4 +125,27 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).not.toContain('a previous message') // transcript replaced by the pager
     expect(frame).not.toContain('Type your message') // composer hidden while the pager is open
   })
+
+  test('the session switcher renders session rows and replaces the composer', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.openSwitcher([
+      { id: 's1', title: 'First chat', preview: 'hi', messageCount: 5 },
+      { id: 's2', title: 'Second chat', preview: 'yo', messageCount: 12 }
+    ])
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: 'Resume a session', width: 72, height: 18 }
+    )
+
+    expect(frame).toContain('Resume a session') // switcher header
+    expect(frame).toContain('First chat') // session row
+    expect(frame).toContain('Second chat')
+    expect(frame).not.toContain('Type your message') // composer hidden while switcher open
+  })
 })

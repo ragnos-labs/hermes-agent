@@ -20,6 +20,7 @@ import type { SessionStore } from '../logic/store.ts'
 import { Composer } from './composer.tsx'
 import { Header } from './header.tsx'
 import { Pager } from './overlays/pager.tsx'
+import { SessionSwitcher } from './overlays/sessionSwitcher.tsx'
 import { PromptOverlay } from './prompts/promptOverlay.tsx'
 import { Transcript } from './transcript.tsx'
 
@@ -27,19 +28,27 @@ export interface AppProps {
   readonly store: SessionStore
   readonly onSubmit?: (text: string) => void
   readonly onRespond?: (method: string, params: Record<string, unknown>) => void
+  readonly onResume?: (sessionId: string) => void
   readonly sessionId?: () => string | undefined
 }
 
 const NOOP = () => {}
 const NOOP_RESPOND = () => {}
+const NOOP_RESUME = () => {}
 const NO_SESSION = () => undefined
 
 export function App(props: AppProps) {
   const blocked = () => props.store.state.prompt !== undefined
   const pager = () => props.store.state.pager
-  // Defer the close so the key that closed the overlay (Esc/q) can't land in the
-  // freshly-remounted composer.
+  const switcher = () => props.store.state.switcher
+  // Defer the close so the key that closed an overlay (Esc/q/Enter) can't land in
+  // the freshly-remounted composer.
   const closePager = () => setTimeout(() => props.store.closePager(), 0)
+  const closeSwitcher = () => setTimeout(() => props.store.closeSwitcher(), 0)
+  const resume = (id: string) => {
+    ;(props.onResume ?? NOOP_RESUME)(id)
+    closeSwitcher()
+  }
 
   return (
     <box style={{ flexDirection: 'column', flexGrow: 1, padding: 1 }}>
@@ -49,7 +58,14 @@ export function App(props: AppProps) {
         fallback={
           <>
             <Transcript store={props.store} />
-            <Show when={blocked()} fallback={<Composer onSubmit={props.onSubmit ?? NOOP} />}>
+            <Show
+              when={blocked()}
+              fallback={
+                <Show when={switcher()} fallback={<Composer onSubmit={props.onSubmit ?? NOOP} />}>
+                  {sessions => <SessionSwitcher sessions={sessions()} onPick={resume} onClose={closeSwitcher} />}
+                </Show>
+              }
+            >
               <PromptOverlay
                 store={props.store}
                 onRespond={props.onRespond ?? NOOP_RESPOND}

@@ -322,10 +322,24 @@ Unlocks `/status`,`/logs`,`/history`,`/tools` output at once.
     PageDown scrolled; Esc closed → composer returned AND refocused (typed "after-pager" appeared —
     no key-leak). `/version` (5-line output) → routed to the pager titled "Version".
 
-**Phase 5a (completions) / 5b–5e (TODO):** completions dropdown (typing `/` → `complete.slash`);
-chrome (header model/cwd/context%/cost from `session.info`+`Usage`); pickers (model picker, session
-switcher, skills hub); agent features (reasoning trail, todos, notifications, voice); subagents
-tree + agents dashboard.
+### Phase 5c — session switcher (step 5; first-class picker)
+
+`/sessions` (alias `/resume`,`/switch`,`/session`) → `session.list` → a native `<select>` overlay
+(`view/overlays/sessionSwitcher.tsx`) replacing the composer; Enter resumes the chosen session via
+the SAME `resumeInto` hydrate path as launch (so tool rows hydrate), Esc closes. Reuses Phase 4b.
+
+- *Run log (2026-06-08, PASS):*
+  - Headless gate `bun run check` → **green** (43 tests / 7 files): slash `/sessions`/`/resume` →
+    `listSessions`+`openSwitcher` + a switcher frame test (rows render, composer replaced).
+  - **Live tmux:** `/sessions` → switcher listing real sessions with titles + msg counts + previews
+    ("Terminal Echo Command Output · 4 msgs · …", "[IMPORTANT: …cron…] · 21 msgs", …). ↓ + Enter on
+    "Terminal Echo Command Output" → `session resumed {count:3, hydrate_ms:8}` and the transcript
+    hydrated (user prompt + `⚡terminal echo resume-marker-42` + assistant reply); switcher closed,
+    composer returned; `/quit` clean.
+
+**Phase 5a (completions) / 5b / 5d / 5e (TODO):** completions dropdown (typing `/` → `complete.slash`);
+chrome (header model/cwd/context%/cost from `session.info`+`Usage`); model picker + skills hub;
+agent features (reasoning trail, todos, notifications, voice); subagents tree + agents dashboard.
 
 ### Phase 8 — launcher
 _(append: launch via the real `HERMES_TUI_ENGINE=opentui hermes --tui`; dashboard PTY path)_

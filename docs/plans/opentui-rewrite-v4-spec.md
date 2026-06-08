@@ -587,6 +587,10 @@ two gates run every phase.
   that replaces the transcript+composer; long slash output (>180 chars / >2 lines) + `/logs` route to
   it (`logic/slash.ts` `present()`), unlocking `/status`,`/logs`,`/history`,`/tools` output. Esc/q
   close (deferred, no key-leak); scroll via scrollBy/scrollTo. Live: `/logs`,`/version` → pager (smoke P5a).
-- **Next:** completions dropdown (typing `/` → `complete.slash`), then Phase 5b chrome (header
-  model/cwd/context%/cost from `session.info`+`Usage`), Phase 5c pickers (model picker, session
-  switcher, skills hub), Phase 5d agent features, Phase 5e subagents/agents dashboard, Phase 8 launcher.
+- **Phase 5c — session switcher: ✅** (this commit). `/sessions`/`/resume`/`/switch`/`/session` →
+  `session.list` → a native `<select>` overlay (`view/overlays/sessionSwitcher.tsx`) that resumes the
+  chosen session via the shared `resumeInto` hydrate path (so tool rows hydrate). Live: list → pick →
+  full transcript hydrated (smoke P5c). 3 of 6 first-class overlays now done (prompts, pager, switcher).
+- **Next:** completions dropdown (`/` → `complete.slash`), Phase 5b chrome (header model/cwd/context%/
+  cost from `session.info`+`Usage`), model picker + skills hub, agent features (5d), subagents/agents
+  dashboard (5e), Phase 8 launcher.

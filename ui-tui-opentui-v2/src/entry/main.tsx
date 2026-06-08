@@ -27,7 +27,7 @@ import { liveGatewayLayer } from '../boundary/gateway/liveGateway.ts'
 import { getLog } from '../boundary/log.ts'
 import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
-import { mapResumeHistory } from '../logic/resume.ts'
+import { mapResumeHistory, mapSessionList } from '../logic/resume.ts'
 import { dispatchSlash, type SlashContext } from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
@@ -49,6 +49,28 @@ export interface TuiInput {
 
 const READY_POLL = Duration.millis(100)
 const READY_TIMEOUT_MS = 20_000
+
+/**
+ * Resume a session INTO the store: buffer live events across the `session.resume`
+ * RPC, then replace history + replay (gotcha §8 #5 tool rows handled by
+ * mapResumeHistory). Shared by the launch bootstrap and the session switcher.
+ * Timed (rpc_ms / hydrate_ms) for the resume profile.
+ */
+const resumeInto = (gateway: GatewayServiceShape, store: SessionStore, sid: string, cols: number) =>
+  Effect.gen(function* () {
+    store.beginBuffer()
+    const t0 = Date.now()
+    const resumed = yield* gateway.request<{ messages?: unknown }>('session.resume', { cols, session_id: sid })
+    const t1 = Date.now()
+    const snapshot = mapResumeHistory(resumed?.messages)
+    store.commitSnapshot(snapshot)
+    getLog().info('bootstrap', 'session resumed', {
+      count: snapshot.length,
+      hydrate_ms: Date.now() - t1,
+      rpc_ms: t1 - t0,
+      sid
+    })
+  })
 
 /**
  * Live session bootstrap: wait for the unsolicited `gateway.ready` handshake,
@@ -82,23 +104,7 @@ const bootstrapSession = (gateway: GatewayServiceShape, store: SessionStore, inp
         log.warn('bootstrap', 'no session to resume', { resumeId: input.resumeId })
         return
       }
-      // Buffer live events across the resume RPC, then replace history + replay.
-      store.beginBuffer()
-      const t0 = Date.now()
-      const resumed = yield* gateway.request<{ messages?: unknown }>('session.resume', {
-        cols: input.cols,
-        session_id: sid
-      })
-      const t1 = Date.now()
-      const snapshot = mapResumeHistory(resumed?.messages)
-      store.commitSnapshot(snapshot)
-      // Hydration profile: rpc_ms = server load + transport; hydrate_ms = map + store write.
-      log.info('bootstrap', 'session resumed', {
-        count: snapshot.length,
-        hydrate_ms: Date.now() - t1,
-        rpc_ms: t1 - t0,
-        sid
-      })
+      yield* resumeInto(gateway, store, sid, input.cols)
     } else {
       const created = yield* gateway.request<{ session_id?: string }>('session.create', { cols: input.cols })
       sid = created?.session_id ?? gateway.sessionId()
@@ -156,11 +162,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
       const slashCtx: SlashContext = {
         clearTranscript: () => store.clearTranscript(),
         confirm: (message, onConfirm) => store.setConfirm(message, onConfirm),
+        listSessions: () => Effect.runPromise(gateway.request('session.list', {})).then(mapSessionList),
         logTail: () =>
           getLog()
             .tail(200)
             .map(e => `${e.scope}: ${e.msg}`),
         openPager: (title, text) => store.openPager(title, text),
+        openSwitcher: sessions => store.openSwitcher(sessions),
         pushSystem: text => store.pushSystem(text),
         quit: () => {
           if (!renderer.isDestroyed) renderer.destroy()
@@ -168,6 +176,15 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         request: (method, params) => Effect.runPromise(gateway.request(method, params)),
         sessionId: () => gateway.sessionId(),
         submit: submitPrompt
+      }
+
+      // Resume a chosen session (session switcher pick) — same hydrate path as launch.
+      const onResume = (resumeSid: string) => {
+        Effect.runFork(
+          resumeInto(gateway, store, resumeSid, input.cols).pipe(
+            Effect.catchCause(cause => Effect.sync(() => getLog().warn('resume', 'failed', { cause: String(cause) })))
+          )
+        )
       }
 
       // The composer's submit: route `/command` through the slash ladder, else a prompt.
@@ -199,7 +216,13 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         render(
           () => (
             <ThemeProvider theme={() => store.state.theme}>
-              <App store={store} onSubmit={submit} onRespond={respond} sessionId={() => gateway.sessionId()} />
+              <App
+                store={store}
+                onSubmit={submit}
+                onRespond={respond}
+                onResume={onResume}
+                sessionId={() => gateway.sessionId()}
+              />
             </ThemeProvider>
           ),
           renderer

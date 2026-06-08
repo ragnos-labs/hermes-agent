@@ -5,6 +5,9 @@
 import { describe, expect, test } from 'bun:test'
 
 import { dispatchSlash, parseSlash, type SlashContext } from '../logic/slash.ts'
+import type { SessionItem } from '../logic/store.ts'
+
+const FAKE_SESSIONS: SessionItem[] = [{ id: 's1', messageCount: 5, preview: 'hello there', title: 'First chat' }]
 
 describe('parseSlash', () => {
   test('splits name + arg; rejects non-slash / empty', () => {
@@ -22,6 +25,7 @@ interface Probe {
   submitted: string[]
   confirmed: Array<{ message: string; onConfirm: () => void }>
   paged: Array<{ title: string; text: string }>
+  switched: SessionItem[][]
   quit: { value: boolean }
   cleared: { value: boolean }
 }
@@ -32,13 +36,16 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
   const submitted: string[] = []
   const confirmed: Probe['confirmed'] = []
   const paged: Probe['paged'] = []
+  const switched: Probe['switched'] = []
   const quit = { value: false }
   const cleared = { value: false }
   const ctx: SlashContext = {
     clearTranscript: () => (cleared.value = true),
     confirm: (message, onConfirm) => confirmed.push({ message, onConfirm }),
+    listSessions: () => Promise.resolve(FAKE_SESSIONS),
     logTail: () => ['gateway: spawned', 'bootstrap: session created'],
     openPager: (title, text) => paged.push({ text, title }),
+    openSwitcher: sessions => switched.push(sessions),
     pushSystem: text => system.push(text),
     quit: () => (quit.value = true),
     request: (method, params) => {
@@ -48,7 +55,7 @@ function makeCtx(request: (method: string, params: Record<string, unknown>) => P
     sessionId: () => 'sid-1',
     submit: text => submitted.push(text)
   }
-  return { calls, cleared, confirmed, ctx, paged, quit, submitted, system }
+  return { calls, cleared, confirmed, ctx, paged, quit, submitted, switched, system }
 }
 
 describe('dispatchSlash — client commands', () => {
@@ -73,6 +80,16 @@ describe('dispatchSlash — client commands', () => {
     await dispatchSlash('/logs', p.ctx)
     expect(p.paged[0]?.title).toBe('Logs')
     expect(p.paged[0]?.text).toContain('session created')
+  })
+
+  test('/sessions (and /resume) open the switcher with session.list rows', async () => {
+    const p = makeCtx(async () => ({}))
+    await dispatchSlash('/sessions', p.ctx)
+    expect(p.switched).toHaveLength(1)
+    expect(p.switched[0]).toEqual(FAKE_SESSIONS)
+    const p2 = makeCtx(async () => ({}))
+    await dispatchSlash('/resume', p2.ctx)
+    expect(p2.switched).toHaveLength(1)
   })
 
   test('/help renders the gateway catalog', async () => {

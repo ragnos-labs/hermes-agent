@@ -9,12 +9,37 @@
  * a live one. Resumed assistant text is given a single text part so it renders
  * through the native markdown path. IDs are `r*` (distinct from live `p*`).
  */
-import type { Message, Part } from './store.ts'
+import type { Message, Part, SessionItem } from './store.ts'
 
 function readStr(value: unknown, key: string): string | undefined {
   if (!value || typeof value !== 'object') return undefined
   const v = (value as { [k: string]: unknown })[key]
   return typeof v === 'string' ? v : undefined
+}
+
+function readNum(value: unknown, key: string): number {
+  if (!value || typeof value !== 'object') return 0
+  const v = (value as { [k: string]: unknown })[key]
+  return typeof v === 'number' ? v : 0
+}
+
+/** Map a `session.list` result into switcher rows (loose-typed read). */
+export function mapSessionList(result: unknown): SessionItem[] {
+  if (!result || typeof result !== 'object') return []
+  const sessions = (result as { sessions?: unknown }).sessions
+  if (!Array.isArray(sessions)) return []
+  const out: SessionItem[] = []
+  for (const s of sessions) {
+    const id = readStr(s, 'id')
+    if (!id) continue
+    out.push({
+      id,
+      messageCount: readNum(s, 'message_count'),
+      preview: readStr(s, 'preview') ?? '',
+      title: readStr(s, 'title') ?? ''
+    })
+  }
+  return out
 }
 
 export function mapResumeHistory(history: unknown): Message[] {
