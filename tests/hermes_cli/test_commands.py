@@ -839,6 +839,17 @@ class TestSubcommandCompletion:
         monkeypatch.setattr("gateway.config.load_gateway_config", _boom)
         assert _completions(SlashCommandCompleter(), "/handoff ") == []
 
+    def test_personality_completes_configured_personalities(self):
+        """`/personality ` lists real personalities, not just `none`.
+
+        Regression: the completer read load_config().agent.personalities, a path
+        that never exists, so it always came back empty. It must resolve from the
+        CLI config the runtime actually applies (which ships built-ins).
+        """
+        texts = {c.text for c in _completions(SlashCommandCompleter(), "/personality ")}
+        assert "none" in texts
+        assert len(texts) > 1
+
 
 # ── Ghost text (SlashCommandAutoSuggest) ────────────────────────────────
 
