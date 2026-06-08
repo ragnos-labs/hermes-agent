@@ -596,5 +596,11 @@ two gates run every phase.
   <name>` direct) and `/skills` (`skills.manage list`→pick→inspect→pager). App input zone is now a
   `<Switch>` (prompt→switcher→picker→composer). Live-verified (smoke P5c). **5 of 6 first-class
   overlays done** (prompts, pager, session switcher, model picker, skills hub).
-- **Next:** completions dropdown (`/` → `complete.slash`) — the last first-class overlay; then chrome
-  (5b: header model/cwd/context%/cost), agent features (5d), agents dashboard (5e), Phase 8 launcher.
+- **Phase 5a — completions dropdown: ✅** (this commit). A live `complete.slash` dropdown above the
+  composer (`onContentChange`→`onType`→`store.completions`); Tab accepts the top, Esc dismisses.
+  Live-verified (`/comp` → dropdown → Tab). **All 6 first-class overlay/popup surfaces are now done**
+  (blocking prompts, pager, session switcher, model picker, skills hub, completions) — each ✅ +
+  tested + in the smoke, the judge's acceptance bar for the interactive surfaces.
+- **Next:** Phase 5b chrome (header model/cwd/context%/cost from `session.info`+`Usage`), Phase 5d
+  agent features (reasoning trail/todos/notifications/voice), Phase 5e subagents tree + agents
+  dashboard (needs live `subagent.*`), Phase 8 launcher cutover + distribution.

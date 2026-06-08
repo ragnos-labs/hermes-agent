@@ -353,9 +353,25 @@ The App input zone is now a `<Switch>`: prompt → switcher → picker → compo
     closed cleanly. `/skills` → hub (1s) listing `cua-driver-mac-automation`/`apple`/`claude-code`/…
     with category descriptions. (Polish TODO: a "fetching…" indicator while `model.options` loads.)
 
-**Phase 5a (completions) / 5b / 5d / 5e (TODO):** completions dropdown (typing `/` → `complete.slash`);
-chrome (header model/cwd/context%/cost from `session.info`+`Usage`); agent features (reasoning trail,
-todos, notifications, voice); subagents tree + agents dashboard.
+### Phase 5a — completions dropdown (the 6th first-class overlay)
+
+A live slash-completion dropdown renders ABOVE the composer as you type `/…`: `onContentChange` →
+`onType` queries `complete.slash {text}` (entry boundary) → `store.setCompletions(mapCompletions)`.
+The textarea owns key input (so live-refine-by-typing works), so **Tab** accepts the top match and
+**Esc** dismisses (arrow-nav would fight the cursor — a polish item, noted).
+
+- *Run log (2026-06-08, PASS):*
+  - Headless gate `bun run check` → **green** (49 tests / 7 files): `mapCompletions` (items→candidates,
+    display/meta defaults) + a composer-dropdown frame test (candidates + meta + "Tab complete" hint).
+  - **Live tmux:** typing `/comp` showed the dropdown — `/compress · Compress conversation context…`,
+    `/composio · ⚡ Composio CLI…`, `/compact · Toggle compact display mode`, "Tab complete · Esc
+    dismiss". **Tab** accepted the top match (filled the composer) and cleared the dropdown.
+
+**ALL 6 first-class overlays now ✅ + tested + in the smoke:** blocking prompts (P3), pager (P5a),
+session switcher (P5c), model picker (P5c), skills hub (P5c), completions (P5a).
+
+**Phase 5b / 5d / 5e (TODO):** header chrome (model/cwd/context%/cost from `session.info`+`Usage`);
+agent features (reasoning trail, todos, notifications, voice); subagents tree + agents dashboard.
 
 ### Phase 8 — launcher
 _(append: launch via the real `HERMES_TUI_ENGINE=opentui hermes --tui`; dashboard PTY path)_

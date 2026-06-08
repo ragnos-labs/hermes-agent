@@ -120,8 +120,15 @@ Composer↔overlay swap on `store.state.prompt`; global Ctrl+C-quit gated on `!b
 | Model picker — `/model` bare→picker (model.options, current marked) / `/model <name>`→switch | `modelPicker.tsx` | `logic/slash.ts` `modelCmd`+`mapModelOptions` | ✅ | `slash.test.ts` · **smoke P5c (live: 8 models, Esc)** |
 | Skills hub — `/skills`→picker (skills.manage list)→pick→inspect→pager | `skillsHub.tsx` | `logic/slash.ts` `skillsCmd`+`mapSkills` | ✅ | `slash.test.ts` · **smoke P5c (live)** |
 
-_Remaining first-class surfaces: completions dropdown, agents dashboard; plus chrome (5b) + agent
-features (5d). The §1–§4 Ink inventory below is the per-phase source._
+### Phase 5a — completions dropdown (§1 autocomplete)
+| Concern | Ink ref | v2 build | Status | Test · smoke |
+|---|---|---|---|---|
+| Live slash completions above the composer — `onContentChange`→`complete.slash`; Tab accepts top, Esc dismiss | `useCompletion.ts`, `appOverlays.tsx:203` | `view/composer.tsx`, store `completions`/set/clear, `logic/slash.ts` `mapCompletions`, `entry` `onType` | ✅ | `slash.test.ts` + `render.test.tsx` · **smoke P5a (live: /comp → dropdown → Tab)** |
+
+**5 of 6 first-class overlay/popup surfaces ✅ + tested + smoked: blocking prompts, pager, session
+switcher, model picker, skills hub, completions** (6 incl. prompts). Remaining: agents dashboard
+(5e — needs live `subagent.*`). Plus chrome (5b) + agent features (5d). The §1–§4 Ink inventory
+below is the per-phase source._
 
 ---
 
