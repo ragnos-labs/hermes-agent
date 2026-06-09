@@ -14,7 +14,7 @@
  * Fully themed (no hardcoded styles); decorative glyphs are selectable={false}.
  */
 import { type ToolPartState } from '../logic/store.ts'
-import { useTerminalDimensions } from '@opentui/solid'
+import { useDimensions } from './dimensions.tsx'
 import { createMemo, createSignal, For, Show } from 'solid-js'
 
 import { collapseToolOutput, truncate } from '../logic/toolOutput.ts'
@@ -36,7 +36,7 @@ function fmtDuration(s: number): string {
 
 export function ToolPart(props: { part: ToolPartState }) {
   const theme = useTheme()
-  const dims = useTerminalDimensions()
+  const dims = useDimensions()
   const [expanded, setExpanded] = createSignal(false)
 
   const bodyWidth = () => Math.max(20, dims().width - GUTTER - 4)

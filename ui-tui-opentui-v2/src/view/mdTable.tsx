@@ -2,9 +2,9 @@
  * MdTable — renders a parsed GFM table as an aligned grid (item 7). The native
  * markdown renderable leaves tables as raw pipes; this lays them out with
  * per-column widths, alignment, a header rule, and dim `│` separators. Width
- * is reactive (useTerminalDimensions) so columns shrink to fit on resize.
+ * is reactive (useDimensions) so columns shrink to fit on resize.
  */
-import { useTerminalDimensions } from '@opentui/solid'
+import { useDimensions } from './dimensions.tsx'
 import { createMemo, type JSX } from 'solid-js'
 
 import { padAligned, tableColumnWidths, type TableSegment } from '../logic/mdTable.ts'
@@ -15,7 +15,7 @@ const GUTTER = 2
 
 export function MdTable(props: { seg: TableSegment }) {
   const theme = useTheme()
-  const dims = useTerminalDimensions()
+  const dims = useDimensions()
   const widths = createMemo(() => tableColumnWidths(props.seg, Math.max(24, dims().width - GUTTER - 2)))
 
   const cellText = (raw: string, i: number) =>

@@ -10,7 +10,7 @@
  * terminals and the cwd is left-truncated (`…/tail`) so the row NEVER wraps or
  * clips. Read-only chrome — no input handling here.
  */
-import { useTerminalDimensions } from '@opentui/solid'
+import { useDimensions } from './dimensions.tsx'
 import { createMemo, Show } from 'solid-js'
 
 import { useTheme } from './theme.tsx'
@@ -54,7 +54,7 @@ function ctxBar(pct: number, width: number): string {
 
 export function StatusBar(props: { store: SessionStore }) {
   const theme = useTheme()
-  const dims = useTerminalDimensions()
+  const dims = useDimensions()
   const info = () => props.store.state.info
 
   // Context-bar colour escalates with pressure (Ink ctxBarColor good→warn→bad→critical).

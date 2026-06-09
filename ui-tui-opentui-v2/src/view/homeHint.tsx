@@ -5,7 +5,7 @@
  * panel (item 9), the common commands, and the key tips. Fully themed; decorative,
  * so `selectable={false}` (item 4).
  */
-import { useTerminalDimensions } from '@opentui/solid'
+import { useDimensions } from './dimensions.tsx'
 import { createSignal, For, Show } from 'solid-js'
 
 import type { Catalog } from '../logic/store.ts'
@@ -33,7 +33,7 @@ const BANNER_W = 102
 
 export function HomeHint(props: { catalog: Catalog | undefined }) {
   const theme = useTheme()
-  const dims = useTerminalDimensions()
+  const dims = useDimensions()
   const [open, setOpen] = createSignal(false)
   const wide = () => dims().width >= BANNER_W
   const cat = () => props.catalog

@@ -18,6 +18,7 @@ import { Match, Switch } from 'solid-js'
 import type { PromptHistory } from '../logic/history.ts'
 import type { SessionStore } from '../logic/store.ts'
 import { Composer } from './composer.tsx'
+import { DimensionsProvider } from './dimensions.tsx'
 import { Header } from './header.tsx'
 import { AgentsDashboard } from './overlays/agentsDashboard.tsx'
 import { Pager } from './overlays/pager.tsx'
@@ -64,6 +65,7 @@ export function App(props: AppProps) {
   }
 
   return (
+    <DimensionsProvider>
     <box style={{ flexDirection: 'column', flexGrow: 1, paddingTop: 1, paddingLeft: 1, paddingRight: 1 }}>
       {/* a bottom rule under the header bookends the transcript with the status
           bar's top rule — frames the chrome as intentional (item 8). */}
@@ -132,5 +134,6 @@ export function App(props: AppProps) {
         </Match>
       </Switch>
     </box>
+    </DimensionsProvider>
   )
 }
