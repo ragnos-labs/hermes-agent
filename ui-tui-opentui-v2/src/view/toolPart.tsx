@@ -87,7 +87,9 @@ export function ToolPart(props: { part: ToolPartState }) {
   const subWidth = () => Math.max(1, bodyWidth() - props.part.name.length - 2)
 
   return (
-    <box style={{ flexDirection: 'column', flexShrink: 0, marginTop: 1 }}>
+    // Spacing between parts is owned by the parts column (gap), not per-part
+    // margins — so a tool appearing mid-stream doesn't shift the layout (item 5).
+    <box style={{ flexDirection: 'column', flexShrink: 0 }}>
       {/* header — clickable to toggle when there's expandable output/args */}
       <box style={{ flexDirection: 'row', flexShrink: 0 }} onMouseDown={() => collapsible() && setExpanded(e => !e)}>
         <box style={{ flexShrink: 0, width: GUTTER }}>

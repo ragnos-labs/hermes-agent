@@ -34,7 +34,10 @@ export function MessageLine(props: { message: Message }) {
           <span style={{ fg: glyphFg() }}>{glyph()}</span>
         </text>
       </box>
-      <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+      {/* gap owns ALL inter-part spacing (item 5) — uniform 1 line between text /
+          reasoning / tool regardless of order or stream timing, so blank lines
+          don't pop in and out as parts are created/merged mid-stream. */}
+      <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0, gap: 1 }}>
         <Show
           when={m().role === 'assistant' && hasParts()}
           fallback={
@@ -63,7 +66,10 @@ export function MessageLine(props: { message: Message }) {
                   {r => <ReasoningPart text={r().text} streaming={m().streaming ?? false} />}
                 </Match>
                 <Match when={part.type === 'text' && part}>
-                  {t => <Markdown text={t().text} streaming={m().streaming ?? false} />}
+                  {/* strip leading/trailing blank lines so the part's own spacing is
+                      0 and the column `gap` is the SOLE source of inter-part spacing —
+                      no double gaps, no transient blank lines mid-stream (item 5). */}
+                  {t => <Markdown text={t().text.replace(/^\n+|\n+$/g, '')} streaming={m().streaming ?? false} />}
                 </Match>
               </Switch>
             )}
