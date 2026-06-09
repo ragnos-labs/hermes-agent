@@ -861,7 +861,12 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             data = await self._sidecar_call("/send", body)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            # Preserve the exception TYPE when str(e) is empty -- httpx timeout
+            # exceptions (ReadTimeout/WriteTimeout) often stringify to "" -- so
+            # _is_timeout_error() can detect a read/write timeout and SUPPRESS the
+            # plain-text fallback. A slow-but-delivered /send must not be re-sent,
+            # or the user gets a duplicate iMessage.
+            return SendResult(success=False, error=str(e) or type(e).__name__)
         return SendResult(success=True, message_id=data.get("messageId"))
 
     async def _sidecar_send_attachment(
@@ -919,7 +924,11 @@ class PhotonAdapter(BasePlatformAdapter):
             f"http://{self._sidecar_bind}:{self._sidecar_port}{path}",
             json=body,
             headers={"X-Hermes-Sidecar-Token": self._sidecar_token},
-            timeout=30.0,
+            # Photon's free-tier ack latency is variable (observed 8s to >30s); a
+            # 30s timeout false-fails slow-but-delivered sends and triggers a
+            # duplicate fallback. Widen the window (env-configurable) so the ack
+            # arrives in-band. Pairs with the timeout-aware error above.
+            timeout=float(os.getenv("PHOTON_SIDECAR_TIMEOUT") or 90.0),
         )
         if resp.status_code != 200:
             raise RuntimeError(
