@@ -43,11 +43,17 @@ const REQUEST_TIMEOUT_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? Math.max(5000, raw) : 120_000
 })()
 
+const STARTUP_TIMEOUT_MS = (() => {
+  const raw = Number.parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '', 10)
+  return Number.isFinite(raw) && raw > 0 ? Math.max(2000, raw) : 20_000
+})()
+
 export class RawGatewayClient {
   private proc: ReturnType<typeof Bun.spawn> | null = null
   private pending = new Map<string, Pending>()
   private reqId = 0
   private stdinBuffer = ''
+  private startupTimer: ReturnType<typeof setTimeout> | undefined
   private readonly log: Log
   private readonly onEvent: (params: unknown) => void
   private readonly onExit?: (reason: string) => void
@@ -90,6 +96,16 @@ export class RawGatewayClient {
     this.proc = proc
     void this.readStdout(proc)
     void this.readStderr(proc)
+
+    // Startup-readiness watchdog: a child that hangs on import (wrong python /
+    // missing dep) never emits the unsolicited `gateway.ready` handshake, leaving
+    // a silent blank UI. Emit `gateway.start_timeout` so the store can surface a
+    // failure line + the captured stderr tail. Cleared on ready (dispatch) / stop.
+    // A recovery-respawn re-enters start(), so this re-arms per respawn — desired.
+    this.startupTimer = setTimeout(() => {
+      this.startupTimer = undefined
+      this.onEvent({ type: 'gateway.start_timeout', payload: { message: `no gateway.ready within ${STARTUP_TIMEOUT_MS}ms` } })
+    }, STARTUP_TIMEOUT_MS)
   }
 
   private async readStdout(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
@@ -168,6 +184,12 @@ export class RawGatewayClient {
 
     // Event push: method === "event", no id. Surface params (decoded upstream).
     if (frame.method === 'event' && frame.params && typeof frame.params === 'object') {
+      // Handshake arrived: cancel the startup-readiness watchdog. Narrow without
+      // `as` via `'type' in obj` + property access (the params record is loose).
+      if ('type' in frame.params && frame.params.type === 'gateway.ready') {
+        if (this.startupTimer) clearTimeout(this.startupTimer)
+        this.startupTimer = undefined
+      }
       this.onEvent(frame.params)
       return
     }
@@ -222,6 +244,8 @@ export class RawGatewayClient {
 
   /** Close stdin (EOF → child exits) and stop. */
   stop(): void {
+    if (this.startupTimer) clearTimeout(this.startupTimer)
+    this.startupTimer = undefined
     this.rejectAll('gateway stopping')
     const stdin = this.proc?.stdin
     if (stdin && typeof stdin !== 'number') {
