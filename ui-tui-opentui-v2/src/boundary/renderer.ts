@@ -9,7 +9,7 @@
  * No throw / try-catch here: acquisition failure surfaces as a typed
  * `RendererError` via `Effect.tryPromise`'s `catch`.
  */
-import { createCliRenderer, type CliRenderer, type KeyEvent } from '@opentui/core'
+import { createCliRenderer, type CliRenderer, type KeyEvent, type Selection } from '@opentui/core'
 import { Deferred, Effect } from 'effect'
 
 import { RendererError } from './errors.ts'
@@ -84,6 +84,21 @@ export const acquireRenderer = Effect.fn('Renderer.acquire')(function* (options:
     if (options.onCtrlC) options.onCtrlC()
     else renderer.destroy()
   })
+
+  // Copy-on-select (item 1 parity with free-code/Ink): the renderer's "selection"
+  // event fires ONCE when a free-form mouse selection COMPLETES (drag finish);
+  // auto-copy the spanned selectable text. Unlike the Ctrl+C path above we do NOT
+  // clearSelection() — the highlight persists so the user sees what was copied and
+  // Ctrl+C still works on it. `writeClipboard` is idempotent, so both paths writing
+  // the same text is harmless (no double-write bug). `CliRenderer extends
+  // EventEmitter`, so `on('selection', …)` is untyped → annotate `selection`.
+  const onCopy = options.onCopySelection
+  if (onCopy) {
+    renderer.on('selection', (selection: Selection) => {
+      const text = selection.getSelectedText()
+      if (text) onCopy(text)
+    })
+  }
 
   return { renderer, shutdown } as const
 })
