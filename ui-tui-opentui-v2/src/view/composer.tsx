@@ -25,6 +25,7 @@ import { For, onMount, Show } from 'solid-js'
 
 import type { CompletionItem } from '../logic/store.ts'
 import type { PromptHistory } from '../logic/history.ts'
+import { type PasteStore, shouldPlaceholder } from '../logic/pastes.ts'
 import { useDimensions } from './dimensions.tsx'
 import { useTheme } from './theme.tsx'
 
@@ -82,6 +83,7 @@ export function Composer(props: {
   onDismiss?: (() => void) | undefined
   history?: PromptHistory | undefined
   onImagePaste?: (() => void) | undefined
+  pasteStore?: PasteStore | undefined
 }) {
   const theme = useTheme()
   const dims = useDimensions()
@@ -101,12 +103,15 @@ export function Composer(props: {
 
   const submit = () => {
     if (submitting || !ta) return
-    const text = ta.plainText.trim()
+    // Expand any `[Pasted text #N]` placeholders back to their full content before
+    // sending (item: pasted-text). No-op when nothing was placeheld.
+    const text = (props.pasteStore?.expand(ta.plainText) ?? ta.plainText).trim()
     if (!text) return
     submitting = true
     props.onSubmit(text)
     props.history?.push(text)
     ta.clear()
+    props.pasteStore?.clear()
     props.onDismiss?.()
     submitting = false
   }
@@ -206,12 +211,21 @@ export function Composer(props: {
           onMouseDown={() => ta?.focus()}
           onSubmit={submit}
           onPaste={(e: PasteEvent) => {
-            // An empty bracketed paste = an image-only clipboard (item 1) — read +
-            // attach it. Text pastes fall through to the textarea's native insert.
-            if (new TextDecoder().decode(e.bytes).trim() === '') {
+            const text = new TextDecoder().decode(e.bytes)
+            // An empty bracketed paste = an image-only clipboard (item 1) — read + attach it.
+            if (text.trim() === '') {
               e.preventDefault()
               props.onImagePaste?.()
+              return
             }
+            // A large paste becomes a compact `[Pasted text #N +M lines]` chip instead
+            // of flooding the input; the real text is expanded back on submit.
+            if (props.pasteStore && shouldPlaceholder(text)) {
+              e.preventDefault()
+              ta?.insertText(props.pasteStore.add(text))
+              return
+            }
+            // small pastes fall through to the textarea's native insert
           }}
           onContentChange={() => props.onType?.(ta?.plainText ?? '')}
         />

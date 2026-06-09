@@ -16,6 +16,7 @@
 import { Match, Switch } from 'solid-js'
 
 import type { PromptHistory } from '../logic/history.ts'
+import type { PasteStore } from '../logic/pastes.ts'
 import type { SessionStore } from '../logic/store.ts'
 import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
@@ -39,6 +40,7 @@ export interface AppProps {
   readonly sessionId?: () => string | undefined
   readonly history?: PromptHistory
   readonly onImagePaste?: () => void
+  readonly pasteStore?: PasteStore
 }
 
 const NOOP = () => {}
@@ -97,6 +99,7 @@ export function App(props: AppProps) {
                     onDismiss={() => props.store.clearCompletions()}
                     history={props.history}
                     onImagePaste={props.onImagePaste}
+                    pasteStore={props.pasteStore}
                   />
                 }
               >

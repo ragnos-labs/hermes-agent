@@ -30,6 +30,7 @@ import { getLog } from '../boundary/log.ts'
 import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
 import { createPromptHistory, dirHistoryPersister, loadDirHistory } from '../logic/history.ts'
+import { createPasteStore } from '../logic/pastes.ts'
 import { mapResumeHistory, mapSessionList } from '../logic/resume.ts'
 import { dispatchSlash, mapCompletions, planCompletion, readReplaceFrom, type SlashContext } from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
@@ -183,6 +184,11 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         initial: loadDirHistory(historyCwd),
         persist: dirHistoryPersister(historyCwd)
       })
+
+      // Pasted-text store — created ONCE here so it survives the composer
+      // remounting (overlay open/close); a per-composer store would lose a
+      // pending `[Pasted text #N]` mid-compose and submit would send it literally.
+      const pasteStore = createPasteStore()
 
       // Contact point #2: boundary pushes decoded events into the Solid store.
       const gateway = yield* GatewayService
@@ -388,6 +394,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
                 sessionId={() => gateway.sessionId()}
                 history={history}
                 onImagePaste={onImagePaste}
+                pasteStore={pasteStore}
               />
             </ThemeProvider>
           ),
