@@ -9,13 +9,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "== [1/3] type-check =="
+echo "== [1/4] format (prettier --check) =="
+bunx prettier --check src
+
+echo "== [2/4] type-check =="
 bun run type-check
 
-echo "== [2/3] lint =="
+echo "== [3/4] lint =="
 bun run lint
 
-echo "== [3/3] bun test (incl. headless frame gate) =="
+echo "== [4/4] bun test (incl. headless frame gate) =="
 bun test
 
 echo "== check OK =="
