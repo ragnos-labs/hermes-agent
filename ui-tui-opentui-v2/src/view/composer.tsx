@@ -178,15 +178,20 @@ export function Composer(props: {
             paddingRight: 1
           }}
         >
+          {/* the completion dropdown is transient input chrome (menu rows + the
+              key-hint) — not transcript content — so it's excluded from mouse
+              selection (item 4). */}
           <For each={completions().slice(0, 8)}>
             {(c, i) => (
-              <text fg={i() === 0 ? theme().color.accent : theme().color.text}>
+              <text selectable={false} fg={i() === 0 ? theme().color.accent : theme().color.text}>
                 {c.display || c.text}
                 {c.meta ? `  ${c.meta}` : ''}
               </text>
             )}
           </For>
-          <text fg={theme().color.muted}>Tab complete · Esc dismiss</text>
+          <text selectable={false} fg={theme().color.muted}>
+            Tab complete · Esc dismiss
+          </text>
         </box>
       </Show>
       {/* prompt glyph + textarea — the glyph (item 3) marks the input line so the

@@ -103,7 +103,11 @@ export function ToolPart(props: { part: ToolPartState }) {
           </text>
         </box>
         <box style={{ flexDirection: 'row', flexGrow: 1, minWidth: 0 }}>
-          <text>
+          {/* the whole header row is a collapsed SUMMARY (tool name + args-preview
+              + duration + "(N lines)") — chrome, not the copyable body — so a
+              free-form drag over a tool yields only the expanded output/args
+              content, never the header label (item 4). */}
+          <text selectable={false}>
             <span style={{ fg: theme().color.muted }}>{props.part.name}</span>
             <Show when={running()}>
               <span style={{ fg: theme().color.muted }}> …</span>
@@ -134,7 +138,8 @@ export function ToolPart(props: { part: ToolPartState }) {
         >
           <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
             <Show when={showArgs()}>
-              <text>
+              {/* section label — chrome, not content (item 4) */}
+              <text selectable={false}>
                 <span style={{ fg: theme().color.label }}>args</span>
               </text>
               {/* parsed key: value lines (tidy), or raw argsText when unparseable */}
@@ -158,14 +163,16 @@ export function ToolPart(props: { part: ToolPartState }) {
                   )}
                 </For>
                 <Show when={argEntries().length > ARGS_MAX}>
-                  <text>
+                  {/* overflow annotation — chrome, not content (item 4) */}
+                  <text selectable={false}>
                     <span style={{ fg: theme().color.accent }}>{`… +${argEntries().length - ARGS_MAX} more`}</span>
                   </text>
                 </Show>
               </Show>
             </Show>
             <Show when={showArgs() && hasOutput()}>
-              <text>
+              {/* section label — chrome, not content (item 4) */}
+              <text selectable={false}>
                 <span style={{ fg: theme().color.label }}>output</span>
               </text>
             </Show>
@@ -176,13 +183,15 @@ export function ToolPart(props: { part: ToolPartState }) {
                 </text>
               )}
             </For>
+            {/* truncation annotations — chrome (the "… omitted N" / "… +N more
+                lines" notes are not part of the real output body) (item 4). */}
             <Show when={props.part.omittedNote}>
-              <text>
+              <text selectable={false}>
                 <span style={{ fg: theme().color.muted }}>{`… omitted ${props.part.omittedNote}`}</span>
               </text>
             </Show>
             <Show when={body().hiddenLines > 0 && !props.part.omittedNote}>
-              <text>
+              <text selectable={false}>
                 <span style={{ fg: theme().color.accent }}>{`… +${body().hiddenLines} more lines`}</span>
               </text>
             </Show>

@@ -61,7 +61,8 @@ export function MessageLine(props: { message: Message }) {
                 </text>
               }
             >
-              <text>
+              <text selectable={false}>
+                {/* streaming caret — a cursor glyph, not content (item 4) */}
                 <span style={{ fg: theme().color.muted }}>▍</span>
               </text>
             </Show>

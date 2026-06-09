@@ -50,7 +50,10 @@ export function ReasoningPart(props: { text: string; streaming?: boolean }) {
               <span style={{ fg: theme().color.accent }}>{expanded() ? '▼' : '▶'}</span>
             </text>
           </box>
-          <text>
+          {/* the header is a collapsible-section LABEL (Thinking/Thought + title)
+              — chrome, not the reasoning body — so a free-form drag yields only
+              the markdown body below, not the section label (item 4). */}
+          <text selectable={false}>
             {/* accent chevron marks it; muted label keeps reasoning in the dim,
                 secondary tier alongside tool calls (Ink hierarchy). */}
             <span style={{ fg: theme().color.muted }}>{label()}</span>
