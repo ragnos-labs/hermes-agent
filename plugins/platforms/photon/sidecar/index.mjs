@@ -164,6 +164,38 @@ function stampInboundHeartbeat() {
   }
 }
 
+// The spectrum-ts upstream gRPC channel to Photon can drop ("[upstream]
+// Connection dropped") and NOT self-recover: inbound + outbound both silently
+// stop. spectrum-ts's in-session reconnect is unreliable here, so a clean
+// process restart (fresh channel) is the recovery. We detect the dead-upstream
+// error and exit non-zero; the supervisor (start_photon_keez.sh) and the
+// launchd reaper relaunch the sidecar with a new connection.
+function isUpstreamDown(e) {
+  // High-confidence dead-channel signals only. A false positive here costs a
+  // ~90s bridge restart (sidecar exits -> heartbeat stale -> reaper), so we do
+  // NOT treat transient/ambiguous errors (timeouts, "unavailable") as fatal.
+  const msg = (e && (e.message || String(e))) || "";
+  const name = (e && e.name) || "";
+  return (
+    name === "ConnectionError" ||
+    /connection dropped/i.test(msg) ||
+    /\[upstream\]\s*connection/i.test(msg)
+  );
+}
+
+let _exitingForUpstream = false;
+function exitForUpstream(reason) {
+  if (_exitingForUpstream) return;
+  _exitingForUpstream = true;
+  console.error(
+    "photon-sidecar: upstream connection dead (" +
+      reason +
+      ") -> exiting for a clean restart"
+  );
+  // Brief delay so any in-flight HTTP response flushes, then exit non-zero.
+  setTimeout(() => process.exit(75), 250);
+}
+
 // Write one NDJSON line to the active consumer. Blocks until a consumer is
 // connected; if the write fails (consumer vanished mid-flight) we wait for a
 // new consumer and retry, so a message is never silently dropped here.
@@ -278,10 +310,14 @@ async function normalizeEvent(space, message) {
 // always recovers (the adapter dedupes any catch-up replay).
 (async () => {
   let backoff = 1000;
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 5; // ~ backoff maxed out => upstream is dead
   for (;;) {
     try {
       for await (const [space, message] of app.messages) {
         backoff = 1000; // healthy traffic — reset
+        consecutiveFailures = 0;
+        stampInboundHeartbeat(); // real upstream message => upstream is alive
         // Only forward inbound messages (ignore our own outbound echoes).
         if (message && message.direction && message.direction !== "inbound") {
           continue;
@@ -292,11 +328,21 @@ async function normalizeEvent(space, message) {
         await deliver(JSON.stringify(event));
       }
       console.error("photon-sidecar: inbound stream ended — re-subscribing");
+      consecutiveFailures += 1;
     } catch (e) {
+      consecutiveFailures += 1;
       console.error(
-        "photon-sidecar: inbound stream errored — restarting: " +
+        "photon-sidecar: inbound stream errored — restarting (" +
+          consecutiveFailures +
+          "): " +
           (e && e.message ? e.message : String(e))
       );
+    }
+    // If the stream keeps ending/erroring back-to-back, spectrum-ts's internal
+    // reconnect is not recovering -> exit for a fresh-channel restart.
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      exitForUpstream("inbound stream stuck x" + consecutiveFailures);
+      return;
     }
     await new Promise((r) =>
       setTimeout(r, backoff + Math.random() * backoff * 0.2)
@@ -525,7 +571,12 @@ const server = http.createServer(async (req, res) => {
     );
     // serverError() intentionally returns a generic message — see its
     // body for the rationale.
-    return serverError(res);
+    serverError(res);
+    // A dead upstream surfaces here first (send/typing throw it). Exit so the
+    // supervisor restarts the sidecar with a fresh Photon channel rather than
+    // limping on with inbound + outbound both broken.
+    if (isUpstreamDown(e)) exitForUpstream("handler error");
+    return;
   }
 });
 
