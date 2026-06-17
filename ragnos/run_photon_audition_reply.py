@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""RAGnos sibling-service entrypoint: Photon inbound adapter -> audition reply.
+"""RAGnos sibling-service entrypoint: Photon inbound adapter -> Keez CoS over text.
 
-A SECOND, deliberately narrow inbound runner. Unlike run_photon_keez.py (which
-wires the full Keez brain), this one installs the AUDITION-SCOPED handler from
-``home_agent.audition_reply``: an inbound text from the allowlisted operator is
-treated as a reply to the most-recent audition alert thread, confirmed, then sent
-as an email reply via gws. Nothing else is answered.
+The inbound runner. It installs the UNIFIED conversational-CoS handler from
+``home_agent.cos_text_handler.build_live_cos_handler``, gated by
+``KEEZ_TEXT_COS_ENABLED``:
+  off (default) -> delegates verbatim to the audition-reply handler (today's
+                   behavior: reply to the most-recent audition alert, confirm,
+                   send via gws). Nothing else is answered.
+  on            -> full conversational CoS: text Keez anything; it answers drawing
+                   from the entire system (brain + Librarian + live sources) and
+                   takes actions (auto low-risk / confirm high-risk). Audition
+                   reply is absorbed as the email-reply path.
 
 Sidecar policy (CRITICAL): this runner does NOT spawn a sidecar. It sets
 ``PHOTON_SIDECAR_AUTOSTART=false`` so it connects to the EXISTING durable
@@ -53,15 +58,18 @@ async def _run() -> int:
 
     from gateway.config import PlatformConfig
     from plugins.platforms.photon.adapter import PhotonAdapter
-    from home_agent.audition_reply import build_live_handler
+    from home_agent.cos_text_handler import build_live_cos_handler
 
     allow = _allowlist()
     if not allow:
         log.error("PHOTON_ALLOWED_USERS empty -- refusing to start (would block all). Set it in Infisical.")
         return 78  # EX_CONFIG: do not crash-loop fast on a config gap
 
+    # Unified conversational-CoS handler. Gated by KEEZ_TEXT_COS_ENABLED:
+    #   off (default) -> delegates verbatim to the audition-reply handler (today's behavior).
+    #   on            -> full CoS (brain + live sources + audition absorbed).
     adapter = PhotonAdapter(PlatformConfig(extra={}))
-    adapter.set_message_handler(build_live_handler(os.environ))
+    adapter.set_message_handler(build_live_cos_handler(os.environ))
 
     if not await adapter.connect():
         log.error("adapter.connect() failed (missing creds or sidecar). See logs above.")
