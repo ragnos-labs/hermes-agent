@@ -1274,7 +1274,12 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             data = await self._sidecar_call("/send", body)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            # Preserve the exception TYPE when str(e) is empty -- httpx timeout
+            # exceptions (ReadTimeout/WriteTimeout) often stringify to "" -- so
+            # _is_timeout_error() can detect a read/write timeout and SUPPRESS the
+            # plain-text fallback. A slow-but-delivered /send must not be re-sent,
+            # or the user gets a duplicate iMessage.
+            return SendResult(success=False, error=str(e) or type(e).__name__)
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
@@ -1336,9 +1341,12 @@ class PhotonAdapter(BasePlatformAdapter):
         # persistent _http_client was created on (e.g. via _run_async in
         # send_message_tool).  The inbound streaming loop continues to use
         # _http_client directly — it always runs on the gateway's loop.
+        # Photon's free-tier ack latency is variable (observed 8s to >30s); use an
+        # env-configurable timeout (default 90s) so a slow-but-delivered send is
+        # not false-failed into a duplicate fallback.
         url = f"http://{self._sidecar_bind}:{self._sidecar_port}{path}"
         headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=float(os.getenv("PHOTON_SIDECAR_TIMEOUT") or 90.0)) as client:
             resp = await client.post(url, json=body, headers=headers)
         if resp.status_code != 200:
             raise RuntimeError(
