@@ -49,7 +49,7 @@ def _write_allowlist(phone: str) -> None:
         return
     out = []
     found = False
-    for ln in envf.read_text().splitlines():
+    for ln in envf.read_text(encoding="utf-8").splitlines():
         if ln.startswith("export PHOTON_ALLOWED_USERS="):
             out.append(f"export PHOTON_ALLOWED_USERS={phone}")
             found = True
@@ -57,7 +57,7 @@ def _write_allowlist(phone: str) -> None:
             out.append(ln)
     if not found:
         out.append(f"export PHOTON_ALLOWED_USERS={phone}")
-    envf.write_text("\n".join(out) + "\n")
+    envf.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
 def main() -> int:
