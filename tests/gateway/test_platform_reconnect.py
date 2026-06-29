@@ -545,8 +545,10 @@ class TestRuntimeDisconnectQueuing:
         assert runner._failed_platforms[Platform.TELEGRAM]["attempts"] == 0
 
     @pytest.mark.asyncio
-    async def test_retryable_runtime_error_reconnects_immediately(self):
-        """Runtime failures should not wait for the startup retry delay."""
+    async def test_retryable_runtime_error_queued_with_retry_delay(self):
+        """Retryable runtime failures are queued for background reconnection with
+        the standard ~30s retry delay (upstream behavior). Fast Photon recovery is
+        handled by the adapter's own sidecar-death watcher, not a gateway-core edit."""
         runner = _make_runner()
         runner.stop = AsyncMock()
 
@@ -556,11 +558,10 @@ class TestRuntimeDisconnectQueuing:
 
         before = time.monotonic()
         await runner._handle_adapter_fatal_error(adapter)
-        after = time.monotonic()
 
         info = runner._failed_platforms[Platform.TELEGRAM]
         assert info["attempts"] == 0
-        assert before <= info["next_retry"] <= after
+        assert info["next_retry"] >= before + 30
 
     @pytest.mark.asyncio
     async def test_nonretryable_runtime_error_not_queued(self):
