@@ -17,6 +17,9 @@
 // Protocol (all requests require `X-Hermes-Sidecar-Token: ${TOKEN}`):
 //   - GET  /inbound    -> 200 NDJSON stream; one JSON event per line, blank
 //                         lines are heartbeats. One consumer at a time.
+//   - POST /inbound-ack -> acknowledge one handle-bearing event only after its
+//                         secure bytes and durable job submission succeeded
+//       exact body: {"deliveryId": "<48 lowercase hex>"}
 //   - GET  /attachment/<opaque-handle> -> one-shot raw attachment bytes
 //   - POST /healthz     -> {"ok": true}
 //   - POST /send        -> {"ok": true, "messageId": "..."}
@@ -83,6 +86,12 @@ import {
   normalizeInboundBinaryContent,
   serveAttachmentHandle,
 } from "./attachment-handles.mjs";
+import {
+  deliverPendingEntry,
+  InboundDeliveryQueue,
+  eventHasAttachmentHandle,
+  parseDeliveryAck,
+} from "./inbound-deliveries.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -108,6 +117,10 @@ const attachmentHandles = new AttachmentHandleStore({
   maxItemBytes: ATTACHMENT_MAX_ITEM_BYTES,
   maxTotalBytes: ATTACHMENT_MAX_TOTAL_BYTES,
   maxCount: ATTACHMENT_MAX_COUNT,
+  ttlMs: ATTACHMENT_TTL_MS,
+});
+const inboundDeliveries = new InboundDeliveryQueue({
+  maxBytes: 2 * 1024 * 1024,
   ttlMs: ATTACHMENT_TTL_MS,
 });
 const DM_CHAT_GUID_RE = /^any;-;(\+\d{6,})$/;
@@ -307,6 +320,8 @@ const app = await Spectrum({
 // At most one Python consumer is attached at a time (the gateway adapter).
 let consumerRes = null;
 let consumerWaiters = [];
+let consumerVersion = 0;
+let consumerChangeWaiters = [];
 const knownSpaces = new Map();
 // Inbound Message objects by id, so /react can usually skip a
 // `space.getMessage` round trip when tapping back on a recent message.
@@ -362,13 +377,41 @@ function waitForConsumer() {
 
 function setConsumer(res) {
   consumerRes = res;
+  consumerVersion += 1;
+  const changeWaiters = consumerChangeWaiters;
+  consumerChangeWaiters = [];
+  for (const resolve of changeWaiters) resolve();
   const waiters = consumerWaiters;
   consumerWaiters = [];
   for (const resolve of waiters) resolve();
 }
 
 function clearConsumer(res) {
-  if (consumerRes === res) consumerRes = null;
+  if (consumerRes === res) {
+    consumerRes = null;
+    consumerVersion += 1;
+    const waiters = consumerChangeWaiters;
+    consumerChangeWaiters = [];
+    for (const resolve of waiters) resolve();
+  }
+}
+
+function waitForConsumerChange(version) {
+  if (consumerVersion !== version) {
+    return { promise: Promise.resolve("consumer_changed"), cancel() {} };
+  }
+  let waiter;
+  const promise = new Promise((resolve) => {
+    waiter = () => resolve("consumer_changed");
+    consumerChangeWaiters.push(waiter);
+  });
+  return {
+    promise,
+    cancel() {
+      const index = consumerChangeWaiters.indexOf(waiter);
+      if (index !== -1) consumerChangeWaiters.splice(index, 1);
+    },
+  };
 }
 
 // Operational heartbeat: stamp a file whenever the inbound consumer pipe is
@@ -579,7 +622,21 @@ function inboundStreamErrorMessage(e) {
         rememberKnownMessage(message);
         const event = await normalizeEvent(space, message);
         if (!event) continue;
-        await deliver(JSON.stringify(event));
+        if (eventHasAttachmentHandle(event)) {
+          const delivery = inboundDeliveries.begin(event);
+          const outcome = await deliverPendingEntry(delivery, {
+            waitForConsumer,
+            currentConsumer: () => ({ res: consumerRes, version: consumerVersion }),
+            waitForConsumerChange,
+            clearConsumer,
+          });
+          if (outcome !== "acked") {
+            exitForUpstream("inbound attachment acknowledgement unavailable");
+            await new Promise(() => {});
+          }
+        } else {
+          await deliver(JSON.stringify(event));
+        }
       }
       console.error("photon-sidecar: inbound stream ended — re-subscribing");
       consecutiveFailures += 1;
@@ -777,6 +834,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const body = await readBody(req);
+    if (req.url === "/inbound-ack") {
+      let deliveryId;
+      try {
+        deliveryId = parseDeliveryAck(body);
+      } catch {
+        return badRequest(res, "invalid_delivery_ack");
+      }
+      const status = inboundDeliveries.ack(deliveryId);
+      if (status === "not_found") {
+        res.statusCode = 404;
+        res.setHeader("Content-Type", "application/json");
+        return res.end(JSON.stringify({ ok: false, error: "delivery_not_found" }));
+      }
+      return ok(res, { deliveryId, status });
+    }
     if (req.url === "/send") {
       try {
         const receipt = await sendTextMessage({
@@ -958,6 +1030,7 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   attachmentHandles.close();
+  inboundDeliveries.close();
   console.error(`photon-sidecar: received ${signal}, stopping...`);
   try {
     await Promise.race([

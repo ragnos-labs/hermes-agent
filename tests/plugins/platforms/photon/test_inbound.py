@@ -4,6 +4,7 @@ These bypass the loopback HTTP stream — they call ``_dispatch_inbound`` /
 ``_on_inbound_line`` / ``_is_duplicate`` directly, exercising the
 sidecar-event parsing without spawning the Node sidecar or binding ports.
 """
+
 from __future__ import annotations
 
 import json
@@ -12,7 +13,7 @@ from typing import Any, Dict, List
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.photon.adapter import (
     PhotonAdapter,
     PhotonAttachmentConsumerUnavailable,
@@ -26,17 +27,22 @@ def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
     return PhotonAdapter(cfg)
 
 
-def _capture(adapter: PhotonAdapter, monkeypatch: pytest.MonkeyPatch) -> List[MessageEvent]:
+def _capture(
+    adapter: PhotonAdapter, monkeypatch: pytest.MonkeyPatch
+) -> List[MessageEvent]:
     captured: List[MessageEvent] = []
 
     async def fake_handle(event: MessageEvent) -> None:
         captured.append(event)
+        if isinstance(event.raw_message, dict) and event.raw_message.get("deliveryId"):
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     return captured
 
 
 def _accept_secure_handles(adapter: PhotonAdapter) -> None:
+    adapter.set_attachment_sender_authorizer(lambda _source, _event: True)
     adapter.set_attachment_handle_consumer(lambda _event: True)
 
 
@@ -119,9 +125,11 @@ async def test_dispatch_attachment_without_bytes_surfaces_marker(
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
 
-    event = _attachment_event(
-        {"name": "IMG_4127.HEIC", "mimeType": "image/heic", "size": 12345}
-    )
+    event = _attachment_event({
+        "name": "IMG_4127.HEIC",
+        "mimeType": "image/heic",
+        "size": 12345,
+    })
     await adapter._dispatch_inbound(event)
     assert len(captured) == 1
     ev = captured[0]
@@ -142,14 +150,12 @@ async def test_dispatch_attachment_preserves_secure_handle_without_plaintext_cac
     captured = _capture(adapter, monkeypatch)
 
     handle = "a" * 48
-    event = _attachment_event(
-        {
-            "name": "photo.png",
-            "mimeType": "image/png",
-            "size": 67,
-            "handle": handle,
-        }
-    )
+    event = _attachment_event({
+        "name": "photo.png",
+        "mimeType": "image/png",
+        "size": 67,
+        "handle": handle,
+    })
     await adapter._dispatch_inbound(event)
 
     assert len(captured) == 1
@@ -168,15 +174,13 @@ async def test_dispatch_ignores_legacy_inline_base64(
     """A stale or compromised sidecar cannot revive plaintext disk caching."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
-    event = _attachment_event(
-        {
-            "name": "legacy.txt",
-            "mimeType": "text/plain",
-            "size": 6,
-            "data": "c2VjcmV0",
-            "encoding": "base64",
-        }
-    )
+    event = _attachment_event({
+        "name": "legacy.txt",
+        "mimeType": "text/plain",
+        "size": 6,
+        "data": "c2VjcmV0",
+        "encoding": "base64",
+    })
 
     await adapter._dispatch_inbound(event)
 
@@ -206,6 +210,7 @@ async def test_handle_without_secure_consumer_fails_retryably_instead_of_dispatc
         },
         msg_id="secure-handle-no-consumer",
     )
+    event["deliveryId"] = "9" * 48
 
     with pytest.raises(PhotonAttachmentConsumerUnavailable):
         await adapter._on_inbound_line(json.dumps(event))
@@ -230,6 +235,7 @@ async def test_registered_secure_consumer_receives_raw_handle_before_generic_dis
         consumed.append(event["content"]["handle"])
         return True
 
+    adapter.set_attachment_sender_authorizer(lambda _source, _event: True)
     adapter.set_attachment_handle_consumer(consume)
     event = _attachment_event(
         {
@@ -240,6 +246,12 @@ async def test_registered_secure_consumer_receives_raw_handle_before_generic_dis
         },
         msg_id="secure-handle-consumed",
     )
+    event["deliveryId"] = "8" * 48
+
+    async def ack(_path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_sidecar_call", ack)
 
     await adapter._on_inbound_line(json.dumps(event))
 
@@ -247,6 +259,203 @@ async def test_registered_secure_consumer_receives_raw_handle_before_generic_dis
     assert len(captured) == 1
     assert captured[0].media_urls == []
     assert captured[0].raw_message["content"]["handle"] == "f" * 48
+
+
+@pytest.mark.asyncio
+async def test_group_attachment_without_mention_never_crosses_secure_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    adapter.require_mention = True
+    captured = _capture(adapter, monkeypatch)
+    calls: list[str] = []
+    adapter.set_attachment_sender_authorizer(
+        lambda _source, _event: calls.append("authorize") or True
+    )
+    adapter.set_attachment_handle_consumer(
+        lambda _event: calls.append("consume") or True
+    )
+    event = _attachment_event({"handle": "1" * 48}, "ignored-group-handle")
+    event["space"] = {"id": "group-1", "type": "group", "phone": None}
+
+    await adapter._dispatch_inbound(event)
+
+    assert calls == []
+    assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_ignored_group_attachment_is_acked_without_secure_redemption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    adapter.require_mention = True
+    calls: list[str] = []
+    adapter.set_attachment_sender_authorizer(
+        lambda _source, _event: calls.append("authorize") or True
+    )
+    adapter.set_attachment_handle_consumer(
+        lambda _event: calls.append("consume") or True
+    )
+
+    async def ack(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append(f"ack:{path}:{body['deliveryId']}")
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_sidecar_call", ack)
+    event = _attachment_event({"handle": "a" * 48}, "ignored-group-ack")
+    event["space"] = {"id": "group-2", "type": "group", "phone": None}
+    event["deliveryId"] = "b" * 48
+
+    await adapter._on_inbound_line(json.dumps(event))
+
+    assert calls == [f"ack:/inbound-ack:{'b' * 48}"]
+
+
+@pytest.mark.asyncio
+async def test_attachment_authorizes_then_consumes_then_dispatches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    calls: list[str] = []
+
+    async def dispatch(_event: MessageEvent) -> None:
+        calls.append("dispatch")
+        await adapter.on_processing_complete(_event, ProcessingOutcome.SUCCESS)
+
+    monkeypatch.setattr(adapter, "handle_message", dispatch)
+    adapter.set_attachment_sender_authorizer(
+        lambda _source, _event: calls.append("authorize") or True
+    )
+    adapter.set_attachment_handle_consumer(
+        lambda _event: calls.append("consume") or True
+    )
+
+    await adapter._dispatch_inbound(_attachment_event({"handle": "2" * 48}))
+
+    assert calls == ["authorize", "consume", "dispatch"]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_attachment_never_reaches_consumer_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        adapter,
+        "handle_message",
+        lambda _event: calls.append("dispatch"),
+    )
+    adapter.set_attachment_sender_authorizer(
+        lambda _source, _event: calls.append("authorize") or False
+    )
+    adapter.set_attachment_handle_consumer(
+        lambda _event: calls.append("consume") or True
+    )
+
+    with pytest.raises(PhotonAttachmentConsumerUnavailable):
+        await adapter._dispatch_inbound(_attachment_event({"handle": "3" * 48}))
+
+    assert calls == ["authorize"]
+
+
+@pytest.mark.asyncio
+async def test_delivery_ack_follows_secure_acceptance_and_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    calls: list[str] = []
+    adapter.set_attachment_sender_authorizer(
+        lambda _source, _event: calls.append("authorize") or True
+    )
+    adapter.set_attachment_handle_consumer(
+        lambda _event: calls.append("consume") or True
+    )
+
+    async def dispatch(_event: MessageEvent) -> None:
+        calls.append("dispatch")
+        await adapter.on_processing_complete(_event, ProcessingOutcome.SUCCESS)
+
+    async def sidecar_call(path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append(f"ack:{path}:{body['deliveryId']}")
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "handle_message", dispatch)
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    event = _attachment_event({"handle": "4" * 48}, "acked-handle")
+    event["deliveryId"] = "5" * 48
+
+    await adapter._on_inbound_line(json.dumps(event))
+
+    assert calls == ["authorize", "consume", "dispatch", f"ack:/inbound-ack:{'5' * 48}"]
+
+
+@pytest.mark.asyncio
+async def test_ack_failure_replays_without_double_consuming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    calls: list[str] = []
+    adapter.set_attachment_sender_authorizer(
+        lambda _source, _event: calls.append("authorize") or True
+    )
+    adapter.set_attachment_handle_consumer(
+        lambda _event: calls.append("consume") or True
+    )
+
+    async def dispatch(_event: MessageEvent) -> None:
+        calls.append("dispatch")
+        await adapter.on_processing_complete(_event, ProcessingOutcome.SUCCESS)
+
+    monkeypatch.setattr(adapter, "handle_message", dispatch)
+    attempts = 0
+
+    async def sidecar_call(_path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("connection lost")
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    event = _attachment_event({"handle": "6" * 48}, "replay-handle")
+    event["deliveryId"] = "7" * 48
+    line = json.dumps(event)
+
+    with pytest.raises(RuntimeError, match="connection lost"):
+        await adapter._on_inbound_line(line)
+    await adapter._on_inbound_line(line)
+
+    assert calls == ["authorize", "consume", "dispatch"]
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_background_processing_is_not_acked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
+    sidecar_calls: list[str] = []
+
+    async def dispatch(event: MessageEvent) -> None:
+        await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    async def sidecar_call(path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+        sidecar_calls.append(path)
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "handle_message", dispatch)
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    event = _attachment_event({"handle": "c" * 48}, "failed-background")
+    event["deliveryId"] = "e" * 48
+
+    with pytest.raises(RuntimeError, match="secure_attachment_dispatch_failed"):
+        await adapter._on_inbound_line(json.dumps(event))
+
+    assert "/inbound-ack" not in sidecar_calls
+    assert "failed-background" not in adapter._seen_messages
 
 
 @pytest.mark.asyncio
@@ -302,15 +511,13 @@ async def test_dispatch_voice_preserves_handle_without_plaintext_cache(
     _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
-    event = _voice_event(
-        {
-            "name": "note.ogg",
-            "mimeType": "audio/ogg",
-            "duration": 7,
-            "size": 36,
-            "handle": "c" * 48,
-        }
-    )
+    event = _voice_event({
+        "name": "note.ogg",
+        "mimeType": "audio/ogg",
+        "duration": 7,
+        "size": 36,
+        "handle": "c" * 48,
+    })
     await adapter._dispatch_inbound(event)
 
     assert len(captured) == 1
@@ -330,9 +537,12 @@ async def test_dispatch_voice_without_bytes_surfaces_marker(
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
 
-    event = _voice_event(
-        {"name": "note.m4a", "mimeType": "audio/mp4", "duration": 12, "size": 12345}
-    )
+    event = _voice_event({
+        "name": "note.m4a",
+        "mimeType": "audio/mp4",
+        "duration": 12,
+        "size": 12345,
+    })
     await adapter._dispatch_inbound(event)
 
     assert len(captured) == 1
@@ -354,14 +564,12 @@ async def test_dispatch_attachment_document_stays_behind_handle(
     _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
-    event = _attachment_event(
-        {
-            "name": "report.pdf",
-            "mimeType": "application/pdf",
-            "size": 29,
-            "handle": "d" * 48,
-        }
-    )
+    event = _attachment_event({
+        "name": "report.pdf",
+        "mimeType": "application/pdf",
+        "size": 29,
+        "handle": "d" * 48,
+    })
     await adapter._dispatch_inbound(event)
 
     assert len(captured) == 1
@@ -388,7 +596,9 @@ async def test_on_inbound_line_dispatches_and_dedups(
 
 
 @pytest.mark.asyncio
-async def test_on_inbound_line_ignores_bad_json(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_on_inbound_line_ignores_bad_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
 

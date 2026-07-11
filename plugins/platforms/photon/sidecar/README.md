@@ -97,20 +97,57 @@ response completion, close, error, TTL expiry, or shutdown. A stalled client
 is destroyed at TTL expiry, so it cannot move plaintext outside the bounded
 store accounting or retain a queued response after its lease ends.
 
+Handle-bearing events add a random 48-character `deliveryId`. A successful
+NDJSON socket write is not acceptance. The sidecar retains exactly one pending
+event (maximum 2 MiB, five-minute TTL), stops pulling later provider events,
+and replays the identical event and delivery ID after an inbound consumer
+reconnect. The authenticated consumer must send the exact request below only
+after secure handle upload and durable job submission both succeed:
+
+```http
+POST /inbound-ack
+X-Hermes-Sidecar-Token: <shared token>
+Content-Type: application/json
+
+{"deliveryId":"<48 lowercase hex>"}
+```
+
+The ACK is idempotent for a bounded recent-token window. Unknown tokens return
+a content-free 404. Expiry fails closed and restarts the sidecar; it never lets
+later text overtake a pending attachment. Queue state, byte accounting, recent
+ACKs, and timers are bounded. Logs do not include message content, handles, or
+delivery IDs.
+
 This is the external half of the secure attachment flow. Generic Hermes has no
 encrypted media store, so the Python Photon adapter intentionally does not
 fetch a handle or create a media cache file. An embedding runtime must register
-`PhotonAdapter.set_attachment_handle_consumer(...)`; the callback receives the
-raw event and must return `True` only after accepting ownership of every
-handle. Without that consumer, attachment dispatch raises the retryable
-`ATTACHMENT_CONSUMER_UNAVAILABLE` fatal state, rolls back local dedup, and does
-not tell the generic model that media is ready. Keez can install this seam and
-redeem the raw handle inside its governed attachment boundary.
+both `PhotonAdapter.set_attachment_sender_authorizer(...)` and
+`PhotonAdapter.set_attachment_handle_consumer(...)`. Sender authorization and
+group mention acceptance run before the consumer. The callback receives the
+raw event and must return `True` only when the downstream secure handler owns
+handle redemption. It does not redeem the one-shot handle itself. The
+production runner derives that readiness callback only from the exact handler
+marker `keez_attachment_handles_owned is True`, then waits for the handler's
+background processing-success hook before ACK. Without either callback,
+attachment dispatch raises the retryable
+`ATTACHMENT_CONSUMER_UNAVAILABLE` state, rolls back local dedup, and does not
+tell the generic model that media is ready.
 
-The remaining limitation is upstream replay: Spectrum exposes no public
-restart cursor API, as documented above. Reconnect is requested after a missing
-consumer, but replay of that exact event is not guaranteed. A complete generic
-consumer and durable replay queue require a larger approved design.
+Keez's direct home-agent `/inbound` consumer follows the same wire contract; it
+does not use the Python callback seam. It must authorize the sender, enforce
+group mention policy, redeem each `/attachment/<handle>`, securely upload the
+bytes, durably submit the Box job keyed by `deliveryId`, and only then call
+`/inbound-ack`. Reading or parsing the NDJSON line must never auto-ACK it. A
+retry with the same delivery ID must resolve to the existing durable submit,
+not create a second job. The secure upload and Box submission must each use
+`deliveryId` as their idempotency key so a consumer crash after the one-shot
+GET can recover the existing durable result without redeeming the handle again.
+
+The remaining limitation is process crash replay. The pending event is held in
+memory, and Spectrum exposes no public restart cursor API. A sidecar process
+crash can therefore lose that local pending event before ACK. The protocol
+closes consumer disconnect and application failure windows, but not the
+provider-to-sidecar process-crash window.
 
 ## Reply and edit crash boundary
 

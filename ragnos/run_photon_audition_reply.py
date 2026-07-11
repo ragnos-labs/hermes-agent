@@ -29,17 +29,46 @@ Env (rendered from Infisical in production):
   HOME_AGENT_SRC                              path to RAGnos tools/home-agent/src
   RAGNOS_WORKSPACE                            repo root (gws.js + threads file)
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import sys
+from typing import Any, Awaitable, Callable
 
 
 def _allowlist() -> list[str]:
     raw = os.environ.get("PHOTON_ALLOWED_USERS", "")
     return [p.strip() for p in raw.replace("\n", ",").split(",") if p.strip()]
+
+
+def _build_sender_authorizer(allowlist: list[str]) -> Callable[[Any, dict], bool]:
+    """Return the strict, normalized PHOTON_ALLOWED_USERS attachment gate."""
+    allowed = frozenset(str(value).strip() for value in allowlist if str(value).strip())
+
+    def authorize(source: Any, _event: dict) -> bool:
+        return bool(allowed and str(getattr(source, "user_id", "")).strip() in allowed)
+
+    return authorize
+
+
+def _build_attachment_readiness(
+    handler: Callable[[Any], Awaitable[str | None]],
+) -> Callable[[dict], Any]:
+    """Delegate readiness without redeeming the one-shot handle.
+
+    The Keez handler owns secure upload and durable submission during its
+    normal message call. Its optional readiness hook only confirms that this
+    capability is armed. The adapter ACKs after the handler call returns.
+    """
+    handles_owned = getattr(handler, "keez_attachment_handles_owned", False) is True
+
+    def check(_event: dict) -> bool:
+        return handles_owned
+
+    return check
 
 
 async def _run() -> int:
@@ -62,21 +91,30 @@ async def _run() -> int:
 
     allow = _allowlist()
     if not allow:
-        log.error("PHOTON_ALLOWED_USERS empty -- refusing to start (would block all). Set it in Infisical.")
+        log.error(
+            "PHOTON_ALLOWED_USERS empty -- refusing to start (would block all). Set it in Infisical."
+        )
         return 78  # EX_CONFIG: do not crash-loop fast on a config gap
 
     # Unified conversational-CoS handler. Gated by KEEZ_TEXT_COS_ENABLED:
     #   off (default) -> delegates verbatim to the audition-reply handler (today's behavior).
     #   on            -> full CoS (brain + live sources + audition absorbed).
     adapter = PhotonAdapter(PlatformConfig(extra={}))
-    adapter.set_message_handler(build_live_cos_handler(os.environ))
+    handler = build_live_cos_handler(os.environ)
+    adapter.set_attachment_sender_authorizer(_build_sender_authorizer(allow))
+    adapter.set_attachment_handle_consumer(_build_attachment_readiness(handler))
+    adapter.set_message_handler(handler)
 
     if not await adapter.connect():
-        log.error("adapter.connect() failed (missing creds or sidecar). See logs above.")
+        log.error(
+            "adapter.connect() failed (missing creds or sidecar). See logs above."
+        )
         return 1
     cos_enabled = os.environ.get("KEEZ_TEXT_COS_ENABLED", "").strip().lower()
     mode = "full CoS" if cos_enabled in {"1", "true", "yes", "on"} else "audition-reply"
-    log.info("connected; %s inbound active (allowlist=%d). Ctrl-C to stop.", mode, len(allow))
+    log.info(
+        "connected; %s inbound active (allowlist=%d). Ctrl-C to stop.", mode, len(allow)
+    )
     try:
         while True:
             await asyncio.sleep(3600)
