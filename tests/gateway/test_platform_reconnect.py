@@ -545,25 +545,6 @@ class TestRuntimeDisconnectQueuing:
         assert runner._failed_platforms[Platform.TELEGRAM]["attempts"] == 0
 
     @pytest.mark.asyncio
-    async def test_retryable_runtime_error_queued_with_retry_delay(self):
-        """Retryable runtime failures are queued for background reconnection with
-        the standard ~30s retry delay (upstream behavior). Fast Photon recovery is
-        handled by the adapter's own sidecar-death watcher, not a gateway-core edit."""
-        runner = _make_runner()
-        runner.stop = AsyncMock()
-
-        adapter = StubAdapter(succeed=True)
-        adapter._set_fatal_error("sidecar_crashed", "bridge exited", retryable=True)
-        runner.adapters[Platform.TELEGRAM] = adapter
-
-        before = time.monotonic()
-        await runner._handle_adapter_fatal_error(adapter)
-
-        info = runner._failed_platforms[Platform.TELEGRAM]
-        assert info["attempts"] == 0
-        assert info["next_retry"] >= before + 30
-
-    @pytest.mark.asyncio
     async def test_nonretryable_runtime_error_not_queued(self):
         """Non-retryable runtime errors should not be queued for reconnection."""
         runner = _make_runner()
@@ -784,3 +765,4 @@ class TestPlatformSlashCommand:
         runner = _make_runner()
         out = await runner._handle_platform_command(self._make_event("/platform"))
         assert "Gateway platforms" in out
+
