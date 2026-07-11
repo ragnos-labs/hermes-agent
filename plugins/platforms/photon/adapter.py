@@ -1007,8 +1007,8 @@ class PhotonAdapter(BasePlatformAdapter):
             if self._pid_alive(pid):
                 try:
                     os.kill(
-                        pid, signal.SIGKILL
-                    )  # windows-footgun: ok — unreachable on win32 (early return above)
+                        pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+                    )
                 except OSError:
                     pass
         # Give the OS a beat to release the listening socket.
@@ -1160,9 +1160,9 @@ class PhotonAdapter(BasePlatformAdapter):
             except subprocess.TimeoutExpired:
                 if sys.platform != "win32":
                     try:
-                        os.killpg(
+                        os.killpg(  # windows-footgun: ok
                             os.getpgid(proc.pid), signal.SIGTERM
-                        )  # windows-footgun: ok
+                        )
                     except (ProcessLookupError, PermissionError):
                         proc.terminate()
                 else:
