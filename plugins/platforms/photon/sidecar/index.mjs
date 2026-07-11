@@ -20,7 +20,11 @@
 //   - POST /healthz     -> {"ok": true}
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
-//              "format": "text" | "markdown" (default "text")}
+//              "format": "text" | "markdown" (default "text"),
+//              "clientMessageId": "stable-caller-id" (optional)}
+//       receipt: {"clientMessageId": "...", "confirmed": true,
+//                 "providerStatus": "accepted", "messageId": "...",
+//                 "deliveredAt": "..." | null}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
@@ -58,6 +62,10 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
+import {
+  SendRequestError,
+  sendTextMessage,
+} from "./send-contract.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -68,6 +76,12 @@ const sharedToken = process.env.PHOTON_SIDECAR_TOKEN;
 const telemetry = /^(1|true|yes|on)$/i.test(
   (process.env.PHOTON_TELEMETRY || "").trim()
 );
+
+// spectrum-ts 8.0.0's official Space.send type accepts content only. Keep
+// this false until a pinned SDK version exposes and tests a documented
+// clientMessageId send option; the sidecar still echoes the caller's stable
+// ID as its delivery correlation key.
+const SPECTRUM_SEND_SUPPORTS_CLIENT_MESSAGE_ID = false;
 
 // Inbound binary content is read into memory and base64-inlined on the NDJSON
 // event so the Python adapter can cache the real bytes (and the agent can see
@@ -783,20 +797,22 @@ const server = http.createServer(async (req, res) => {
     }
     const body = await readBody(req);
     if (req.url === "/send") {
-      const { spaceId, text, format = "text" } = body || {};
-      if (!spaceId || typeof text !== "string") {
-        return badRequest(res, "spaceId and text are required");
+      try {
+        const receipt = await sendTextMessage({
+          body,
+          resolveSpace,
+          textBuilder: spectrumText,
+          markdownBuilder: spectrumMarkdown,
+          sdkSupportsClientMessageId:
+            SPECTRUM_SEND_SUPPORTS_CLIENT_MESSAGE_ID,
+        });
+        return ok(res, receipt);
+      } catch (e) {
+        if (e instanceof SendRequestError) {
+          return badRequest(res, e.message);
+        }
+        throw e;
       }
-      if (format !== "text" && format !== "markdown") {
-        return badRequest(res, "format must be text or markdown");
-      }
-      const space = await resolveSpace(spaceId);
-      // iMessage renders markdown natively; spectrum-ts degrades it to
-      // readable plain text on platforms that don't.
-      const builder =
-        format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
-      const result = await space.send(builder);
-      return ok(res, { messageId: result?.id || null });
     }
     if (req.url === "/send-attachment") {
       const { spaceId, path, name, mimeType, caption, kind } =
