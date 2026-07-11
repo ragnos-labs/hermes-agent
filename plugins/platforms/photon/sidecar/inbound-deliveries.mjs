@@ -79,12 +79,13 @@ export class InboundDeliveryQueue {
     this.recentAcks = new Map();
   }
 
-  begin(event) {
+  begin(event, { bindDelivery = null } = {}) {
     if (this.pending) throw new Error("delivery_queue_full");
     const deliveryId = this.randomBytes(24).toString("hex");
     const line = JSON.stringify({ ...event, deliveryId });
     const bytes = Buffer.byteLength(line);
     if (bytes > this.maxBytes) throw new Error("delivery_too_large");
+    if (typeof bindDelivery === "function") bindDelivery(deliveryId);
     let settle;
     const settled = new Promise((resolve) => { settle = resolve; });
     const entry = { deliveryId, line, bytes, settled, settle, timer: null };

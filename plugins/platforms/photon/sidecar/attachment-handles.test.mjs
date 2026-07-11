@@ -46,6 +46,7 @@ test("attachment bytes are represented by metadata and an opaque leased handle",
   assert.equal("data" in event, false);
   assert.equal("encoding" in event, false);
 
+  store.bindHandles([event.handle], DELIVERY_ID);
   const leased = store.lease(event.handle, DELIVERY_ID);
   assert.deepEqual([...leased.entry.bytes], [1, 2, 3, 4]);
   assert.equal(leased.entry.mimeType, "image/png");
@@ -173,6 +174,7 @@ test("unknown-size Spectrum streams are read incrementally within the hard cap",
 
   const event = await normalizeInboundBinaryContent(content, store);
   assert.equal(event.size, 4);
+  store.bindHandles([event.handle], DELIVERY_ID);
   assert.deepEqual([...store.lease(event.handle, DELIVERY_ID).entry.bytes], [1, 2, 3, 4]);
 });
 
@@ -226,6 +228,95 @@ test("attachment lease action path schema is exact", () => {
   }
 });
 
+test("wrong first lease cannot claim a handle before its delivery is bound", () => {
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 16,
+    maxCount: 1,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+  });
+  const { handle } = store.put(Buffer.from("private bytes"), {});
+  const wrong = "e".repeat(48);
+  assert.throws(
+    () => store.lease(handle, wrong),
+    (error) => error.code === "binding_mismatch"
+  );
+  store.bindHandles([handle], DELIVERY_ID);
+  assert.throws(
+    () => store.lease(handle, wrong),
+    (error) => error.code === "binding_mismatch"
+  );
+  assert.equal(store.lease(handle, DELIVERY_ID).entry.bytes.toString(), "private bytes");
+});
+
+test("mixed group handles are atomically pre-bound to one delivery", () => {
+  let counter = 1;
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 32,
+    maxCount: 2,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+    randomBytes: () => Buffer.alloc(24, counter++),
+  });
+  const first = store.put(Buffer.from("first"), {}).handle;
+  const second = store.put(Buffer.from("second"), {}).handle;
+  store.bindEvent({
+    content: {
+      type: "group",
+      items: [
+        { content: { type: "attachment", handle: first } },
+        { content: { type: "voice", handle: second } },
+      ],
+    },
+  }, DELIVERY_ID);
+  assert.equal(store.lease(first, DELIVERY_ID).entry.bytes.toString(), "first");
+  assert.equal(store.lease(second, DELIVERY_ID).entry.bytes.toString(), "second");
+});
+
+test("partial multi-handle bind failure rolls back every new binding", () => {
+  let counter = 1;
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 32,
+    maxCount: 2,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+    randomBytes: () => Buffer.alloc(24, counter++),
+  });
+  const first = store.put(Buffer.from("first"), {}).handle;
+  const second = store.put(Buffer.from("second"), {}).handle;
+  store.bindHandles([second], "e".repeat(48));
+  assert.throws(
+    () => store.bindHandles([first, second], DELIVERY_ID),
+    (error) => error.code === "binding_failed"
+  );
+  store.bindHandles([first], DELIVERY_ID);
+  assert.equal(store.lease(first, DELIVERY_ID).entry.bytes.toString(), "first");
+  assert.equal(store.lease(second, "e".repeat(48)).entry.bytes.toString(), "second");
+});
+
+test("missing handle in a multi-bind leaves existing handles unbound", () => {
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 32,
+    maxCount: 2,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+  });
+  const existing = store.put(Buffer.from("private bytes"), {}).handle;
+  assert.throws(
+    () => store.bindHandles([existing, "f".repeat(48)], DELIVERY_ID),
+    (error) => error.code === "binding_failed"
+  );
+  store.bindHandles([existing], DELIVERY_ID);
+  assert.equal(
+    store.lease(existing, DELIVERY_ID).entry.bytes.toString(),
+    "private bytes"
+  );
+});
+
 class FakeResponse extends EventEmitter {
   constructor() {
     super();
@@ -255,6 +346,7 @@ test("consumer crash after lease replays the same bytes and lease", () => {
   const { handle } = store.put(Buffer.from("private bytes"), {
     mimeType: "text/plain",
   });
+  store.bindHandles([handle], DELIVERY_ID);
   const first = new FakeResponse();
   assert.equal(
     serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, first, store),
@@ -290,6 +382,7 @@ test("expired attachment lease returns the stable content-free not-found envelop
     setTimer: noTimer,
   });
   const { handle } = store.put(Buffer.from("private bytes"), {});
+  store.bindHandles([handle], DELIVERY_ID);
   now += 11;
   const expired = new FakeResponse();
   serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, expired, store);
@@ -309,6 +402,7 @@ test("response faults retain charged bytes for an exact replay", () => {
     setTimer: noTimer,
   });
   const { handle } = store.put(Buffer.from("private bytes"), {});
+  store.bindHandles([handle], DELIVERY_ID);
   class FailingResponse extends FakeResponse {
     end(body) {
       this.reference = body;
@@ -342,6 +436,7 @@ test("stalled responses remain charged and are wiped by the transfer TTL", () =>
     clearTimer: () => {},
   });
   const { handle } = store.put(Buffer.from("private bytes"), {});
+  store.bindHandles([handle], DELIVERY_ID);
   class StalledResponse extends FakeResponse {
     end(body) {
       this.reference = body;
@@ -380,6 +475,7 @@ test("only exact binding finalizes and duplicate finalize is idempotent", () => 
     setTimer: noTimer,
   });
   const { handle } = store.put(Buffer.from("private bytes"), {});
+  store.bindHandles([handle], DELIVERY_ID);
   const lease = store.lease(handle, DELIVERY_ID);
   assert.throws(
     () => store.finalize(handle, "e".repeat(48)),
@@ -408,6 +504,7 @@ test("consumed idempotency receipts are strictly count bounded under flood", () 
   for (let index = 0; index < 8; index += 1) {
     const { handle } = store.put(Buffer.from(`secret-${index}`), {});
     const deliveryId = index.toString(16).padStart(48, "0");
+    store.bindHandles([handle], deliveryId);
     const lease = store.lease(handle, deliveryId);
     assert.equal(store.finalize(handle, deliveryId), "consumed");
     assert.ok(store._consumed.size <= 2);
@@ -425,6 +522,7 @@ test("release preserves bytes and permits a fresh lease for the same delivery", 
     setTimer: noTimer,
   });
   const { handle } = store.put(Buffer.from("private bytes"), {});
+  store.bindHandles([handle], DELIVERY_ID);
   const first = store.lease(handle, DELIVERY_ID);
   assert.equal(store.releaseLease(handle, DELIVERY_ID, first.leaseId), "released");
   assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
@@ -442,6 +540,7 @@ test("consume and release HTTP mutations require exact bindings", () => {
     setTimer: noTimer,
   });
   const { handle } = store.put(Buffer.from("private bytes"), {});
+  store.bindHandles([handle], DELIVERY_ID);
   const lease = store.lease(handle, DELIVERY_ID);
   const consumed = new FakeResponse();
   assert.equal(mutateAttachmentLease(`/attachment/${handle}/consume`, {
@@ -465,6 +564,7 @@ test("completion close error and shutdown detach responses without consuming", (
       setTimer: noTimer,
     });
     const { handle } = store.put(Buffer.from("private bytes"), {});
+    store.bindHandles([handle], DELIVERY_ID);
     class ManualResponse extends FakeResponse {
       end(body, callback) {
         this.reference = body;

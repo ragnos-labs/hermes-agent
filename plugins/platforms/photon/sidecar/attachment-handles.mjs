@@ -166,6 +166,7 @@ export class AttachmentHandleStore {
           : null,
       expiresAt: this._now() + this.ttlMs,
       state: "queued",
+      deliveryId: null,
       lease: null,
       wiped: false,
       aborted: false,
@@ -203,6 +204,49 @@ export class AttachmentHandleStore {
     entry.lease = null;
   }
 
+  bindHandles(handles, deliveryId) {
+    if (typeof deliveryId !== "string" || !DELIVERY_RE.test(deliveryId)) {
+      throw new AttachmentHandleError("invalid_binding", "invalid delivery binding");
+    }
+    if (!Array.isArray(handles) || handles.length === 0 || handles.length > this.maxCount) {
+      throw new AttachmentHandleError("binding_failed", "attachment binding failed");
+    }
+    this.purgeExpired();
+    const unique = new Set(handles);
+    if (unique.size !== handles.length) {
+      throw new AttachmentHandleError("binding_failed", "attachment binding failed");
+    }
+    const entries = [];
+    for (const handle of handles) {
+      if (typeof handle !== "string" || !HANDLE_RE.test(handle)) {
+        throw new AttachmentHandleError("binding_failed", "attachment binding failed");
+      }
+      const entry = this._entries.get(handle);
+      if (!entry || entry.deliveryId !== null) {
+        throw new AttachmentHandleError("binding_failed", "attachment binding failed");
+      }
+      entries.push(entry);
+    }
+    for (const entry of entries) entry.deliveryId = deliveryId;
+  }
+
+  bindEvent(event, deliveryId) {
+    const handles = [];
+    const stack = [event?.content];
+    while (stack.length > 0 && handles.length <= this.maxCount) {
+      const content = stack.pop();
+      if (!content || typeof content !== "object") continue;
+      if (content.type === "attachment" || content.type === "voice") {
+        if (HANDLE_RE.test(String(content.handle || ""))) handles.push(content.handle);
+      } else if (content.type === "group") {
+        for (const item of Array.isArray(content.items) ? content.items : []) {
+          stack.push(item?.content);
+        }
+      }
+    }
+    this.bindHandles(handles, deliveryId);
+  }
+
   lease(handle, deliveryId, { onExpire = null } = {}) {
     this._validateBinding(handle, deliveryId);
     this.purgeExpired();
@@ -212,6 +256,9 @@ export class AttachmentHandleStore {
         "not_found",
         "attachment handle not found"
       );
+    }
+    if (entry.deliveryId !== deliveryId) {
+      throw new AttachmentHandleError("binding_mismatch", "attachment delivery is not bound");
     }
     if (entry.lease && entry.lease.deliveryId !== deliveryId) {
       throw new AttachmentHandleError("binding_mismatch", "attachment lease is bound");
@@ -246,7 +293,7 @@ export class AttachmentHandleStore {
     }
     const entry = this._entries.get(handle);
     if (!entry) throw new AttachmentHandleError("not_found", "attachment handle not found");
-    if (entry.lease?.deliveryId !== deliveryId) {
+    if (entry.deliveryId !== deliveryId || entry.lease?.deliveryId !== deliveryId) {
       throw new AttachmentHandleError("binding_mismatch", "attachment lease binding mismatch");
     }
     while (this._consumed.size >= this.maxCount) {
@@ -266,7 +313,11 @@ export class AttachmentHandleStore {
     this.purgeExpired();
     const entry = this._entries.get(handle);
     if (!entry) throw new AttachmentHandleError("not_found", "attachment handle not found");
-    if (entry.lease?.deliveryId !== deliveryId || entry.lease?.leaseId !== leaseId) {
+    if (
+      entry.deliveryId !== deliveryId ||
+      entry.lease?.deliveryId !== deliveryId ||
+      entry.lease?.leaseId !== leaseId
+    ) {
       throw new AttachmentHandleError("binding_mismatch", "attachment lease binding mismatch");
     }
     this._abortLease(entry);

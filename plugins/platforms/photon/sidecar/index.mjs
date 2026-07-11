@@ -627,7 +627,10 @@ function inboundStreamErrorMessage(e) {
         const event = await normalizeEvent(space, message);
         if (!event) continue;
         if (eventHasAttachmentHandle(event)) {
-          const delivery = inboundDeliveries.begin(event);
+          const delivery = inboundDeliveries.begin(event, {
+            bindDelivery: (deliveryId) =>
+              attachmentHandles.bindEvent(event, deliveryId),
+          });
           const outcome = await deliverPendingEntry(delivery, {
             waitForConsumer,
             currentConsumer: () => ({ res: consumerRes, version: consumerVersion }),

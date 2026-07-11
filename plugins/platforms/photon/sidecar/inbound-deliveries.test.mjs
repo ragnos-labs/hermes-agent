@@ -38,6 +38,33 @@ test("attachment delivery is content-bound, opaque, and charged", () => {
   assert.deepEqual(queue.stats(), { count: 1, totalBytes: Buffer.byteLength(entry.line) });
 });
 
+test("delivery binding runs before an event becomes pending and fails atomically", () => {
+  const t = timers();
+  const queue = new InboundDeliveryQueue({
+    maxBytes: 4096,
+    ttlMs: 600000,
+    randomBytes: () => Buffer.alloc(24, 0xcd),
+    setTimer: t.setTimer,
+    clearTimer: t.clearTimer,
+  });
+  let bound = null;
+  const entry = queue.begin(
+    { content: { type: "attachment", handle: "a".repeat(48) } },
+    { bindDelivery: (deliveryId) => { bound = deliveryId; } }
+  );
+  assert.equal(bound, entry.deliveryId);
+  queue.ack(entry.deliveryId);
+
+  assert.throws(
+    () => queue.begin(
+      { content: { type: "attachment", handle: "b".repeat(48) } },
+      { bindDelivery: () => { throw new Error("binding_failed"); } }
+    ),
+    /binding_failed/
+  );
+  assert.deepEqual(queue.stats(), { count: 0, totalBytes: 0 });
+});
+
 test("one pending event and byte limit are hard bounds", () => {
   const t = timers();
   const queue = new InboundDeliveryQueue({

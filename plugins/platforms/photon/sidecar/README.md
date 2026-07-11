@@ -107,7 +107,10 @@ Handle-bearing events add a random 48-character `deliveryId`. A successful
 NDJSON socket write is not acceptance. The sidecar retains exactly one pending
 event (maximum 2 MiB, five-minute TTL), stops pulling later provider events,
 and replays the identical event and delivery ID after an inbound consumer
-reconnect. The authenticated consumer must send the exact request below only
+reconnect. Before the event becomes pending, every handle in the normalized
+event is atomically pre-bound to that delivery ID. A missing, duplicate, or
+already-bound handle rejects the entire bind without changing any other
+handle. The authenticated consumer must send the exact request below only
 after secure handle upload and durable job submission both succeed:
 
 ```http
