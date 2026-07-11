@@ -5,14 +5,16 @@ import test from "node:test";
 import {
   AttachmentHandleError,
   AttachmentHandleStore,
+  mutateAttachmentLease,
   normalizeInboundBinaryContent,
-  parseAttachmentHandlePath,
-  serveAttachmentHandle,
+  parseAttachmentActionPath,
+  serveAttachmentLease,
 } from "./attachment-handles.mjs";
 
 const noTimer = () => ({ unref() {} });
+const DELIVERY_ID = "d".repeat(48);
 
-test("attachment bytes are represented by metadata and a one-shot opaque handle", async () => {
+test("attachment bytes are represented by metadata and an opaque leased handle", async () => {
   const store = new AttachmentHandleStore({
     maxItemBytes: 32,
     maxTotalBytes: 64,
@@ -44,14 +46,10 @@ test("attachment bytes are represented by metadata and a one-shot opaque handle"
   assert.equal("data" in event, false);
   assert.equal("encoding" in event, false);
 
-  const consumed = store.consume(event.handle);
-  assert.deepEqual([...consumed.bytes], [1, 2, 3, 4]);
-  assert.equal(consumed.mimeType, "image/png");
-  assert.throws(
-    () => store.consume(event.handle),
-    (error) =>
-      error instanceof AttachmentHandleError && error.code === "not_found"
-  );
+  const leased = store.lease(event.handle, DELIVERY_ID);
+  assert.deepEqual([...leased.entry.bytes], [1, 2, 3, 4]);
+  assert.equal(leased.entry.mimeType, "image/png");
+  assert.equal(store.lease(event.handle, DELIVERY_ID).leaseId, leased.leaseId);
 });
 
 test("store enforces item, count, and aggregate byte caps", () => {
@@ -89,7 +87,7 @@ test("expired handles are wiped and cannot be replayed", () => {
   now += 51;
   store.purgeExpired();
   assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
-  assert.throws(() => store.consume(handle), /not found/);
+  assert.throws(() => store.lease(handle, DELIVERY_ID), /not found/);
 });
 
 test("expiry timer purges bytes without a later request", () => {
@@ -175,7 +173,7 @@ test("unknown-size Spectrum streams are read incrementally within the hard cap",
 
   const event = await normalizeInboundBinaryContent(content, store);
   assert.equal(event.size, 4);
-  assert.deepEqual([...store.consume(event.handle).bytes], [1, 2, 3, 4]);
+  assert.deepEqual([...store.lease(event.handle, DELIVERY_ID).entry.bytes], [1, 2, 3, 4]);
 });
 
 test("unknown-size streams are cancelled when they cross the hard cap", async () => {
@@ -211,17 +209,20 @@ test("unknown-size streams are cancelled when they cross the hard cap", async ()
   assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
 });
 
-test("attachment GET path schema is exact", () => {
+test("attachment lease action path schema is exact", () => {
   const handle = "a".repeat(48);
-  assert.equal(parseAttachmentHandlePath(`/attachment/${handle}`), handle);
+  assert.deepEqual(parseAttachmentActionPath(`/attachment/${handle}/lease`), {
+    handle,
+    action: "lease",
+  });
   for (const path of [
-    `/attachment/${handle}?again=1`,
+    `/attachment/${handle}/lease?again=1`,
     `/attachment/${handle}/extra`,
     `/attachment/${"a".repeat(47)}`,
     `/attachments/${handle}`,
     "/attachment/not-hex",
   ]) {
-    assert.equal(parseAttachmentHandlePath(path), null);
+    assert.equal(parseAttachmentActionPath(path), null);
   }
 });
 
@@ -243,7 +244,7 @@ class FakeResponse extends EventEmitter {
   }
 }
 
-test("raw attachment GET consumes once and replay is content-free", () => {
+test("consumer crash after lease replays the same bytes and lease", () => {
   const store = new AttachmentHandleStore({
     maxItemBytes: 16,
     maxTotalBytes: 16,
@@ -256,7 +257,7 @@ test("raw attachment GET consumes once and replay is content-free", () => {
   });
   const first = new FakeResponse();
   assert.equal(
-    serveAttachmentHandle(`/attachment/${handle}`, first, store),
+    serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, first, store),
     true
   );
   assert.equal(first.statusCode, 200);
@@ -264,16 +265,21 @@ test("raw attachment GET consumes once and replay is content-free", () => {
   assert.equal(first.headers["Cache-Control"], "no-store");
   assert.equal(first.body.toString(), "private bytes");
 
+  assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
   const replay = new FakeResponse();
   assert.equal(
-    serveAttachmentHandle(`/attachment/${handle}`, replay, store),
+    serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, replay, store),
     true
   );
-  assert.equal(replay.statusCode, 404);
-  assert.equal(replay.body.includes("private bytes"), false);
+  assert.equal(replay.statusCode, 200);
+  assert.equal(replay.body.toString(), "private bytes");
+  assert.equal(
+    replay.headers["X-Hermes-Attachment-Lease-Id"],
+    first.headers["X-Hermes-Attachment-Lease-Id"]
+  );
 });
 
-test("expired raw attachment GET returns the same stable not-found envelope", () => {
+test("expired attachment lease returns the stable content-free not-found envelope", () => {
   let now = 1_000;
   const store = new AttachmentHandleStore({
     maxItemBytes: 16,
@@ -286,7 +292,7 @@ test("expired raw attachment GET returns the same stable not-found envelope", ()
   const { handle } = store.put(Buffer.from("private bytes"), {});
   now += 11;
   const expired = new FakeResponse();
-  serveAttachmentHandle(`/attachment/${handle}`, expired, store);
+  serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, expired, store);
   assert.equal(expired.statusCode, 404);
   assert.deepEqual(JSON.parse(expired.body), {
     ok: false,
@@ -294,7 +300,7 @@ test("expired raw attachment GET returns the same stable not-found envelope", ()
   });
 });
 
-test("response faults still wipe consumed bytes", () => {
+test("response faults retain charged bytes for an exact replay", () => {
   const store = new AttachmentHandleStore({
     maxItemBytes: 16,
     maxTotalBytes: 16,
@@ -311,11 +317,13 @@ test("response faults still wipe consumed bytes", () => {
   }
   const response = new FailingResponse();
   assert.throws(
-    () => serveAttachmentHandle(`/attachment/${handle}`, response, store),
+    () => serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, response, store),
     /socket failed/
   );
-  assert.equal(response.reference.every((value) => value === 0), true);
-  assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
+  assert.equal(response.reference.toString(), "private bytes");
+  assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
+  const replay = store.lease(handle, DELIVERY_ID);
+  assert.equal(replay.entry.bytes.toString(), "private bytes");
 });
 
 test("stalled responses remain charged and are wiped by the transfer TTL", () => {
@@ -345,7 +353,7 @@ test("stalled responses remain charged and are wiped by the transfer TTL", () =>
     }
   }
   const response = new StalledResponse();
-  serveAttachmentHandle(`/attachment/${handle}`, response, store);
+  serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, response, store);
 
   assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
   assert.throws(
@@ -359,11 +367,95 @@ test("stalled responses remain charged and are wiped by the transfer TTL", () =>
   assert.equal(response.destroyed, true);
 
   const replay = new FakeResponse();
-  serveAttachmentHandle(`/attachment/${handle}`, replay, store);
+  serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, replay, store);
   assert.equal(replay.statusCode, 404);
 });
 
-test("completion close error and shutdown release each lease exactly once", () => {
+test("only exact binding finalizes and duplicate finalize is idempotent", () => {
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 16,
+    maxCount: 1,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+  });
+  const { handle } = store.put(Buffer.from("private bytes"), {});
+  const lease = store.lease(handle, DELIVERY_ID);
+  assert.throws(
+    () => store.finalize(handle, "e".repeat(48)),
+    (error) => error.code === "binding_mismatch"
+  );
+  assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
+  assert.equal(store.finalize(handle, DELIVERY_ID), "consumed");
+  assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
+  assert.equal(store.finalize(handle, DELIVERY_ID), "duplicate");
+  assert.throws(
+    () => store.finalize(handle, "e".repeat(48)),
+    (error) => error.code === "not_found"
+  );
+});
+
+test("consumed idempotency receipts are strictly count bounded under flood", () => {
+  let counter = 1;
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 32,
+    maxCount: 2,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+    randomBytes: () => Buffer.alloc(24, counter++),
+  });
+  for (let index = 0; index < 8; index += 1) {
+    const { handle } = store.put(Buffer.from(`secret-${index}`), {});
+    const deliveryId = index.toString(16).padStart(48, "0");
+    const lease = store.lease(handle, deliveryId);
+    assert.equal(store.finalize(handle, deliveryId), "consumed");
+    assert.ok(store._consumed.size <= 2);
+  }
+  assert.equal(store._consumed.size, 2);
+  assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
+});
+
+test("release preserves bytes and permits a fresh lease for the same delivery", () => {
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 16,
+    maxCount: 1,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+  });
+  const { handle } = store.put(Buffer.from("private bytes"), {});
+  const first = store.lease(handle, DELIVERY_ID);
+  assert.equal(store.releaseLease(handle, DELIVERY_ID, first.leaseId), "released");
+  assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
+  const retry = store.lease(handle, DELIVERY_ID);
+  assert.notEqual(retry.leaseId, first.leaseId);
+  assert.equal(retry.entry.bytes.toString(), "private bytes");
+});
+
+test("consume and release HTTP mutations require exact bindings", () => {
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 16,
+    maxCount: 1,
+    ttlMs: 1_000,
+    setTimer: noTimer,
+  });
+  const { handle } = store.put(Buffer.from("private bytes"), {});
+  const lease = store.lease(handle, DELIVERY_ID);
+  const consumed = new FakeResponse();
+  assert.equal(mutateAttachmentLease(`/attachment/${handle}/consume`, {
+    deliveryId: DELIVERY_ID,
+  }, consumed, store), true);
+  assert.deepEqual(JSON.parse(consumed.body), { ok: true, status: "consumed" });
+  const duplicate = new FakeResponse();
+  mutateAttachmentLease(`/attachment/${handle}/consume`, {
+    deliveryId: DELIVERY_ID,
+  }, duplicate, store);
+  assert.deepEqual(JSON.parse(duplicate.body), { ok: true, status: "duplicate" });
+});
+
+test("completion close error and shutdown detach responses without consuming", () => {
   for (const releaseKind of ["completion", "close", "error", "shutdown"]) {
     const store = new AttachmentHandleStore({
       maxItemBytes: 16,
@@ -385,7 +477,7 @@ test("completion close error and shutdown release each lease exactly once", () =
       }
     }
     const response = new ManualResponse();
-    serveAttachmentHandle(`/attachment/${handle}`, response, store);
+    serveAttachmentLease(`/attachment/${handle}/lease`, { deliveryId: DELIVERY_ID }, response, store);
     if (releaseKind === "completion") response.completion();
     if (releaseKind === "close") response.emit("close");
     if (releaseKind === "error") response.emit("error", new Error("socket"));
@@ -394,9 +486,15 @@ test("completion close error and shutdown release each lease exactly once", () =
     response.completion();
     response.emit("close");
     if (releaseKind !== "error") response.emit("error", new Error("late"));
-    store.close();
-    assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
-    assert.equal(response.reference.every((value) => value === 0), true);
+    assert.deepEqual(
+      store.stats(),
+      releaseKind === "shutdown" ? { count: 0, totalBytes: 0 } : { count: 1, totalBytes: 13 }
+    );
+    assert.equal(
+      response.reference.every((value) => value === 0),
+      releaseKind === "shutdown"
+    );
     assert.equal(Boolean(response.destroyed), releaseKind === "shutdown");
+    store.close();
   }
 });

@@ -23,10 +23,14 @@ def test_attachment_handle_route_is_behind_the_sidecar_token_gate() -> None:
         encoding="utf-8"
     )
     auth = 'if (!tokenOk(req.headers["x-hermes-sidecar-token"]))'
-    route = "serveAttachmentHandle(req.url, res, attachmentHandles)"
+    routes = (
+        "serveAttachmentLease(req.url, body, res, attachmentHandles)",
+        "mutateAttachmentLease(req.url, body, res, attachmentHandles)",
+    )
     assert auth in index
-    assert route in index
-    assert index.index(auth) < index.index(route)
+    for route in routes:
+        assert route in index
+        assert index.index(auth) < index.index(route)
 
 
 def test_sidecar_healthz_reports_stream_health() -> None:

@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 
 const HANDLE_RE = /^[a-f0-9]{48}$/;
+const DELIVERY_RE = /^[a-f0-9]{48}$/;
+const LEASE_RE = /^[a-f0-9]{48}$/;
 
 export class AttachmentHandleError extends Error {
   constructor(code, message) {
@@ -15,6 +17,7 @@ export class AttachmentHandleStore {
     maxTotalBytes,
     maxCount,
     ttlMs,
+    leaseTtlMs = ttlMs,
     now = Date.now,
     randomBytes = crypto.randomBytes,
     setTimer = setTimeout,
@@ -25,6 +28,7 @@ export class AttachmentHandleStore {
       maxTotalBytes,
       maxCount,
       ttlMs,
+      leaseTtlMs,
     })) {
       if (!Number.isSafeInteger(value) || value <= 0) {
         throw new TypeError(`${name} must be a positive safe integer`);
@@ -37,11 +41,13 @@ export class AttachmentHandleStore {
     this.maxTotalBytes = maxTotalBytes;
     this.maxCount = maxCount;
     this.ttlMs = ttlMs;
+    this.leaseTtlMs = leaseTtlMs;
     this._now = now;
     this._randomBytes = randomBytes;
     this._setTimer = setTimer;
     this._clearTimer = clearTimer;
     this._entries = new Map();
+    this._consumed = new Map();
     this._totalBytes = 0;
     this._expiryTimer = null;
   }
@@ -58,6 +64,7 @@ export class AttachmentHandleStore {
     this._entries.delete(handle);
     if (abort && !entry.aborted) {
       entry.aborted = true;
+      this._abortLease(entry);
       try {
         entry.onExpire?.();
       } catch {
@@ -76,6 +83,10 @@ export class AttachmentHandleStore {
     let earliest = Infinity;
     for (const entry of this._entries.values()) {
       earliest = Math.min(earliest, entry.expiresAt);
+      if (entry.lease) earliest = Math.min(earliest, entry.lease.expiresAt);
+    }
+    for (const receipt of this._consumed.values()) {
+      earliest = Math.min(earliest, receipt.expiresAt);
     }
     if (earliest === Infinity) return;
     this._expiryTimer = this._setTimer(
@@ -93,7 +104,12 @@ export class AttachmentHandleStore {
     for (const [handle, entry] of this._entries) {
       if (entry.expiresAt <= now) {
         this._release(handle, entry, { abort: true });
+      } else if (entry.lease?.expiresAt <= now) {
+        this._abortLease(entry);
       }
+    }
+    for (const [handle, receipt] of this._consumed) {
+      if (receipt.expiresAt <= now) this._consumed.delete(handle);
     }
     this._scheduleExpiry();
   }
@@ -150,6 +166,7 @@ export class AttachmentHandleStore {
           : null,
       expiresAt: this._now() + this.ttlMs,
       state: "queued",
+      lease: null,
       wiped: false,
       aborted: false,
       onExpire: null,
@@ -159,30 +176,102 @@ export class AttachmentHandleStore {
     return { handle };
   }
 
-  consume(handle, { onExpire = null } = {}) {
+  _validateBinding(handle, deliveryId, leaseId = null) {
     if (typeof handle !== "string" || !HANDLE_RE.test(handle)) {
       throw new AttachmentHandleError(
         "not_found",
         "attachment handle not found"
       );
     }
+    if (typeof deliveryId !== "string" || !DELIVERY_RE.test(deliveryId)) {
+      throw new AttachmentHandleError("invalid_binding", "invalid delivery binding");
+    }
+    if (leaseId !== null && (typeof leaseId !== "string" || !LEASE_RE.test(leaseId))) {
+      throw new AttachmentHandleError("invalid_binding", "invalid lease binding");
+    }
+  }
+
+  _abortLease(entry) {
+    if (!entry.lease) return;
+    for (const abort of entry.lease.aborters) {
+      try {
+        abort();
+      } catch {
+        // Lease expiry remains authoritative when socket teardown fails.
+      }
+    }
+    entry.lease = null;
+  }
+
+  lease(handle, deliveryId, { onExpire = null } = {}) {
+    this._validateBinding(handle, deliveryId);
     this.purgeExpired();
     const entry = this._entries.get(handle);
-    if (!entry || entry.state !== "queued") {
+    if (!entry) {
       throw new AttachmentHandleError(
         "not_found",
         "attachment handle not found"
       );
     }
-    entry.state = "in_flight";
-    entry.onExpire = typeof onExpire === "function" ? onExpire : null;
-    return entry;
+    if (entry.lease && entry.lease.deliveryId !== deliveryId) {
+      throw new AttachmentHandleError("binding_mismatch", "attachment lease is bound");
+    }
+    if (!entry.lease) {
+      entry.lease = {
+        deliveryId,
+        leaseId: this._randomBytes(24).toString("hex"),
+        expiresAt: Math.min(entry.expiresAt, this._now() + this.leaseTtlMs),
+        aborters: new Set(),
+      };
+    }
+    if (typeof onExpire === "function") entry.lease.aborters.add(onExpire);
+    this._scheduleExpiry();
+    return { entry, leaseId: entry.lease.leaseId };
   }
 
-  release(handle, entry) {
-    const released = this._release(handle, entry);
-    if (released) this._scheduleExpiry();
-    return released;
+  detachLeaseResponse(handle, leaseId, aborter) {
+    const entry = this._entries.get(handle);
+    if (entry?.lease?.leaseId === leaseId) entry.lease.aborters.delete(aborter);
+  }
+
+  finalize(handle, deliveryId) {
+    this._validateBinding(handle, deliveryId);
+    this.purgeExpired();
+    const receipt = this._consumed.get(handle);
+    if (receipt) {
+      if (receipt.deliveryId === deliveryId) {
+        return "duplicate";
+      }
+      throw new AttachmentHandleError("not_found", "attachment handle not found");
+    }
+    const entry = this._entries.get(handle);
+    if (!entry) throw new AttachmentHandleError("not_found", "attachment handle not found");
+    if (entry.lease?.deliveryId !== deliveryId) {
+      throw new AttachmentHandleError("binding_mismatch", "attachment lease binding mismatch");
+    }
+    while (this._consumed.size >= this.maxCount) {
+      this._consumed.delete(this._consumed.keys().next().value);
+    }
+    this._consumed.set(handle, {
+      deliveryId,
+      expiresAt: this._now() + this.ttlMs,
+    });
+    this._release(handle, entry);
+    this._scheduleExpiry();
+    return "consumed";
+  }
+
+  releaseLease(handle, deliveryId, leaseId) {
+    this._validateBinding(handle, deliveryId, leaseId);
+    this.purgeExpired();
+    const entry = this._entries.get(handle);
+    if (!entry) throw new AttachmentHandleError("not_found", "attachment handle not found");
+    if (entry.lease?.deliveryId !== deliveryId || entry.lease?.leaseId !== leaseId) {
+      throw new AttachmentHandleError("binding_mismatch", "attachment lease binding mismatch");
+    }
+    this._abortLease(entry);
+    this._scheduleExpiry();
+    return "released";
   }
 
   stats() {
@@ -198,6 +287,7 @@ export class AttachmentHandleStore {
     for (const [handle, entry] of this._entries) {
       this._release(handle, entry, { abort: true });
     }
+    this._consumed.clear();
   }
 }
 
@@ -300,6 +390,12 @@ export function parseAttachmentHandlePath(path) {
   return match ? match[1] : null;
 }
 
+export function parseAttachmentActionPath(path) {
+  if (typeof path !== "string") return null;
+  const match = path.match(/^\/attachment\/([a-f0-9]{48})\/(lease|consume|release)$/);
+  return match ? { handle: match[1], action: match[2] } : null;
+}
+
 function safeMimeType(value) {
   if (
     typeof value === "string" &&
@@ -310,35 +406,63 @@ function safeMimeType(value) {
   return "application/octet-stream";
 }
 
-export function serveAttachmentHandle(path, res, store) {
-  const handle = parseAttachmentHandlePath(path);
-  if (handle === null) return false;
-  let entry;
+export function serveAttachmentLease(path, body, res, store) {
+  const parsed = parseAttachmentActionPath(path);
+  if (parsed?.action !== "lease") return false;
+  const deliveryId = body?.deliveryId;
+  let leased;
+  const abort = () => res.destroy?.();
   try {
-    entry = store.consume(handle, {
-      onExpire: () => res.destroy?.(),
-    });
+    if (!body || Object.keys(body).length !== 1) throw new AttachmentHandleError("invalid_binding", "invalid delivery binding");
+    leased = store.lease(parsed.handle, deliveryId, { onExpire: abort });
   } catch (error) {
     if (!(error instanceof AttachmentHandleError)) throw error;
-    res.statusCode = 404;
+    res.statusCode = error.code === "invalid_binding" ? 400 : error.code === "binding_mismatch" ? 409 : 404;
     res.setHeader("Content-Type", "application/json");
     res.setHeader("Cache-Control", "no-store");
     res.end(JSON.stringify({ ok: false, error: "attachment handle not found" }));
     return true;
   }
+  const { entry, leaseId } = leased;
   res.statusCode = 200;
   res.setHeader("Content-Type", safeMimeType(entry.mimeType));
   res.setHeader("Content-Length", String(entry.bytes.length));
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
-  const release = () => store.release(handle, entry);
-  res.once?.("close", release);
-  res.once?.("error", release);
+  res.setHeader("X-Hermes-Attachment-Lease-Id", leaseId);
+  const detach = () => store.detachLeaseResponse(parsed.handle, leaseId, abort);
+  res.once?.("close", detach);
+  res.once?.("error", detach);
   try {
-    res.end(entry.bytes, release);
+    res.end(entry.bytes, detach);
   } catch (error) {
-    release();
+    detach();
     throw error;
+  }
+  return true;
+}
+
+export function mutateAttachmentLease(path, body, res, store) {
+  const parsed = parseAttachmentActionPath(path);
+  if (!parsed || parsed.action === "lease") return false;
+  try {
+    const expectedKeys = parsed.action === "consume" ? "deliveryId" : "deliveryId,leaseId";
+    if (!body || Object.keys(body).sort().join(",") !== expectedKeys) {
+      throw new AttachmentHandleError("invalid_binding", "invalid lease binding");
+    }
+    const status = parsed.action === "consume"
+      ? store.finalize(parsed.handle, body.deliveryId)
+      : store.releaseLease(parsed.handle, body.deliveryId, body.leaseId);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Cache-Control", "no-store");
+    res.end(JSON.stringify({ ok: true, status }));
+  } catch (error) {
+    if (!(error instanceof AttachmentHandleError)) throw error;
+    res.statusCode = error.code === "invalid_binding" ? 400 : error.code === "binding_mismatch" ? 409 : 404;
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Cache-Control", "no-store");
+    res.end(JSON.stringify({ ok: false, error: "attachment handle not found" }));
   }
   return true;
 }

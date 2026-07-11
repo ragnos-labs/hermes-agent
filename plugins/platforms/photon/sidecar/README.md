@@ -87,15 +87,21 @@ of the bytes in memory with fixed limits: 20 MiB per item, 64 MiB total, 64
 items, and a five-minute TTL. Capacity and read failures emit metadata without
 a handle and never include provider error text.
 
-An authenticated `GET /attachment/<handle>` returns the raw bytes once with
-`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. The exact path
-accepts no query string or suffix. Consumption is atomic: concurrent or replay
-requests receive the same content-free 404 as expired and unknown handles.
-Queued and in-flight transfers remain charged to the same count, byte, and TTL
-limits until their buffer is zeroed. Buffers are released exactly once after
-response completion, close, error, TTL expiry, or shutdown. A stalled client
-is destroyed at TTL expiry, so it cannot move plaintext outside the bounded
-store accounting or retain a queued response after its lease ends.
+An authenticated `POST /attachment/<handle>/lease` with exact body
+`{"deliveryId":"<48 lowercase hex>"}` returns raw bytes plus an opaque lease
+ID header. A crash or socket fault does not consume the handle: the same
+delivery replays the same bytes and active lease. Another delivery is rejected.
+`POST /attachment/<handle>/release` requires that delivery and lease ID and
+makes the bytes available for a fresh lease. `POST
+/attachment/<handle>/consume` requires the exact delivery and is allowed only
+after the consumer has a durable upload receipt. The same consume is
+idempotent; another delivery is rejected. Consumed receipts are bounded by the
+same count and TTL limits.
+
+Queued and leased transfers remain charged to the same count, byte, and TTL
+limits until explicit consume or expiry zeroes the buffer. Completion, close,
+or error only detaches the response. A stalled client is destroyed at lease or
+item expiry. Shutdown also wipes every buffer. Plaintext never touches disk.
 
 Handle-bearing events add a random 48-character `deliveryId`. A successful
 NDJSON socket write is not acceptance. The sidecar retains exactly one pending
@@ -135,13 +141,16 @@ tell the generic model that media is ready.
 
 Keez's direct home-agent `/inbound` consumer follows the same wire contract; it
 does not use the Python callback seam. It must authorize the sender, enforce
-group mention policy, redeem each `/attachment/<handle>`, securely upload the
-bytes, durably submit the Box job keyed by `deliveryId`, and only then call
+group mention policy, lease each `/attachment/<handle>`, securely upload the
+bytes, consume only after the durable Box upload receipt, durably submit the
+job keyed by `deliveryId`, and only then call
 `/inbound-ack`. Reading or parsing the NDJSON line must never auto-ACK it. A
 retry with the same delivery ID must resolve to the existing durable submit,
 not create a second job. The secure upload and Box submission must each use
-`deliveryId` as their idempotency key so a consumer crash after the one-shot
-GET can recover the existing durable result without redeeming the handle again.
+`deliveryId` as their idempotency key. Failed or unknown Box commits release
+the lease and never consume or ACK. A crash before Box commit replays identical
+bytes. A crash after consume or submit replays the durable receipt without a
+second upload, and exact consume remains idempotent.
 
 The remaining limitation is process crash replay. The pending event is held in
 memory, and Spectrum exposes no public restart cursor API. A sidecar process

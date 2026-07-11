@@ -20,7 +20,10 @@
 //   - POST /inbound-ack -> acknowledge one handle-bearing event only after its
 //                         secure bytes and durable job submission succeeded
 //       exact body: {"deliveryId": "<48 lowercase hex>"}
-//   - GET  /attachment/<opaque-handle> -> one-shot raw attachment bytes
+//   - POST /attachment/<opaque-handle>/lease -> replayable raw bytes bound to
+//                         an exact delivery; returns an opaque lease id header
+//   - POST /attachment/<opaque-handle>/(consume|release) -> finalize only
+//                         after durable consumer commit, or release for retry
 //   - POST /healthz     -> {"ok": true}
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
@@ -83,8 +86,9 @@ import {
 } from "./message-actions.mjs";
 import {
   AttachmentHandleStore,
+  mutateAttachmentLease,
   normalizeInboundBinaryContent,
-  serveAttachmentHandle,
+  serveAttachmentLease,
 } from "./attachment-handles.mjs";
 import {
   deliverPendingEntry,
@@ -814,12 +818,6 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/inbound") {
     return handleInbound(req, res);
   }
-  if (
-    req.method === "GET" &&
-    serveAttachmentHandle(req.url, res, attachmentHandles)
-  ) {
-    return;
-  }
   if (req.method !== "POST") {
     res.statusCode = 405;
     return res.end();
@@ -834,6 +832,8 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const body = await readBody(req);
+    if (serveAttachmentLease(req.url, body, res, attachmentHandles)) return;
+    if (mutateAttachmentLease(req.url, body, res, attachmentHandles)) return;
     if (req.url === "/inbound-ack") {
       let deliveryId;
       try {
