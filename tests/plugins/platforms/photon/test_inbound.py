@@ -6,9 +6,7 @@ sidecar-event parsing without spawning the Node sidecar or binding ports.
 """
 from __future__ import annotations
 
-import base64
 import json
-from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
@@ -82,13 +80,6 @@ async def test_dispatch_group_type(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured[0].source.chat_type == "group"
 
 
-# A real 1x1 transparent PNG (passes base.py's _looks_like_image magic check).
-_PNG_1X1_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhf"
-    "DwAChwGA60e6kgAAAABJRU5ErkJggg=="
-)
-
-
 def _attachment_event(
     content: Dict[str, Any], msg_id: str = "spc-msg-att"
 ) -> Dict[str, Any]:
@@ -135,21 +126,20 @@ async def test_dispatch_attachment_without_bytes_surfaces_marker(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_attachment_downloads_image(
+async def test_dispatch_attachment_preserves_secure_handle_without_plaintext_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inline base64 image bytes are decoded, cached, and exposed as media."""
+    """The opaque handle stays in raw_message and never becomes a disk path."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
 
-    raw = base64.b64decode(_PNG_1X1_B64)
+    handle = "a" * 48
     event = _attachment_event(
         {
             "name": "photo.png",
             "mimeType": "image/png",
-            "size": len(raw),
-            "data": _PNG_1X1_B64,
-            "encoding": "base64",
+            "size": 67,
+            "handle": handle,
         }
     )
     await adapter._dispatch_inbound(event)
@@ -157,15 +147,34 @@ async def test_dispatch_attachment_downloads_image(
     assert len(captured) == 1
     ev = captured[0]
     assert ev.message_type == MessageType.PHOTO
-    assert ev.media_types == ["image/png"]
-    assert len(ev.media_urls) == 1
-    cached = Path(ev.media_urls[0])
-    try:
-        assert cached.is_file()
-        assert cached.read_bytes() == raw
-        assert ev.text == "(attachment)"
-    finally:
-        cached.unlink(missing_ok=True)
+    assert ev.media_types == []
+    assert ev.media_urls == []
+    assert "Photon attachment received" in ev.text
+    assert ev.raw_message["content"]["handle"] == handle
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ignores_legacy_inline_base64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale or compromised sidecar cannot revive plaintext disk caching."""
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    event = _attachment_event(
+        {
+            "name": "legacy.txt",
+            "mimeType": "text/plain",
+            "size": 6,
+            "data": "c2VjcmV0",
+            "encoding": "base64",
+        }
+    )
+
+    await adapter._dispatch_inbound(event)
+
+    assert captured[0].media_urls == []
+    assert captured[0].media_types == []
+    assert "Photon attachment received" in captured[0].text
 
 
 @pytest.mark.asyncio
@@ -175,7 +184,6 @@ async def test_dispatch_group_preserves_text_and_attachment(
     """Spectrum group content from a mixed text+image iMessage must not drop text."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
-    raw = base64.b64decode(_PNG_1X1_B64)
 
     event = _attachment_event(
         {},
@@ -194,9 +202,8 @@ async def test_dispatch_group_preserves_text_and_attachment(
                     "type": "attachment",
                     "name": "photo.png",
                     "mimeType": "image/png",
-                    "size": len(raw),
-                    "data": _PNG_1X1_B64,
-                    "encoding": "base64",
+                    "size": 67,
+                    "handle": "b" * 48,
                 },
             },
         ],
@@ -206,35 +213,28 @@ async def test_dispatch_group_preserves_text_and_attachment(
 
     assert len(captured) == 1
     ev = captured[0]
-    assert ev.text == "请分析这张图的重点"
+    assert ev.text.startswith("请分析这张图的重点")
+    assert "Photon attachment received" in ev.text
     assert ev.message_type == MessageType.PHOTO
-    assert ev.media_types == ["image/png"]
-    assert len(ev.media_urls) == 1
-    cached = Path(ev.media_urls[0])
-    try:
-        assert cached.is_file()
-        assert cached.read_bytes() == raw
-    finally:
-        cached.unlink(missing_ok=True)
+    assert ev.media_types == []
+    assert ev.media_urls == []
 
 
 @pytest.mark.asyncio
-async def test_dispatch_voice_downloads_audio(
+async def test_dispatch_voice_preserves_handle_without_plaintext_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inbound Spectrum voice content is cached and routed to auto-STT."""
+    """Inbound voice bytes remain behind the one-shot sidecar handle."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
 
-    raw = b"OggS" + b"\x00" * 32
     event = _voice_event(
         {
             "name": "note.ogg",
             "mimeType": "audio/ogg",
             "duration": 7,
-            "size": len(raw),
-            "data": base64.b64encode(raw).decode("ascii"),
-            "encoding": "base64",
+            "size": 36,
+            "handle": "c" * 48,
         }
     )
     await adapter._dispatch_inbound(event)
@@ -242,15 +242,10 @@ async def test_dispatch_voice_downloads_audio(
     assert len(captured) == 1
     ev = captured[0]
     assert ev.message_type == MessageType.VOICE
-    assert ev.media_types == ["audio/ogg"]
-    assert len(ev.media_urls) == 1
-    cached = Path(ev.media_urls[0])
-    try:
-        assert cached.is_file()
-        assert cached.read_bytes() == raw
-        assert ev.text == "(voice)"
-    finally:
-        cached.unlink(missing_ok=True)
+    assert ev.media_types == []
+    assert ev.media_urls == []
+    assert "Photon voice received" in ev.text
+    assert ev.raw_message["content"]["handle"] == "c" * 48
 
 
 @pytest.mark.asyncio
@@ -277,21 +272,19 @@ async def test_dispatch_voice_without_bytes_surfaces_marker(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_attachment_downloads_document(
+async def test_dispatch_attachment_document_stays_behind_handle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-image attachments route through the document cache as DOCUMENT."""
+    """Non-image attachments retain type without writing a document cache."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture(adapter, monkeypatch)
 
-    raw = b"%PDF-1.4 hermes test document"
     event = _attachment_event(
         {
             "name": "report.pdf",
             "mimeType": "application/pdf",
-            "size": len(raw),
-            "data": base64.b64encode(raw).decode("ascii"),
-            "encoding": "base64",
+            "size": 29,
+            "handle": "d" * 48,
         }
     )
     await adapter._dispatch_inbound(event)
@@ -299,15 +292,9 @@ async def test_dispatch_attachment_downloads_document(
     assert len(captured) == 1
     ev = captured[0]
     assert ev.message_type == MessageType.DOCUMENT
-    assert ev.media_types == ["application/pdf"]
-    assert len(ev.media_urls) == 1
-    cached = Path(ev.media_urls[0])
-    try:
-        assert cached.is_file()
-        assert cached.read_bytes() == raw
-        assert ev.text == "(attachment)"
-    finally:
-        cached.unlink(missing_ok=True)
+    assert ev.media_types == []
+    assert ev.media_urls == []
+    assert "Photon attachment received" in ev.text
 
 
 @pytest.mark.asyncio

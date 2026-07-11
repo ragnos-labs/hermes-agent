@@ -24,7 +24,6 @@ Outbound:
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -556,10 +555,11 @@ class PhotonAdapter(BasePlatformAdapter):
                           "targetText": "..." | null},
               "timestamp": "2026-05-14T19:06:32.000Z"
 
-        Attachment and voice content carry the bytes inline as base64 ``data``
-        (with ``encoding == "base64"``) when the sidecar could read them
-        within its size cap; otherwise only metadata is present and we surface
-        a marker.
+        Attachment and voice content carry metadata plus an opaque one-shot
+        ``handle`` when the sidecar could read their bytes into its bounded
+        in-memory store. Bytes are never embedded in this event or cached to
+        plaintext disk by this adapter. The handle remains in ``raw_message``
+        for the external secure attachment consumer.
             }
         """
         space = event.get("space") or {}
@@ -597,16 +597,6 @@ class PhotonAdapter(BasePlatformAdapter):
             name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
             mime = payload.get("mimeType") or ""
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
-            cached = _cache_inbound_attachment(
-                payload, name, mime, force_audio=is_voice
-            )
-            if cached:
-                return (
-                    "(voice)" if is_voice else "(attachment)",
-                    mtype,
-                    [cached],
-                    [mime or ("audio/mp4" if is_voice else "application/octet-stream")],
-                )
             label = "voice" if is_voice else "attachment"
             duration = payload.get("duration")
             duration_text = (
@@ -1499,83 +1489,6 @@ def _attachment_message_type(mime: str) -> MessageType:
     if mime.startswith("application/"):
         return MessageType.DOCUMENT
     return MessageType.DOCUMENT
-
-
-# MIME → file-extension maps for caching inbound attachment bytes. These mirror
-# the BlueBubbles iMessage channel so both adapters name cached media the same.
-_IMAGE_EXT_BY_MIME = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/heic": ".jpg",
-    "image/heif": ".jpg",
-    "image/tiff": ".jpg",
-}
-_AUDIO_EXT_BY_MIME = {
-    "audio/mp3": ".mp3",
-    "audio/mpeg": ".mp3",
-    "audio/ogg": ".ogg",
-    "audio/wav": ".wav",
-    "audio/x-caf": ".mp3",
-    "audio/mp4": ".m4a",
-    "audio/aac": ".m4a",
-}
-
-
-def _cache_inbound_attachment(
-    content: Dict[str, Any],
-    name: str,
-    mime: str,
-    *,
-    force_audio: bool = False,
-) -> Optional[str]:
-    """Decode a base64-inlined inbound attachment and cache it locally.
-
-    The sidecar inlines the attachment bytes as ``content["data"]`` (base64).
-    We decode them and route to the shared media cache by MIME type, returning
-    the cached absolute path so the caller can populate ``media_urls`` (which
-    the gateway then hands to the model). Returns ``None`` when there are no
-    bytes (over the sidecar's inline cap or a failed read) or when caching
-    fails, so the caller can fall back to a text marker.
-    """
-    data_b64 = content.get("data")
-    if not data_b64:
-        return None
-    try:
-        raw = base64.b64decode(data_b64)
-    except (ValueError, TypeError) as exc:
-        logger.warning("[photon] failed to decode inbound attachment bytes: %s", exc)
-        return None
-
-    from gateway.platforms.base import (
-        cache_audio_from_bytes,
-        cache_document_from_bytes,
-        cache_image_from_bytes,
-    )
-
-    mime = (mime or "").lower()
-    # Prefer the real extension from the filename; fall back to the MIME map.
-    suffix = Path(name).suffix if name else ""
-    try:
-        if mime.startswith("image/"):
-            ext = suffix or _IMAGE_EXT_BY_MIME.get(mime, ".jpg")
-            try:
-                return cache_image_from_bytes(raw, ext)
-            except ValueError:
-                # Bytes don't look like a supported image (e.g. HEIC magic) —
-                # still deliver them as a document rather than dropping them.
-                return cache_document_from_bytes(raw, name)
-        if force_audio or mime.startswith("audio/"):
-            ext = suffix or _AUDIO_EXT_BY_MIME.get(
-                mime, ".m4a" if force_audio else ".mp3"
-            )
-            return cache_audio_from_bytes(raw, ext)
-        # Video, application/*, and everything else → document cache.
-        return cache_document_from_bytes(raw, name)
-    except Exception as exc:
-        logger.warning("[photon] failed to cache inbound attachment %s: %s", name, exc)
-        return None
 
 
 # ---------------------------------------------------------------------------

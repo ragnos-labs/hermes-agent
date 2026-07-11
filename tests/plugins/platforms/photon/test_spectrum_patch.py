@@ -17,6 +17,18 @@ def test_sidecar_applies_spectrum_patch_before_importing_sdk() -> None:
     assert index.index("patchSpectrumTs();") < index.index('await import("spectrum-ts")')
 
 
+def test_attachment_handle_route_is_behind_the_sidecar_token_gate() -> None:
+    """Raw attachment bytes must never be reachable before authentication."""
+    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(
+        encoding="utf-8"
+    )
+    auth = 'if (!tokenOk(req.headers["x-hermes-sidecar-token"]))'
+    route = "serveAttachmentHandle(req.url, res, attachmentHandles)"
+    assert auth in index
+    assert route in index
+    assert index.index(auth) < index.index(route)
+
+
 def test_sidecar_healthz_reports_stream_health() -> None:
     """Local process health must include upstream stream health."""
     index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")

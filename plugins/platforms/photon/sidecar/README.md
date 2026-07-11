@@ -78,6 +78,48 @@ Expected first two outputs are `{ getMessage: true, history: false, catchUp:
 false, cursor: false }` and four `false` export checks. The final command shows
 that catch-up exists only beneath Spectrum's provider implementation.
 
+## Inbound attachment handles
+
+Inbound attachment bytes never enter NDJSON and are never cached to plaintext
+disk by the Photon adapter. The normalized event contains the existing
+metadata plus a random 48-character opaque `handle`. The sidecar holds a copy
+of the bytes in memory with fixed limits: 20 MiB per item, 64 MiB total, 64
+items, and a five-minute TTL. Capacity and read failures emit metadata without
+a handle and never include provider error text.
+
+An authenticated `GET /attachment/<handle>` returns the raw bytes once with
+`Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. The exact path
+accepts no query string or suffix. Consumption is atomic: concurrent or replay
+requests receive the same content-free 404 as expired and unknown handles.
+Buffers are zeroed after response completion, on expiry, and on shutdown.
+
+This is the external half of the secure attachment flow. The Python Photon
+adapter preserves the handle in `MessageEvent.raw_message` but intentionally
+does not fetch it or create a media cache file. A downstream secure consumer
+must redeem the handle within the TTL before attachments become model-ready.
+
+## Reply and edit crash boundary
+
+Spectrum 9.3.1 does not accept `clientMessageId` or other caller reference
+metadata in `Space.send`, `Message.reply`, or `Message.edit`. Reply returns a
+provider `Message`, edit returns `void`, and the only public lookup is
+`getMessage(id)`. There is no lookup by caller reference. Therefore a process
+crash after Photon accepts a reply but before an external receipt CAS can
+duplicate that reply on retry. A local post-send ledger cannot close this
+window and this sidecar does not claim otherwise.
+
+Executable evidence after `npm ci`:
+
+```bash
+rg -n 'clientMessageId' node_modules/@spectrum-ts node_modules/spectrum-ts
+rg -n 'reply\\(content:|edit\\(newContent:|getMessage\\(id:' \
+  node_modules/@spectrum-ts/core/dist/*.d.ts
+```
+
+The first command returns no matches. The second shows reply returning a
+message, edit returning `Promise<void>`, and lookup requiring a provider
+message ID.
+
 ## Run standalone
 
 For debugging:

@@ -17,6 +17,7 @@
 // Protocol (all requests require `X-Hermes-Sidecar-Token: ${TOKEN}`):
 //   - GET  /inbound    -> 200 NDJSON stream; one JSON event per line, blank
 //                         lines are heartbeats. One consumer at a time.
+//   - GET  /attachment/<opaque-handle> -> one-shot raw attachment bytes
 //   - POST /healthz     -> {"ok": true}
 //   - POST /send        -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "text": "...",
@@ -77,6 +78,11 @@ import {
   normalizeEventPosition,
   replyToMessage,
 } from "./message-actions.mjs";
+import {
+  AttachmentHandleStore,
+  normalizeInboundBinaryContent,
+  serveAttachmentHandle,
+} from "./attachment-handles.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -94,13 +100,16 @@ const telemetry = /^(1|true|yes|on)$/i.test(
 // ID as its delivery correlation key.
 const SPECTRUM_SEND_SUPPORTS_CLIENT_MESSAGE_ID = false;
 
-// Inbound binary content is read into memory and base64-inlined on the NDJSON
-// event so the Python adapter can cache the real bytes (and the agent can see
-// images / transcribe voice). Cap the size we inline — above it we forward
-// metadata only and the adapter surfaces a text marker, so one large clip can't
-// balloon a single NDJSON line. Override via PHOTON_MAX_INLINE_ATTACHMENT_BYTES.
-const MAX_INLINE_ATTACHMENT_BYTES =
-  Number(process.env.PHOTON_MAX_INLINE_ATTACHMENT_BYTES) || 20 * 1024 * 1024;
+const ATTACHMENT_MAX_ITEM_BYTES = 20 * 1024 * 1024;
+const ATTACHMENT_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+const ATTACHMENT_MAX_COUNT = 64;
+const ATTACHMENT_TTL_MS = 5 * 60 * 1000;
+const attachmentHandles = new AttachmentHandleStore({
+  maxItemBytes: ATTACHMENT_MAX_ITEM_BYTES,
+  maxTotalBytes: ATTACHMENT_MAX_TOTAL_BYTES,
+  maxCount: ATTACHMENT_MAX_COUNT,
+  ttlMs: ATTACHMENT_TTL_MS,
+});
 const DM_CHAT_GUID_RE = /^any;-;(\+\d{6,})$/;
 const E164_RE = /^\+\d{6,}$/;
 const MAX_KNOWN_SPACES = 2048;
@@ -428,57 +437,6 @@ async function deliver(line) {
   }
 }
 
-async function normalizeBinaryContent(content) {
-  const meta = {
-    type: content.type,
-    id: content.id ?? null,
-    name: content.name ?? null,
-    mimeType: content.mimeType ?? null,
-    size: typeof content.size === "number" ? content.size : null,
-  };
-  if (content.type === "voice" && typeof content.duration === "number") {
-    meta.duration = content.duration;
-  }
-
-  // Read the bytes eagerly and base64-inline them as `data` so the Python
-  // adapter can cache the real file (the agent then sees images and can run
-  // STT on voice notes). Spectrum content objects may not outlive this stream
-  // iteration, so a lazy/on-demand fetch isn't safe. Over-cap content (when
-  // size is known up front) is forwarded as metadata only and the adapter falls
-  // back to a text marker. A read failure must never break the inbound loop.
-  const label = `${content.type} ${meta.name ?? meta.id ?? "(unnamed)"}`;
-  if (meta.size !== null && meta.size > MAX_INLINE_ATTACHMENT_BYTES) {
-    console.error(
-      `photon-sidecar: ${label} (${meta.size} bytes) ` +
-        `exceeds inline cap ${MAX_INLINE_ATTACHMENT_BYTES}; forwarding metadata only`
-    );
-    return meta;
-  }
-  if (typeof content.read === "function") {
-    try {
-      const buf = await content.read();
-      // Guard the case where size was unknown but the bytes turn out to be
-      // over the cap.
-      if (buf && buf.length > MAX_INLINE_ATTACHMENT_BYTES) {
-        console.error(
-          `photon-sidecar: ${label} (${buf.length} bytes) ` +
-            `exceeds inline cap after read; forwarding metadata only`
-        );
-        return meta;
-      }
-      meta.data = Buffer.from(buf).toString("base64");
-      meta.encoding = "base64";
-    } catch (e) {
-      console.error(
-        `photon-sidecar: failed to read ${content.type} bytes ` +
-          "(forwarding metadata only): " +
-          (e && e.stack ? e.stack : String(e))
-      );
-    }
-  }
-  return meta;
-}
-
 // Best-effort text preview of a reaction's resolved target Message, so the
 // Python adapter can populate the gateway's `reply_to_text` (context: WHAT was
 // tapped back). The SDK only emits a reaction once it has resolved the full
@@ -516,7 +474,7 @@ async function normalizeContent(content) {
     return { type: "text", text: content.text || "" };
   }
   if (content.type === "attachment" || content.type === "voice") {
-    return await normalizeBinaryContent(content);
+    return await normalizeInboundBinaryContent(content, attachmentHandles);
   }
   if (content.type === "group") {
     const items = [];
@@ -799,6 +757,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/inbound") {
     return handleInbound(req, res);
   }
+  if (
+    req.method === "GET" &&
+    serveAttachmentHandle(req.url, res, attachmentHandles)
+  ) {
+    return;
+  }
   if (req.method !== "POST") {
     res.statusCode = 405;
     return res.end();
@@ -993,6 +957,7 @@ async function shutdown(signal) {
   // during one teardown.
   if (stopping) return;
   stopping = true;
+  attachmentHandles.close();
   console.error(`photon-sidecar: received ${signal}, stopping...`);
   try {
     await Promise.race([
