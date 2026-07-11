@@ -43,6 +43,41 @@ Normalized inbound events may also carry `sequence` when the provider exposes
 a nonnegative safe integer and `cursor` when it exposes a bounded opaque
 string. Both fields are omitted when unavailable or malformed.
 
+## Catch-up capability audit
+
+Spectrum 9.3.1 does not expose application-level history or cursor replay.
+The public `Space` contract supports only one-message lookup through
+`getMessage(id)`, and the root `spectrum-ts` package exports no `history`,
+`catchUp`, `fetchMissed`, or `resumableOrderedStream` API. The iMessage
+provider does use cursor catch-up internally while its live iterator remains
+running, but the cursor and raw provider client are not part of the public
+application contract. A sidecar restart therefore cannot request a bounded
+page from a persisted cursor without reaching through `app.__internal` or
+binding directly to `@photon-ai/advanced-imessage` internals. This sidecar
+does neither, so it intentionally exposes no `/history` or `/catch-up` route.
+
+Executable audit from this directory after `npm ci`:
+
+```bash
+node --input-type=module -e '
+  import fs from "node:fs";
+  const d = fs.readFileSync("node_modules/@spectrum-ts/core/dist/attachment-ChqzKngn.d.ts", "utf8");
+  const s = d.slice(d.indexOf("interface Space<_Def = unknown>"), d.indexOf("//#endregion", d.indexOf("interface Space<_Def = unknown>")));
+  console.log({getMessage: /getMessage\\(id: string\\)/.test(s), history: /\\bhistory\\b/i.test(s), catchUp: /\\bcatchUp\\b/.test(s), cursor: /\\bcursor\\b/.test(s)});
+'
+node --input-type=module -e '
+  const s = await import("spectrum-ts");
+  console.log(Object.fromEntries(["history", "catchUp", "fetchMissed", "resumableOrderedStream"].map(k => [k, k in s])));
+'
+rg -n 'fetchMissed: \\(cursor\\)|catchUp\\(since' \
+  node_modules/@spectrum-ts/imessage/dist/index.js \
+  node_modules/@photon-ai/advanced-imessage/dist/index.d.ts
+```
+
+Expected first two outputs are `{ getMessage: true, history: false, catchUp:
+false, cursor: false }` and four `false` export checks. The final command shows
+that catch-up exists only beneath Spectrum's provider implementation.
+
 ## Run standalone
 
 For debugging:
