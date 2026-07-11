@@ -25,6 +25,12 @@
 //       receipt: {"clientMessageId": "...", "confirmed": true,
 //                 "providerStatus": "accepted", "messageId": "...",
 //                 "deliveredAt": "..." | null}
+//   - POST /reply       -> structured content-free delivery receipt
+//       exact body: {"spaceId": "...", "text": "...",
+//                    "replyToMessageId": "...", "clientMessageId": "..."}
+//   - POST /edit        -> structured content-free mutation receipt
+//       exact body: {"spaceId": "...", "messageId": "...", "text": "...",
+//                    "clientMessageId": "..."}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "path": "...", "name": "..." | null,
 //              "mimeType": "..." | null, "caption": "..." | null,
@@ -42,7 +48,7 @@
 // On SIGINT/SIGTERM the sidecar calls `app.stop()` (3s graceful) before
 // exiting. Logs go to stderr; Python supervises restart.
 //
-// Requires spectrum-ts 8.x — pinned exactly in package.json because the SDK
+// Requires spectrum-ts 9.3.1 - pinned exactly in package.json because the SDK
 // ships breaking majors; see README "Upgrading spectrum-ts".
 //
 // Env vars (required):
@@ -66,6 +72,11 @@ import {
   SendRequestError,
   sendTextMessage,
 } from "./send-contract.mjs";
+import {
+  editMessage,
+  normalizeEventPosition,
+  replyToMessage,
+} from "./message-actions.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -77,7 +88,7 @@ const telemetry = /^(1|true|yes|on)$/i.test(
   (process.env.PHOTON_TELEMETRY || "").trim()
 );
 
-// spectrum-ts 8.0.0's official Space.send type accepts content only. Keep
+// spectrum-ts 9.3.1's official Space.send type accepts content only. Keep
 // this false until a pinned SDK version exposes and tests a documented
 // clientMessageId send option; the sidecar still echoes the caller's stable
 // ID as its delivery correlation key.
@@ -541,6 +552,7 @@ async function normalizeEvent(space, message) {
     const ts = message.timestamp;
     return {
       messageId: message.id ?? null,
+      ...normalizeEventPosition(message),
       platform: message.platform || space.__platform || "iMessage",
       space: {
         id: space.id ?? msgSpace.id ?? null,
@@ -766,6 +778,11 @@ async function resolveSpace(spaceId) {
   return space;
 }
 
+async function resolveMessageTarget(spaceId, messageId) {
+  const space = await resolveSpace(spaceId);
+  return await space.getMessage(messageId);
+}
+
 // Constant-time token comparison — don't leak the token via `!==` timing.
 const _tokenBuf = Buffer.from(sharedToken);
 function tokenOk(header) {
@@ -805,6 +822,36 @@ const server = http.createServer(async (req, res) => {
           markdownBuilder: spectrumMarkdown,
           sdkSupportsClientMessageId:
             SPECTRUM_SEND_SUPPORTS_CLIENT_MESSAGE_ID,
+        });
+        return ok(res, receipt);
+      } catch (e) {
+        if (e instanceof SendRequestError) {
+          return badRequest(res, e.message);
+        }
+        throw e;
+      }
+    }
+    if (req.url === "/reply") {
+      try {
+        const receipt = await replyToMessage({
+          body,
+          resolveTarget: resolveMessageTarget,
+          textBuilder: spectrumText,
+        });
+        return ok(res, receipt);
+      } catch (e) {
+        if (e instanceof SendRequestError) {
+          return badRequest(res, e.message);
+        }
+        throw e;
+      }
+    }
+    if (req.url === "/edit") {
+      try {
+        const receipt = await editMessage({
+          body,
+          resolveTarget: resolveMessageTarget,
+          textBuilder: spectrumText,
         });
         return ok(res, receipt);
       } catch (e) {

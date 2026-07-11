@@ -14,7 +14,7 @@
     "node": ">=18.17"
   },
   "dependencies": {
-    "spectrum-ts": "8.0.0"
+    "spectrum-ts": "9.3.1"
   },
   "overrides": {
     "protobufjs": "8.6.1",

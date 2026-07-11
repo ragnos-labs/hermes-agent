@@ -8,7 +8,8 @@ The sidecar:
 
 - runs `Spectrum({ projectId, projectSecret, providers: [imessage.config()] })`
 - exposes a loopback-only HTTP control channel for the Python adapter
-  to push send/typing requests (auth via `X-Hermes-Sidecar-Token`)
+  to push send, reply, edit, and typing requests (auth via
+  `X-Hermes-Sidecar-Token`)
 - drains the inbound message stream so `spectrum-ts` keeps its
   reconnect/heartbeat machinery alive (real inbound delivery is via
   Photon's signed webhook hitting our Python aiohttp server)
@@ -22,6 +23,25 @@ npm install
 
 The Hermes plugin's `hermes photon setup` command runs `npm install`
 here automatically.
+
+The SDK is pinned to `spectrum-ts` 9.3.1. That release natively preserves
+ordered mixed text and attachment parts. The postinstall compatibility hook
+still recognizes and patches the older 8.x mapper, but leaves the 9.3.1
+implementation unchanged after verifying the native ordered-parts behavior.
+
+## Message action contract
+
+Every route requires the sidecar token header. `/reply` accepts exactly
+`spaceId`, `text`, `replyToMessageId`, and `clientMessageId`. `/edit` accepts
+exactly `spaceId`, `messageId`, `text`, and `clientMessageId`. Unknown fields,
+missing fields, identifiers over 512 characters, text over 100,000 characters,
+and invalid client message IDs are rejected before an SDK call. Successful
+responses contain only `clientMessageId`, `confirmed`, `providerStatus`,
+`messageId`, and `deliveredAt`; message content is never echoed.
+
+Normalized inbound events may also carry `sequence` when the provider exposes
+a nonnegative safe integer and `cursor` when it exposes a bounded opaque
+string. Both fields are omitted when unavailable or malformed.
 
 ## Run standalone
 

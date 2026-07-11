@@ -198,6 +198,44 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     assert chunk.read_text(encoding="utf-8") == patched
 
 
+def test_spectrum_patch_accepts_upstream_ordered_mixed_parts(tmp_path: Path) -> None:
+    """Spectrum 9.3.1 natively interleaves text and attachments.
+
+    The compatibility hook must recognize that implementation and leave the
+    dependency byte-for-byte unchanged instead of treating an upgrade as a
+    fatal patch failure.
+    """
+    dist = tmp_path / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    dist.mkdir(parents=True)
+    chunk = dist / "index.js"
+    source = _tabify(
+        """
+const toOrderedParts = (text, attachments) => [{ type: "text", text }, ...attachments];
+const buildOrderedPartMessage = async (client, base, part) => ({ ...base, content: part });
+const buildUnwrappedContentMessage = async (client, base, message, messageGuidStr) => {
+  const attachments = messageAttachments(message);
+  const parts = toOrderedParts(message.content.text, attachments);
+  return { ...base, id: messageGuidStr, content: asProviderGroup(parts) };
+};
+const rebuildFromAppleMessage = async (client, message) => buildUnwrappedContentMessage(client, {}, message, message.guid);
+const toInboundMessages = async (client, cache, event) => [await rebuildFromAppleMessage(client, event.message)];
+"""
+    )
+    chunk.write_text(source, encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "upstream native" in result.stderr
+    assert chunk.read_text(encoding="utf-8") == source
+
+
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
     """Execute the patched mappers and assert mixed bubbles become groups whose
     first child is the typed text, while text-free bubbles keep their exact

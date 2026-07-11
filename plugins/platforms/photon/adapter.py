@@ -541,6 +541,8 @@ class PhotonAdapter(BasePlatformAdapter):
 
             {
               "messageId": "...",
+              "sequence": 123,       # optional nonnegative provider sequence
+              "cursor": "opaque",   # optional provider resume cursor
               "platform": "iMessage",
               "space": {"id": "...", "type": "dm"|"group", "phone": "+E164"},
               "sender": {"id": "+E164"},
