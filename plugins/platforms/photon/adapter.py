@@ -21,10 +21,11 @@ Outbound:
     ``attachment()`` / ``voice()`` content builders via the sidecar's
     ``/send-attachment`` endpoint.
 """
+
 from __future__ import annotations
 
 import asyncio
-import base64
+import inspect
 import json
 import logging
 import os
@@ -37,17 +38,19 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     # Type checkers see ``httpx`` as the always-imported module, so every use
     # site type-checks cleanly. The runtime fallback below keeps the optional
     # dependency truly optional (each use site is guarded by HTTPX_AVAILABLE).
     import httpx
+
     HTTPX_AVAILABLE = True
 else:
     try:
         import httpx
+
         HTTPX_AVAILABLE = True
     except ImportError:  # pragma: no cover - httpx is already a Hermes dep
         HTTPX_AVAILABLE = False
@@ -82,6 +85,9 @@ _MAX_MESSAGE_LENGTH = 8000
 # reconnect can replay, so keep at least 1k ids for ~48h.
 _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
+_DELIVERY_DEDUP_MAX_SIZE = 256
+_DELIVERY_DEDUP_WINDOW_SECONDS = 10 * 60
+_DELIVERY_ID_RE = re.compile(r"^[a-f0-9]{48}$")
 
 _SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
@@ -113,8 +119,30 @@ _DEFAULT_MENTION_PATTERNS = [
 ]
 
 
+class PhotonAttachmentConsumerUnavailable(RuntimeError):
+    """A secure consumer did not accept an opaque inbound attachment handle."""
+
+
+def _event_has_attachment_handle(event: Dict[str, Any]) -> bool:
+    def content_has_handle(content: Any) -> bool:
+        if not isinstance(content, dict):
+            return False
+        if content.get("type") in {"attachment", "voice"}:
+            return bool(re.fullmatch(r"[a-f0-9]{48}", str(content.get("handle") or "")))
+        if content.get("type") == "group":
+            return any(
+                content_has_handle(item.get("content"))
+                for item in content.get("items") or []
+                if isinstance(item, dict)
+            )
+        return False
+
+    return content_has_handle(event.get("content"))
+
+
 # ---------------------------------------------------------------------------
 # Module-level helpers — also used by check_fn / standalone send
+
 
 def _coerce_port(value: Any, default: int) -> int:
     try:
@@ -180,12 +208,15 @@ def _markdown_enabled() -> bool:
     text without a release.
     """
     return os.getenv("PHOTON_MARKDOWN", "true").strip().lower() not in {
-        "false", "0", "no",
+        "false",
+        "0",
+        "no",
     }
 
 
 # ---------------------------------------------------------------------------
 # Adapter
+
 
 class PhotonAdapter(BasePlatformAdapter):
     """Bidirectional bridge to Photon Spectrum via the Node spectrum-ts sidecar.
@@ -205,10 +236,7 @@ class PhotonAdapter(BasePlatformAdapter):
         # the spectrum-ts SDK authenticates with.
         stored_id, stored_sec = load_project_credentials()
         self._project_id: str = (
-            os.getenv("PHOTON_PROJECT_ID")
-            or extra.get("project_id")
-            or stored_id
-            or ""
+            os.getenv("PHOTON_PROJECT_ID") or extra.get("project_id") or stored_id or ""
         )
         self._project_secret: str = (
             os.getenv("PHOTON_PROJECT_SECRET")
@@ -223,9 +251,7 @@ class PhotonAdapter(BasePlatformAdapter):
             _DEFAULT_SIDECAR_PORT,
         )
         self._sidecar_bind = _DEFAULT_SIDECAR_BIND
-        self._sidecar_token = (
-            os.getenv("PHOTON_SIDECAR_TOKEN") or secrets.token_hex(16)
-        )
+        self._sidecar_token = os.getenv("PHOTON_SIDECAR_TOKEN") or secrets.token_hex(16)
         self._autostart_sidecar = str(
             os.getenv("PHOTON_SIDECAR_AUTOSTART", "true")
         ).lower() not in ("0", "false", "no")
@@ -246,6 +272,12 @@ class PhotonAdapter(BasePlatformAdapter):
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).
         self._seen_messages: Dict[str, float] = {}
+        # Successfully handled sidecar delivery tokens. This closes the
+        # accept-then-ACK network-failure window without invoking a secure
+        # consumer twice during an in-process reconnect replay.
+        self._handled_deliveries: Dict[str, float] = {}
+        self._accepted_handle_deliveries: Dict[str, float] = {}
+        self._delivery_processing_waiters: Dict[str, asyncio.Future] = {}
         # Ids of messages WE sent (bounded, insertion-order eviction). Inbound
         # reaction events are only routed to the agent when they target one of
         # these — a tapback on a human↔human message is not addressed to us.
@@ -256,6 +288,12 @@ class PhotonAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: Dict[str, str] = {}
         # Last time we sent a typing indicator per chat, for cooldown gating.
         self._typing_last_sent: Dict[str, float] = {}
+        self._attachment_handle_consumer: Optional[Callable[[Dict[str, Any]], Any]] = (
+            None
+        )
+        self._attachment_sender_authorizer: Optional[
+            Callable[[Any, Dict[str, Any]], Any]
+        ] = None
 
         # Group-chat mention gating (parity with BlueBubbles). When enabled,
         # group messages are ignored unless they match a wake word; DMs are
@@ -264,13 +302,76 @@ class PhotonAdapter(BasePlatformAdapter):
         if _require_mention is None:
             _require_mention = os.getenv("PHOTON_REQUIRE_MENTION")
         self.require_mention = str(_require_mention).strip().lower() in {
-            "true", "1", "yes", "on",
+            "true",
+            "1",
+            "yes",
+            "on",
         }
         self._mention_patterns = self._compile_mention_patterns(
             extra["mention_patterns"]
             if "mention_patterns" in extra
             else os.getenv("PHOTON_MENTION_PATTERNS")
         )
+
+    def set_attachment_handle_consumer(
+        self,
+        consumer: Callable[[Dict[str, Any]], Any] | None,
+    ) -> None:
+        """Register the secure owner that redeems raw sidecar handles.
+
+        The callback must return ``True`` only after it has accepted ownership
+        of every handle in the raw event. Generic Hermes has no safe encrypted
+        media store, so handle-bearing events fail retryably until an embedding
+        runtime such as Keez installs this seam.
+        """
+        self._attachment_handle_consumer = consumer
+
+    def set_attachment_sender_authorizer(
+        self,
+        authorizer: Callable[[Any, Dict[str, Any]], Any] | None,
+    ) -> None:
+        """Register the sender-authorization gate paired with the consumer."""
+        self._attachment_sender_authorizer = authorizer
+
+    async def _require_attachment_handle_consumer(
+        self,
+        event: Dict[str, Any],
+        source: Any,
+    ) -> None:
+        if not _event_has_attachment_handle(event):
+            return
+        delivery_id = str(event.get("deliveryId") or "")
+        authorizer = self._attachment_sender_authorizer
+        consumer = self._attachment_handle_consumer
+        if authorizer is None or consumer is None:
+            raise PhotonAttachmentConsumerUnavailable(
+                "secure_attachment_consumer_unavailable"
+            )
+        try:
+            authorized = authorizer(source, event)
+            if inspect.isawaitable(authorized):
+                authorized = await authorized
+            if authorized is not True:
+                raise PhotonAttachmentConsumerUnavailable(
+                    "secure_attachment_sender_unauthorized"
+                )
+            if delivery_id and self._delivery_cache_has(
+                self._accepted_handle_deliveries, delivery_id
+            ):
+                return
+            accepted = consumer(event)
+            if inspect.isawaitable(accepted):
+                accepted = await accepted
+        except Exception as exc:
+            raise PhotonAttachmentConsumerUnavailable(
+                "secure_attachment_consumer_failed"
+            ) from exc
+        if accepted is not True:
+            raise PhotonAttachmentConsumerUnavailable(
+                "secure_attachment_consumer_rejected"
+            )
+        if delivery_id:
+            self._record_delivery_cache(self._accepted_handle_deliveries, delivery_id)
 
     # -- Group-mention gating (parity with BlueBubbles) -------------------
 
@@ -291,11 +392,15 @@ class PhotonAdapter(BasePlatformAdapter):
                 loaded = json.loads(text) if text else []
             except Exception:
                 loaded = None
-            patterns = loaded if isinstance(loaded, list) else [
-                part.strip()
-                for line in text.splitlines()
-                for part in line.split(",")
-            ]
+            patterns = (
+                loaded
+                if isinstance(loaded, list)
+                else [
+                    part.strip()
+                    for line in text.splitlines()
+                    for part in line.split(",")
+                ]
+            )
         elif isinstance(raw, list):
             patterns = raw
         else:
@@ -328,7 +433,7 @@ class PhotonAdapter(BasePlatformAdapter):
         for pattern in self._mention_patterns:
             match = pattern.match(text.lstrip())
             if match:
-                cleaned = text.lstrip()[match.end():].lstrip(" ,:-")
+                cleaned = text.lstrip()[match.end() :].lstrip(" ,:-")
                 return cleaned or text
         return text
 
@@ -336,9 +441,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         if not HTTPX_AVAILABLE:
-            self._set_fatal_error(
-                "MISSING_DEP", "httpx not installed", retryable=False
-            )
+            self._set_fatal_error("MISSING_DEP", "httpx not installed", retryable=False)
             return False
         if not self._project_id or not self._project_secret:
             self._set_fatal_error(
@@ -373,9 +476,7 @@ class PhotonAdapter(BasePlatformAdapter):
 
         # Start consuming the inbound gRPC stream from the sidecar.
         self._inbound_running = True
-        self._inbound_task = asyncio.get_event_loop().create_task(
-            self._inbound_loop()
-        )
+        self._inbound_task = asyncio.get_event_loop().create_task(self._inbound_loop())
         self._sidecar_health_task = asyncio.get_event_loop().create_task(
             self._monitor_sidecar_health()
         )
@@ -383,7 +484,8 @@ class PhotonAdapter(BasePlatformAdapter):
         self._mark_connected()
         logger.info(
             "[photon] connected — sidecar on %s:%d, streaming inbound over gRPC",
-            self._sidecar_bind, self._sidecar_port,
+            self._sidecar_bind,
+            self._sidecar_port,
         )
         return True
 
@@ -436,7 +538,10 @@ class PhotonAdapter(BasePlatformAdapter):
         while self._inbound_running:
             try:
                 async with client.stream(
-                    "GET", url, headers=headers, timeout=None,
+                    "GET",
+                    url,
+                    headers=headers,
+                    timeout=None,
                 ) as resp:
                     if resp.status_code != 200:
                         raise RuntimeError(f"/inbound returned {resp.status_code}")
@@ -455,7 +560,8 @@ class PhotonAdapter(BasePlatformAdapter):
                     break
                 logger.warning(
                     "[photon] inbound stream dropped (%s); reconnecting in %.1fs",
-                    e, backoff,
+                    e,
+                    backoff,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
@@ -510,12 +616,85 @@ class PhotonAdapter(BasePlatformAdapter):
             logger.debug("[photon] skipping non-JSON inbound line")
             return
         msg_id = event.get("messageId")
-        if msg_id and self._is_duplicate(msg_id):
-            return
+        delivery_id = event.get("deliveryId")
+        has_handle = _event_has_attachment_handle(event)
         try:
-            await self._dispatch_inbound(event)
+            if has_handle and not _DELIVERY_ID_RE.fullmatch(str(delivery_id or "")):
+                raise PhotonAttachmentConsumerUnavailable(
+                    "secure_attachment_delivery_id_missing"
+                )
+            if delivery_id and self._delivery_was_handled(delivery_id):
+                await self._ack_inbound_delivery(delivery_id)
+                return
+            if msg_id and self._is_duplicate(msg_id):
+                if not delivery_id:
+                    return
+                # A new content-bound delivery token must pass the secure
+                # consumer; message-id dedup alone cannot prove acceptance.
+                self._seen_messages.pop(msg_id, None)
+            processing_waiter: asyncio.Future | None = None
+            if delivery_id:
+                processing_waiter = asyncio.get_running_loop().create_future()
+                self._delivery_processing_waiters[delivery_id] = processing_waiter
+            dispatched = await self._dispatch_inbound(event)
+            if processing_waiter is not None:
+                if dispatched:
+                    outcome = await processing_waiter
+                    if outcome != ProcessingOutcome.SUCCESS:
+                        raise RuntimeError("secure_attachment_dispatch_failed")
+                else:
+                    self._delivery_processing_waiters.pop(delivery_id, None)
+            if delivery_id:
+                self._record_handled_delivery(delivery_id)
+                await self._ack_inbound_delivery(delivery_id)
+        except PhotonAttachmentConsumerUnavailable:
+            if msg_id:
+                self._seen_messages.pop(msg_id, None)
+            self._set_fatal_error(
+                "ATTACHMENT_CONSUMER_UNAVAILABLE",
+                "Photon attachment requires a registered secure handle consumer",
+                retryable=True,
+            )
+            await self._notify_fatal_error()
+            raise
         except Exception:
+            if delivery_id:
+                waiter = self._delivery_processing_waiters.pop(delivery_id, None)
+                if waiter is not None and not waiter.done():
+                    waiter.cancel()
+                if msg_id:
+                    self._seen_messages.pop(msg_id, None)
+                raise
             logger.exception("[photon] inbound dispatch failed")
+
+    async def _ack_inbound_delivery(self, delivery_id: str) -> None:
+        await self._sidecar_call("/inbound-ack", {"deliveryId": delivery_id})
+
+    def _delivery_was_handled(self, delivery_id: str) -> bool:
+        return self._delivery_cache_has(self._handled_deliveries, delivery_id)
+
+    @staticmethod
+    def _delivery_cache_has(cache: Dict[str, float], delivery_id: str) -> bool:
+        now = time.time()
+        accepted_at = cache.get(delivery_id)
+        return (
+            accepted_at is not None
+            and now - accepted_at < _DELIVERY_DEDUP_WINDOW_SECONDS
+        )
+
+    def _record_handled_delivery(self, delivery_id: str) -> None:
+        self._record_delivery_cache(self._handled_deliveries, delivery_id)
+
+    @staticmethod
+    def _record_delivery_cache(cache: Dict[str, float], delivery_id: str) -> None:
+        now = time.time()
+        cache.pop(delivery_id, None)
+        cache[delivery_id] = now
+        for old_id, accepted_at in list(cache.items()):
+            if now - accepted_at >= _DELIVERY_DEDUP_WINDOW_SECONDS:
+                cache.pop(old_id, None)
+        while len(cache) > _DELIVERY_DEDUP_MAX_SIZE:
+            cache.pop(next(iter(cache)))
 
     def _is_duplicate(self, msg_id: str) -> bool:
         now = time.time()
@@ -534,13 +713,15 @@ class PhotonAdapter(BasePlatformAdapter):
                 del seen[old]
         return False
 
-    async def _dispatch_inbound(self, event: Dict[str, Any]) -> None:
+    async def _dispatch_inbound(self, event: Dict[str, Any]) -> bool:
         """Normalize a sidecar inbound event and dispatch it to the gateway.
 
         Event shape (from ``sidecar/index.mjs``)::
 
             {
               "messageId": "...",
+              "sequence": 123,       # optional nonnegative provider sequence
+              "cursor": "opaque",   # optional provider resume cursor
               "platform": "iMessage",
               "space": {"id": "...", "type": "dm"|"group", "phone": "+E164"},
               "sender": {"id": "+E164"},
@@ -554,10 +735,11 @@ class PhotonAdapter(BasePlatformAdapter):
                           "targetText": "..." | null},
               "timestamp": "2026-05-14T19:06:32.000Z"
 
-        Attachment and voice content carry the bytes inline as base64 ``data``
-        (with ``encoding == "base64"``) when the sidecar could read them
-        within its size cap; otherwise only metadata is present and we surface
-        a marker.
+        Attachment and voice content carry metadata plus an opaque one-shot
+        ``handle`` when the sidecar could read their bytes into its bounded
+        in-memory store. Bytes are never embedded in this event or cached to
+        plaintext disk by this adapter. The handle remains in ``raw_message``
+        for the external secure attachment consumer.
             }
         """
         space = event.get("space") or {}
@@ -567,7 +749,7 @@ class PhotonAdapter(BasePlatformAdapter):
         space_id = space.get("id") or ""
         if not space_id:
             logger.warning("[photon] inbound missing space.id")
-            return
+            return False
 
         # iMessage spaces carry their type directly — no id string-sniffing.
         chat_type = "group" if space.get("type") == "group" else "dm"
@@ -589,28 +771,16 @@ class PhotonAdapter(BasePlatformAdapter):
         media_types: List[str] = []
 
         def _normalize_binary_payload(
-            payload: Dict[str, Any]
+            payload: Dict[str, Any],
         ) -> tuple[str, MessageType, List[str], List[str]]:
             is_voice = payload.get("type") == "voice"
             name = payload.get("name") or ("voice" if is_voice else "(unnamed)")
             mime = payload.get("mimeType") or ""
             mtype = MessageType.VOICE if is_voice else _attachment_message_type(mime)
-            cached = _cache_inbound_attachment(
-                payload, name, mime, force_audio=is_voice
-            )
-            if cached:
-                return (
-                    "(voice)" if is_voice else "(attachment)",
-                    mtype,
-                    [cached],
-                    [mime or ("audio/mp4" if is_voice else "application/octet-stream")],
-                )
             label = "voice" if is_voice else "attachment"
             duration = payload.get("duration")
             duration_text = (
-                f", duration: {duration}s"
-                if isinstance(duration, (int, float))
-                else ""
+                f", duration: {duration}s" if isinstance(duration, (int, float)) else ""
             )
             return (
                 f"[Photon {label} received: {name} "
@@ -631,10 +801,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 target_id and target_id in self._sent_message_ids
             )
             if not is_ours:
-                logger.debug(
-                    "[photon] ignoring reaction on a message we didn't send"
-                )
-                return
+                logger.debug("[photon] ignoring reaction on a message we didn't send")
+                return False
             emoji = content.get("emoji") or ""
             source = self.build_source(
                 chat_id=space_id,
@@ -667,7 +835,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     timestamp=timestamp,
                 )
             )
-            return
+            return True
         # Anything past here is a real (reactable) message — remember it as
         # the chat's latest inbound so `add_reaction` can target it when the
         # caller doesn't pass an explicit message id. Recorded before the
@@ -694,8 +862,8 @@ class PhotonAdapter(BasePlatformAdapter):
                         text_parts.append(item_text)
                     continue
                 if item_type in {"attachment", "voice"}:
-                    marker, item_mtype, item_urls, item_types = _normalize_binary_payload(
-                        item_content
+                    marker, item_mtype, item_urls, item_types = (
+                        _normalize_binary_payload(item_content)
                     )
                     if mtype == MessageType.TEXT:
                         mtype = item_mtype
@@ -725,7 +893,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     "[photon] ignoring group message "
                     "(require_mention=true, no mention pattern matched)"
                 )
-                return
+                return False
             text = self._clean_mention_text(text)
 
         source = self.build_source(
@@ -745,7 +913,9 @@ class PhotonAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
+        await self._require_attachment_handle_consumer(event, source)
         await self.handle_message(message_event)
+        return True
 
     # -- Sidecar lifecycle -------------------------------------------------
 
@@ -755,7 +925,10 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             out = subprocess.run(  # noqa: S603, S607
                 ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-                capture_output=True, text=True, timeout=5.0, check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return []
@@ -767,7 +940,10 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             out = subprocess.run(  # noqa: S603, S607
                 ["ps", "-p", str(pid), "-o", "command="],
-                capture_output=True, text=True, timeout=5.0, check=False,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -777,7 +953,9 @@ class PhotonAdapter(BasePlatformAdapter):
     @staticmethod
     def _pid_alive(pid: int) -> bool:
         try:
-            os.kill(pid, 0)  # windows-footgun: ok — only called from _reap_stale_sidecar which win32-guards early
+            os.kill(
+                pid, 0
+            )  # windows-footgun: ok — only called from _reap_stale_sidecar which win32-guards early
             return True
         except OSError:
             return False
@@ -815,7 +993,8 @@ class PhotonAdapter(BasePlatformAdapter):
         for pid in stale:
             logger.warning(
                 "[photon] reaping orphaned sidecar (pid %d) on port %d",
-                pid, self._sidecar_port,
+                pid,
+                self._sidecar_port,
             )
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -827,7 +1006,9 @@ class PhotonAdapter(BasePlatformAdapter):
         for pid in stale:
             if self._pid_alive(pid):
                 try:
-                    os.kill(pid, signal.SIGKILL)  # windows-footgun: ok — unreachable on win32 (early return above)
+                    os.kill(
+                        pid, getattr(signal, "SIGKILL", signal.SIGTERM)
+                    )
                 except OSError:
                     pass
         # Give the OS a beat to release the listening socket.
@@ -930,7 +1111,9 @@ class PhotonAdapter(BasePlatformAdapter):
                 line = await loop.run_in_executor(None, stdout.readline)
                 if not line:
                     break
-                logger.info("[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip())
+                logger.info(
+                    "[photon-sidecar] %s", line.decode("utf-8", "replace").rstrip()
+                )
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("[photon-sidecar] supervisor exited: %s", e)
         if self._inbound_running:
@@ -977,7 +1160,9 @@ class PhotonAdapter(BasePlatformAdapter):
             except subprocess.TimeoutExpired:
                 if sys.platform != "win32":
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)  # windows-footgun: ok
+                        os.killpg(  # windows-footgun: ok
+                            os.getpgid(proc.pid), signal.SIGTERM
+                        )
                     except (ProcessLookupError, PermissionError):
                         proc.terminate()
                 else:
@@ -1027,7 +1212,9 @@ class PhotonAdapter(BasePlatformAdapter):
             # Couldn't fetch the URL — fall back to sending it as text.
             return await super().send_image(chat_id, image_url, caption, reply_to)
         return await self._sidecar_send_attachment(
-            chat_id, local_path, caption=caption,
+            chat_id,
+            local_path,
+            caption=caption,
         )
 
     async def send_image_file(
@@ -1040,7 +1227,9 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, image_path, caption=caption,
+            chat_id,
+            image_path,
+            caption=caption,
         )
 
     async def send_voice(
@@ -1053,7 +1242,10 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, audio_path, caption=caption, kind="voice",
+            chat_id,
+            audio_path,
+            caption=caption,
+            kind="voice",
         )
 
     async def send_video(
@@ -1066,7 +1258,9 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, video_path, caption=caption,
+            chat_id,
+            video_path,
+            caption=caption,
         )
 
     async def send_document(
@@ -1080,7 +1274,10 @@ class PhotonAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         return await self._sidecar_send_attachment(
-            chat_id, file_path, name=file_name, caption=caption,
+            chat_id,
+            file_path,
+            name=file_name,
+            caption=caption,
         )
 
     async def send_animation(
@@ -1093,7 +1290,11 @@ class PhotonAdapter(BasePlatformAdapter):
     ) -> SendResult:
         # iMessage renders GIFs inline as ordinary image attachments.
         return await self.send_image(
-            chat_id, animation_url, caption, reply_to, metadata,
+            chat_id,
+            animation_url,
+            caption,
+            reply_to,
+            metadata,
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -1102,18 +1303,14 @@ class PhotonAdapter(BasePlatformAdapter):
             return
         self._typing_last_sent[chat_id] = now
         try:
-            await self._sidecar_call(
-                "/typing", {"spaceId": chat_id, "state": "start"}
-            )
+            await self._sidecar_call("/typing", {"spaceId": chat_id, "state": "start"})
         except Exception as e:
             logger.debug("[photon] send_typing failed: %s", e)
 
     async def stop_typing(self, chat_id: str) -> None:
         self._typing_last_sent.pop(chat_id, None)
         try:
-            await self._sidecar_call(
-                "/typing", {"spaceId": chat_id, "state": "stop"}
-            )
+            await self._sidecar_call("/typing", {"spaceId": chat_id, "state": "stop"})
         except Exception as e:
             logger.debug("[photon] stop_typing failed: %s", e)
 
@@ -1160,19 +1357,18 @@ class PhotonAdapter(BasePlatformAdapter):
             del last[key]  # refresh insertion order
         last[key] = message_id
         if len(last) > self._LAST_INBOUND_CHATS_MAX:
-            for old in list(last.keys())[
-                : len(last) - self._LAST_INBOUND_CHATS_MAX
-            ]:
+            for old in list(last.keys())[: len(last) - self._LAST_INBOUND_CHATS_MAX]:
                 del last[old]
 
     def _reactions_enabled(self) -> bool:
         return os.getenv("PHOTON_REACTIONS", "false").strip().lower() in {
-            "true", "1", "yes", "on",
+            "true",
+            "1",
+            "yes",
+            "on",
         }
 
-    async def _add_reaction(
-        self, chat_id: str, message_id: str, emoji: str
-    ) -> bool:
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Tapback ``emoji`` onto a message. Soft-fails (False), never raises."""
         try:
             await self._sidecar_call(
@@ -1193,7 +1389,8 @@ class PhotonAdapter(BasePlatformAdapter):
         """
         try:
             await self._sidecar_call(
-                "/unreact", {"spaceId": chat_id, "messageId": message_id},
+                "/unreact",
+                {"spaceId": chat_id, "messageId": message_id},
             )
             return True
         except Exception as e:
@@ -1274,18 +1471,25 @@ class PhotonAdapter(BasePlatformAdapter):
         platform replaces a sender's previous tapback or stacks them, and it
         keeps the sidecar's reaction-handle slot coherent.
         """
-        if not self._reactions_enabled():
-            return
-        chat_id = getattr(event.source, "chat_id", None)
-        message_id = getattr(event, "message_id", None)
-        if not chat_id or not message_id:
-            return
-        await self._remove_reaction(chat_id, message_id)
-        if outcome == ProcessingOutcome.SUCCESS:
-            await self._add_reaction(chat_id, message_id, "\U0001f44d")
-        elif outcome == ProcessingOutcome.FAILURE:
-            await self._add_reaction(chat_id, message_id, "\U0001f44e")
-        # CANCELLED: leave the message unreacted.
+        try:
+            if not self._reactions_enabled():
+                return
+            chat_id = getattr(event.source, "chat_id", None)
+            message_id = getattr(event, "message_id", None)
+            if not chat_id or not message_id:
+                return
+            await self._remove_reaction(chat_id, message_id)
+            if outcome == ProcessingOutcome.SUCCESS:
+                await self._add_reaction(chat_id, message_id, "\U0001f44d")
+            elif outcome == ProcessingOutcome.FAILURE:
+                await self._add_reaction(chat_id, message_id, "\U0001f44e")
+            # CANCELLED: leave the message unreacted.
+        finally:
+            raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+            delivery_id = str(raw.get("deliveryId") or "")
+            waiter = self._delivery_processing_waiters.pop(delivery_id, None)
+            if waiter is not None and not waiter.done():
+                waiter.set_result(outcome)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return whatever we know about a Spectrum space id.
@@ -1347,7 +1551,10 @@ class PhotonAdapter(BasePlatformAdapter):
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(
                     "[photon] Send failed (attempt %d/%d, retrying in %.1fs): %s",
-                    attempt, max_retries, delay, error_str,
+                    attempt,
+                    max_retries,
+                    delay,
+                    error_str,
                 )
                 await asyncio.sleep(delay)
                 result = await self.send(
@@ -1364,7 +1571,8 @@ class PhotonAdapter(BasePlatformAdapter):
             else:
                 logger.error(
                     "[photon] Failed to deliver response after %d retries: %s",
-                    max_retries, error_str,
+                    max_retries,
+                    error_str,
                 )
                 return result
 
@@ -1379,14 +1587,17 @@ class PhotonAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
         if not fallback_result.success:
-            logger.error("[photon] Plain-text retry also failed: %s", fallback_result.error)
+            logger.error(
+                "[photon] Plain-text retry also failed: %s", fallback_result.error
+            )
         return fallback_result
 
     async def _sidecar_send(self, space_id: str, text: str) -> SendResult:
         if len(text) > self.MAX_MESSAGE_LENGTH:
             logger.warning(
                 "[photon] truncating outbound from %d to %d chars",
-                len(text), self.MAX_MESSAGE_LENGTH,
+                len(text),
+                self.MAX_MESSAGE_LENGTH,
             )
             text = text[: self.MAX_MESSAGE_LENGTH]
         body: Dict[str, Any] = {"spaceId": space_id, "text": text}
@@ -1469,7 +1680,9 @@ class PhotonAdapter(BasePlatformAdapter):
         # not false-failed into a duplicate fallback.
         url = f"http://{self._sidecar_bind}:{self._sidecar_port}{path}"
         headers = {"X-Hermes-Sidecar-Token": self._sidecar_token}
-        async with httpx.AsyncClient(timeout=float(os.getenv("PHOTON_SIDECAR_TIMEOUT") or 90.0)) as client:
+        async with httpx.AsyncClient(
+            timeout=float(os.getenv("PHOTON_SIDECAR_TIMEOUT") or 90.0)
+        ) as client:
             resp = await client.post(url, json=body, headers=headers)
         if resp.status_code != 200:
             raise RuntimeError(
@@ -1486,6 +1699,7 @@ class PhotonAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 # Helpers
 
+
 def _attachment_message_type(mime: str) -> MessageType:
     mime = (mime or "").lower()
     if mime.startswith("image/"):
@@ -1499,87 +1713,11 @@ def _attachment_message_type(mime: str) -> MessageType:
     return MessageType.DOCUMENT
 
 
-# MIME → file-extension maps for caching inbound attachment bytes. These mirror
-# the BlueBubbles iMessage channel so both adapters name cached media the same.
-_IMAGE_EXT_BY_MIME = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/heic": ".jpg",
-    "image/heif": ".jpg",
-    "image/tiff": ".jpg",
-}
-_AUDIO_EXT_BY_MIME = {
-    "audio/mp3": ".mp3",
-    "audio/mpeg": ".mp3",
-    "audio/ogg": ".ogg",
-    "audio/wav": ".wav",
-    "audio/x-caf": ".mp3",
-    "audio/mp4": ".m4a",
-    "audio/aac": ".m4a",
-}
-
-
-def _cache_inbound_attachment(
-    content: Dict[str, Any],
-    name: str,
-    mime: str,
-    *,
-    force_audio: bool = False,
-) -> Optional[str]:
-    """Decode a base64-inlined inbound attachment and cache it locally.
-
-    The sidecar inlines the attachment bytes as ``content["data"]`` (base64).
-    We decode them and route to the shared media cache by MIME type, returning
-    the cached absolute path so the caller can populate ``media_urls`` (which
-    the gateway then hands to the model). Returns ``None`` when there are no
-    bytes (over the sidecar's inline cap or a failed read) or when caching
-    fails, so the caller can fall back to a text marker.
-    """
-    data_b64 = content.get("data")
-    if not data_b64:
-        return None
-    try:
-        raw = base64.b64decode(data_b64)
-    except (ValueError, TypeError) as exc:
-        logger.warning("[photon] failed to decode inbound attachment bytes: %s", exc)
-        return None
-
-    from gateway.platforms.base import (
-        cache_audio_from_bytes,
-        cache_document_from_bytes,
-        cache_image_from_bytes,
-    )
-
-    mime = (mime or "").lower()
-    # Prefer the real extension from the filename; fall back to the MIME map.
-    suffix = Path(name).suffix if name else ""
-    try:
-        if mime.startswith("image/"):
-            ext = suffix or _IMAGE_EXT_BY_MIME.get(mime, ".jpg")
-            try:
-                return cache_image_from_bytes(raw, ext)
-            except ValueError:
-                # Bytes don't look like a supported image (e.g. HEIC magic) —
-                # still deliver them as a document rather than dropping them.
-                return cache_document_from_bytes(raw, name)
-        if force_audio or mime.startswith("audio/"):
-            ext = suffix or _AUDIO_EXT_BY_MIME.get(
-                mime, ".m4a" if force_audio else ".mp3"
-            )
-            return cache_audio_from_bytes(raw, ext)
-        # Video, application/*, and everything else → document cache.
-        return cache_document_from_bytes(raw, name)
-    except Exception as exc:
-        logger.warning("[photon] failed to cache inbound attachment %s: %s", name, exc)
-        return None
-
-
 # ---------------------------------------------------------------------------
 # Standalone (out-of-process) send for cron deliveries when the gateway
 # is not co-resident.  Reuses a live sidecar already listening on the
 # configured port (cron processes cannot spawn the sidecar themselves).
+
 
 async def _standalone_send(
     pconfig: PlatformConfig,
@@ -1619,10 +1757,14 @@ async def _standalone_send(
                 if _markdown_enabled():
                     send_body["format"] = "markdown"
                 resp = await client.post(
-                    f"{base}/send", json=send_body, headers=headers,
+                    f"{base}/send",
+                    json=send_body,
+                    headers=headers,
                 )
                 if resp.status_code != 200:
-                    return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
+                    return {
+                        "error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"
+                    }
                 data = resp.json() or {}
                 if not data.get("ok"):
                     return {"error": data.get("error") or "sidecar reported failure"}
@@ -1634,7 +1776,9 @@ async def _standalone_send(
             import mimetypes
 
             for media_path, is_voice in media_files or []:
-                safe_path = BasePlatformAdapter.validate_media_delivery_path(str(media_path))
+                safe_path = BasePlatformAdapter.validate_media_delivery_path(
+                    str(media_path)
+                )
                 if not safe_path:
                     logger.warning("[photon] standalone send skipping unsafe path")
                     continue
@@ -1647,10 +1791,14 @@ async def _standalone_send(
                 if guessed:
                     att_body["mimeType"] = guessed
                 resp = await client.post(
-                    f"{base}/send-attachment", json=att_body, headers=headers,
+                    f"{base}/send-attachment",
+                    json=att_body,
+                    headers=headers,
                 )
                 if resp.status_code != 200:
-                    return {"error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"}
+                    return {
+                        "error": f"sidecar returned {resp.status_code}: {resp.text[:200]}"
+                    }
                 data = resp.json() or {}
                 if not data.get("ok"):
                     return {"error": data.get("error") or "sidecar reported failure"}
@@ -1663,6 +1811,7 @@ async def _standalone_send(
 
 # ---------------------------------------------------------------------------
 # Plugin entry point
+
 
 def register(ctx) -> None:
     """Called by the Hermes plugin loader at startup."""

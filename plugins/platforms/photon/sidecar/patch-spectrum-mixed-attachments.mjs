@@ -144,6 +144,22 @@ export function patchSpectrumTs(root = scriptDir()) {
     const CRLF = CR + "\n";
     const usedCRLF = raw.includes(CRLF);
     const original = usedCRLF ? raw.split(CRLF).join("\n") : raw;
+    // Spectrum 9.3.1 fixed this upstream with a shared ordered-parts mapper.
+    // Detect the behavior, rather than a version number, so compatible future
+    // releases remain installable and a repackaged old release is not trusted.
+    if (
+      original.includes("const toOrderedParts =") &&
+      original.includes(
+        "const parts = toOrderedParts(message.content.text, attachments);"
+      ) &&
+      original.includes("buildOrderedPartMessage")
+    ) {
+      return {
+        patched: false,
+        file,
+        reason: "upstream native mixed parts",
+      };
+    }
     if (!original.includes("const toInboundMessages = async") ||
         !original.includes("const rebuildFromAppleMessage = async")) {
       continue;
@@ -170,7 +186,8 @@ if (_invokedDirectly) {
     const root = process.argv[2] ? path.resolve(process.argv[2]) : scriptDir();
     const result = patchSpectrumTs(root);
     const action = result.patched ? "patched" : "ok";
-    console.error(`photon-sidecar: spectrum mixed attachment patch ${action}: ${result.file}`);
+    const reason = result.reason ? ` (${result.reason})` : "";
+    console.error(`photon-sidecar: spectrum mixed attachment patch ${action}${reason}: ${result.file}`);
   } catch (err) {
     console.error(`photon-sidecar: spectrum mixed attachment patch failed: ${err?.stack || err}`);
     process.exit(1);
