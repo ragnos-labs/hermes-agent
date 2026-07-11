@@ -138,6 +138,11 @@ All env vars are documented in `plugin.yaml`. The most important:
   any byte read that fails, falls back to a text marker (`[Photon attachment
   received: …]` or `[Photon voice received: …]`) so the agent still knows
   something arrived.
+  Keez handle consumers bind durable upload and submit receipts to the random
+  `deliveryId`. On replay, the consumer queries that receipt before any
+  one-shot `/attachment/<handle>` GET. A committed upload resumes at submit;
+  a committed submit returns its prior approval result and allows ACK. An
+  absent, mismatched, or unknown commit never authorizes ACK.
 - **Outbound attachments are supported.** Images, voice notes, video, and
   documents are sent via `space.send(attachment(...))` /
   `space.send(voice(...))` through the sidecar's `/send-attachment`

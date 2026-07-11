@@ -54,7 +54,8 @@ async def test_runner_acks_only_after_secure_upload_and_durable_submit(
     adapter.set_message_handler(handler)
 
     async def sidecar_call(path: str, _body: dict) -> dict:
-        calls.append(path)
+        if path == "/inbound-ack":
+            calls.append(path)
         return {"ok": True}
 
     monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
@@ -89,3 +90,55 @@ def test_runner_fails_closed_when_keez_handler_has_no_readiness_hook() -> None:
         return None
 
     assert _build_attachment_readiness(handler)(_event()) is False
+
+
+@pytest.mark.asyncio
+async def test_runner_replay_queries_commit_before_any_second_handle_get(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter(monkeypatch)
+    calls: list[str] = []
+    committed = False
+
+    async def handler(_message: Any) -> None:
+        nonlocal committed
+        calls.append("receipt_query")
+        if committed:
+            return
+        calls.extend(["handle_get", "secure_upload", "durable_box_submit_commit"])
+        committed = True
+        raise TimeoutError("response lost after durable commit")
+
+    handler.keez_attachment_handles_owned = True  # type: ignore[attr-defined]
+    adapter.set_attachment_sender_authorizer(_build_sender_authorizer(["+15551234567"]))
+    adapter.set_attachment_handle_consumer(_build_attachment_readiness(handler))
+    adapter.set_message_handler(handler)
+
+    async def sidecar_call(path: str, _body: dict) -> dict:
+        if path == "/inbound-ack":
+            calls.append(path)
+        return {"ok": True}
+
+    monkeypatch.setattr(adapter, "_sidecar_call", sidecar_call)
+    event = _event()
+    attachment = event["content"]
+    event["content"] = {
+        "type": "group",
+        "items": [
+            {"content": {"type": "text", "text": "audit this"}},
+            {"content": attachment},
+        ],
+    }
+    line = json.dumps(event)
+    with pytest.raises(Exception):
+        await adapter._on_inbound_line(line)
+    await adapter._on_inbound_line(line)
+
+    assert calls == [
+        "receipt_query",
+        "handle_get",
+        "secure_upload",
+        "durable_box_submit_commit",
+        "receipt_query",
+        "/inbound-ack",
+    ]
