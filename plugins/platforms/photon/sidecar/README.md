@@ -11,8 +11,8 @@ The sidecar:
   to push send, reply, edit, and typing requests (auth via
   `X-Hermes-Sidecar-Token`)
 - drains the inbound message stream so `spectrum-ts` keeps its
-  reconnect/heartbeat machinery alive (real inbound delivery is via
-  Photon's signed webhook hitting our Python aiohttp server)
+  reconnect/heartbeat machinery alive and forwards normalized events over the
+  authenticated loopback NDJSON stream (Hermes does not use a Photon webhook)
 
 ## Install
 
@@ -91,12 +91,26 @@ An authenticated `GET /attachment/<handle>` returns the raw bytes once with
 `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. The exact path
 accepts no query string or suffix. Consumption is atomic: concurrent or replay
 requests receive the same content-free 404 as expired and unknown handles.
-Buffers are zeroed after response completion, on expiry, and on shutdown.
+Queued and in-flight transfers remain charged to the same count, byte, and TTL
+limits until their buffer is zeroed. Buffers are released exactly once after
+response completion, close, error, TTL expiry, or shutdown. A stalled client
+is destroyed at TTL expiry, so it cannot move plaintext outside the bounded
+store accounting or retain a queued response after its lease ends.
 
-This is the external half of the secure attachment flow. The Python Photon
-adapter preserves the handle in `MessageEvent.raw_message` but intentionally
-does not fetch it or create a media cache file. A downstream secure consumer
-must redeem the handle within the TTL before attachments become model-ready.
+This is the external half of the secure attachment flow. Generic Hermes has no
+encrypted media store, so the Python Photon adapter intentionally does not
+fetch a handle or create a media cache file. An embedding runtime must register
+`PhotonAdapter.set_attachment_handle_consumer(...)`; the callback receives the
+raw event and must return `True` only after accepting ownership of every
+handle. Without that consumer, attachment dispatch raises the retryable
+`ATTACHMENT_CONSUMER_UNAVAILABLE` fatal state, rolls back local dedup, and does
+not tell the generic model that media is ready. Keez can install this seam and
+redeem the raw handle inside its governed attachment boundary.
+
+The remaining limitation is upstream replay: Spectrum exposes no public
+restart cursor API, as documented above. Reconnect is requested after a missing
+consumer, but replay of that exact event is not guaranteed. A complete generic
+consumer and durable replay queue require a larger approved design.
 
 ## Reply and edit crash boundary
 

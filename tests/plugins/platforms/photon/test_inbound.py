@@ -13,7 +13,10 @@ import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
-from plugins.platforms.photon.adapter import PhotonAdapter
+from plugins.platforms.photon.adapter import (
+    PhotonAdapter,
+    PhotonAttachmentConsumerUnavailable,
+)
 
 
 def _make_adapter(monkeypatch: pytest.MonkeyPatch) -> PhotonAdapter:
@@ -31,6 +34,10 @@ def _capture(adapter: PhotonAdapter, monkeypatch: pytest.MonkeyPatch) -> List[Me
 
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     return captured
+
+
+def _accept_secure_handles(adapter: PhotonAdapter) -> None:
+    adapter.set_attachment_handle_consumer(lambda _event: True)
 
 
 def _dm_event(text: str, msg_id: str = "spc-msg-abc") -> Dict[str, Any]:
@@ -131,6 +138,7 @@ async def test_dispatch_attachment_preserves_secure_handle_without_plaintext_cac
 ) -> None:
     """The opaque handle stays in raw_message and never becomes a disk path."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     handle = "a" * 48
@@ -178,11 +186,76 @@ async def test_dispatch_ignores_legacy_inline_base64(
 
 
 @pytest.mark.asyncio
+async def test_handle_without_secure_consumer_fails_retryably_instead_of_dispatching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    notified: list[bool] = []
+
+    async def notify() -> None:
+        notified.append(True)
+
+    monkeypatch.setattr(adapter, "_notify_fatal_error", notify)
+    event = _attachment_event(
+        {
+            "name": "photo.png",
+            "mimeType": "image/png",
+            "size": 67,
+            "handle": "e" * 48,
+        },
+        msg_id="secure-handle-no-consumer",
+    )
+
+    with pytest.raises(PhotonAttachmentConsumerUnavailable):
+        await adapter._on_inbound_line(json.dumps(event))
+
+    assert captured == []
+    assert "secure-handle-no-consumer" not in adapter._seen_messages
+    assert adapter.fatal_error_code == "ATTACHMENT_CONSUMER_UNAVAILABLE"
+    assert adapter.fatal_error_retryable is True
+    assert "e" * 48 not in str(adapter.fatal_error_message)
+    assert notified == [True]
+
+
+@pytest.mark.asyncio
+async def test_registered_secure_consumer_receives_raw_handle_before_generic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+    consumed: list[str] = []
+
+    async def consume(event: Dict[str, Any]) -> bool:
+        consumed.append(event["content"]["handle"])
+        return True
+
+    adapter.set_attachment_handle_consumer(consume)
+    event = _attachment_event(
+        {
+            "name": "photo.png",
+            "mimeType": "image/png",
+            "size": 67,
+            "handle": "f" * 48,
+        },
+        msg_id="secure-handle-consumed",
+    )
+
+    await adapter._on_inbound_line(json.dumps(event))
+
+    assert consumed == ["f" * 48]
+    assert len(captured) == 1
+    assert captured[0].media_urls == []
+    assert captured[0].raw_message["content"]["handle"] == "f" * 48
+
+
+@pytest.mark.asyncio
 async def test_dispatch_group_preserves_text_and_attachment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Spectrum group content from a mixed text+image iMessage must not drop text."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _attachment_event(
@@ -226,6 +299,7 @@ async def test_dispatch_voice_preserves_handle_without_plaintext_cache(
 ) -> None:
     """Inbound voice bytes remain behind the one-shot sidecar handle."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _voice_event(
@@ -277,6 +351,7 @@ async def test_dispatch_attachment_document_stays_behind_handle(
 ) -> None:
     """Non-image attachments retain type without writing a document cache."""
     adapter = _make_adapter(monkeypatch)
+    _accept_secure_handles(adapter)
     captured = _capture(adapter, monkeypatch)
 
     event = _attachment_event(

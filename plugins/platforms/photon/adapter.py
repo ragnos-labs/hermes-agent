@@ -24,6 +24,7 @@ Outbound:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
     # Type checkers see ``httpx`` as the always-imported module, so every use
@@ -110,6 +111,27 @@ _DEFAULT_MENTION_PATTERNS = [
     r"(?<![\w@])@?hermes\s+agent\b[,:\-]?",
     r"(?<![\w@])@?hermes\b[,:\-]?",
 ]
+
+
+class PhotonAttachmentConsumerUnavailable(RuntimeError):
+    """A secure consumer did not accept an opaque inbound attachment handle."""
+
+
+def _event_has_attachment_handle(event: Dict[str, Any]) -> bool:
+    def content_has_handle(content: Any) -> bool:
+        if not isinstance(content, dict):
+            return False
+        if content.get("type") in {"attachment", "voice"}:
+            return bool(re.fullmatch(r"[a-f0-9]{48}", str(content.get("handle") or "")))
+        if content.get("type") == "group":
+            return any(
+                content_has_handle(item.get("content"))
+                for item in content.get("items") or []
+                if isinstance(item, dict)
+            )
+        return False
+
+    return content_has_handle(event.get("content"))
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +277,9 @@ class PhotonAdapter(BasePlatformAdapter):
         self._last_inbound_by_chat: Dict[str, str] = {}
         # Last time we sent a typing indicator per chat, for cooldown gating.
         self._typing_last_sent: Dict[str, float] = {}
+        self._attachment_handle_consumer: Optional[
+            Callable[[Dict[str, Any]], Any]
+        ] = None
 
         # Group-chat mention gating (parity with BlueBubbles). When enabled,
         # group messages are ignored unless they match a wake word; DMs are
@@ -270,6 +295,43 @@ class PhotonAdapter(BasePlatformAdapter):
             if "mention_patterns" in extra
             else os.getenv("PHOTON_MENTION_PATTERNS")
         )
+
+    def set_attachment_handle_consumer(
+        self,
+        consumer: Callable[[Dict[str, Any]], Any] | None,
+    ) -> None:
+        """Register the secure owner that redeems raw sidecar handles.
+
+        The callback must return ``True`` only after it has accepted ownership
+        of every handle in the raw event. Generic Hermes has no safe encrypted
+        media store, so handle-bearing events fail retryably until an embedding
+        runtime such as Keez installs this seam.
+        """
+        self._attachment_handle_consumer = consumer
+
+    async def _require_attachment_handle_consumer(
+        self,
+        event: Dict[str, Any],
+    ) -> None:
+        if not _event_has_attachment_handle(event):
+            return
+        consumer = self._attachment_handle_consumer
+        if consumer is None:
+            raise PhotonAttachmentConsumerUnavailable(
+                "secure_attachment_consumer_unavailable"
+            )
+        try:
+            accepted = consumer(event)
+            if inspect.isawaitable(accepted):
+                accepted = await accepted
+        except Exception as exc:
+            raise PhotonAttachmentConsumerUnavailable(
+                "secure_attachment_consumer_failed"
+            ) from exc
+        if accepted is not True:
+            raise PhotonAttachmentConsumerUnavailable(
+                "secure_attachment_consumer_rejected"
+            )
 
     # -- Group-mention gating (parity with BlueBubbles) -------------------
 
@@ -513,6 +575,16 @@ class PhotonAdapter(BasePlatformAdapter):
             return
         try:
             await self._dispatch_inbound(event)
+        except PhotonAttachmentConsumerUnavailable:
+            if msg_id:
+                self._seen_messages.pop(msg_id, None)
+            self._set_fatal_error(
+                "ATTACHMENT_CONSUMER_UNAVAILABLE",
+                "Photon attachment requires a registered secure handle consumer",
+                retryable=True,
+            )
+            await self._notify_fatal_error()
+            raise
         except Exception:
             logger.exception("[photon] inbound dispatch failed")
 
@@ -562,6 +634,7 @@ class PhotonAdapter(BasePlatformAdapter):
         for the external secure attachment consumer.
             }
         """
+        await self._require_attachment_handle_consumer(event)
         space = event.get("space") or {}
         sender = event.get("sender") or {}
         content = event.get("content") or {}

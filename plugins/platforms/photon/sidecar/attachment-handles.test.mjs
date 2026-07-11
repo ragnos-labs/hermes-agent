@@ -317,3 +317,86 @@ test("response faults still wipe consumed bytes", () => {
   assert.equal(response.reference.every((value) => value === 0), true);
   assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
 });
+
+test("stalled responses remain charged and are wiped by the transfer TTL", () => {
+  let now = 30_000;
+  let expire = null;
+  const store = new AttachmentHandleStore({
+    maxItemBytes: 16,
+    maxTotalBytes: 16,
+    maxCount: 1,
+    ttlMs: 50,
+    now: () => now,
+    setTimer: (callback) => {
+      expire = callback;
+      return { unref() {} };
+    },
+    clearTimer: () => {},
+  });
+  const { handle } = store.put(Buffer.from("private bytes"), {});
+  class StalledResponse extends FakeResponse {
+    end(body) {
+      this.reference = body;
+    }
+
+    destroy() {
+      this.destroyed = true;
+      this.emit("close");
+    }
+  }
+  const response = new StalledResponse();
+  serveAttachmentHandle(`/attachment/${handle}`, response, store);
+
+  assert.deepEqual(store.stats(), { count: 1, totalBytes: 13 });
+  assert.throws(
+    () => store.put(Buffer.from("x"), {}),
+    (error) => error.code === "capacity_exceeded"
+  );
+  now += 51;
+  expire();
+  assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
+  assert.equal(response.reference.every((value) => value === 0), true);
+  assert.equal(response.destroyed, true);
+
+  const replay = new FakeResponse();
+  serveAttachmentHandle(`/attachment/${handle}`, replay, store);
+  assert.equal(replay.statusCode, 404);
+});
+
+test("completion close error and shutdown release each lease exactly once", () => {
+  for (const releaseKind of ["completion", "close", "error", "shutdown"]) {
+    const store = new AttachmentHandleStore({
+      maxItemBytes: 16,
+      maxTotalBytes: 16,
+      maxCount: 1,
+      ttlMs: 1_000,
+      setTimer: noTimer,
+    });
+    const { handle } = store.put(Buffer.from("private bytes"), {});
+    class ManualResponse extends FakeResponse {
+      end(body, callback) {
+        this.reference = body;
+        this.completion = callback;
+      }
+
+      destroy() {
+        this.destroyed = true;
+        this.emit("close");
+      }
+    }
+    const response = new ManualResponse();
+    serveAttachmentHandle(`/attachment/${handle}`, response, store);
+    if (releaseKind === "completion") response.completion();
+    if (releaseKind === "close") response.emit("close");
+    if (releaseKind === "error") response.emit("error", new Error("socket"));
+    if (releaseKind === "shutdown") store.close();
+
+    response.completion();
+    response.emit("close");
+    if (releaseKind !== "error") response.emit("error", new Error("late"));
+    store.close();
+    assert.deepEqual(store.stats(), { count: 0, totalBytes: 0 });
+    assert.equal(response.reference.every((value) => value === 0), true);
+    assert.equal(Boolean(response.destroyed), releaseKind === "shutdown");
+  }
+});

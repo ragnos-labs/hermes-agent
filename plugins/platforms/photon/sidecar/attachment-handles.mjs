@@ -47,8 +47,25 @@ export class AttachmentHandleStore {
   }
 
   _wipe(entry) {
+    if (entry.wiped) return;
+    entry.wiped = true;
     entry.bytes.fill(0);
     this._totalBytes -= entry.bytes.length;
+  }
+
+  _release(handle, entry, { abort = false } = {}) {
+    if (this._entries.get(handle) !== entry) return false;
+    this._entries.delete(handle);
+    if (abort && !entry.aborted) {
+      entry.aborted = true;
+      try {
+        entry.onExpire?.();
+      } catch {
+        // Expiry and shutdown remain authoritative when socket teardown fails.
+      }
+    }
+    this._wipe(entry);
+    return true;
   }
 
   _scheduleExpiry() {
@@ -75,8 +92,7 @@ export class AttachmentHandleStore {
     const now = this._now();
     for (const [handle, entry] of this._entries) {
       if (entry.expiresAt <= now) {
-        this._entries.delete(handle);
-        this._wipe(entry);
+        this._release(handle, entry, { abort: true });
       }
     }
     this._scheduleExpiry();
@@ -133,13 +149,17 @@ export class AttachmentHandleStore {
           ? mimeType
           : null,
       expiresAt: this._now() + this.ttlMs,
+      state: "queued",
+      wiped: false,
+      aborted: false,
+      onExpire: null,
     });
     this._totalBytes += owned.length;
     this._scheduleExpiry();
     return { handle };
   }
 
-  consume(handle) {
+  consume(handle, { onExpire = null } = {}) {
     if (typeof handle !== "string" || !HANDLE_RE.test(handle)) {
       throw new AttachmentHandleError(
         "not_found",
@@ -148,16 +168,21 @@ export class AttachmentHandleStore {
     }
     this.purgeExpired();
     const entry = this._entries.get(handle);
-    if (!entry) {
+    if (!entry || entry.state !== "queued") {
       throw new AttachmentHandleError(
         "not_found",
         "attachment handle not found"
       );
     }
-    this._entries.delete(handle);
-    this._totalBytes -= entry.bytes.length;
-    this._scheduleExpiry();
+    entry.state = "in_flight";
+    entry.onExpire = typeof onExpire === "function" ? onExpire : null;
     return entry;
+  }
+
+  release(handle, entry) {
+    const released = this._release(handle, entry);
+    if (released) this._scheduleExpiry();
+    return released;
   }
 
   stats() {
@@ -170,8 +195,9 @@ export class AttachmentHandleStore {
       this._clearTimer(this._expiryTimer);
       this._expiryTimer = null;
     }
-    for (const entry of this._entries.values()) this._wipe(entry);
-    this._entries.clear();
+    for (const [handle, entry] of this._entries) {
+      this._release(handle, entry, { abort: true });
+    }
   }
 }
 
@@ -289,7 +315,9 @@ export function serveAttachmentHandle(path, res, store) {
   if (handle === null) return false;
   let entry;
   try {
-    entry = store.consume(handle);
+    entry = store.consume(handle, {
+      onExpire: () => res.destroy?.(),
+    });
   } catch (error) {
     if (!(error instanceof AttachmentHandleError)) throw error;
     res.statusCode = 404;
@@ -303,18 +331,13 @@ export function serveAttachmentHandle(path, res, store) {
   res.setHeader("Content-Length", String(entry.bytes.length));
   res.setHeader("Cache-Control", "no-store");
   res.setHeader("X-Content-Type-Options", "nosniff");
-  let wiped = false;
-  const wipe = () => {
-    if (wiped) return;
-    wiped = true;
-    entry.bytes.fill(0);
-  };
-  res.once?.("close", wipe);
-  res.once?.("error", wipe);
+  const release = () => store.release(handle, entry);
+  res.once?.("close", release);
+  res.once?.("error", release);
   try {
-    res.end(entry.bytes, wipe);
+    res.end(entry.bytes, release);
   } catch (error) {
-    wipe();
+    release();
     throw error;
   }
   return true;
