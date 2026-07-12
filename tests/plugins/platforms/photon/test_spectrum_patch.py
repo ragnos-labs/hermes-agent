@@ -17,6 +17,22 @@ def test_sidecar_applies_spectrum_patch_before_importing_sdk() -> None:
     assert index.index("patchSpectrumTs();") < index.index('await import("spectrum-ts")')
 
 
+def test_attachment_handle_route_is_behind_the_sidecar_token_gate() -> None:
+    """Raw attachment bytes must never be reachable before authentication."""
+    index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(
+        encoding="utf-8"
+    )
+    auth = 'if (!tokenOk(req.headers["x-hermes-sidecar-token"]))'
+    routes = (
+        "serveAttachmentLease(req.url, body, res, attachmentHandles)",
+        "mutateAttachmentLease(req.url, body, res, attachmentHandles)",
+    )
+    assert auth in index
+    for route in routes:
+        assert route in index
+        assert index.index(auth) < index.index(route)
+
+
 def test_sidecar_healthz_reports_stream_health() -> None:
     """Local process health must include upstream stream health."""
     index = Path("plugins/platforms/photon/sidecar/index.mjs").read_text(encoding="utf-8")
@@ -196,6 +212,44 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     )
     assert again.returncode == 0, again.stderr
     assert chunk.read_text(encoding="utf-8") == patched
+
+
+def test_spectrum_patch_accepts_upstream_ordered_mixed_parts(tmp_path: Path) -> None:
+    """Spectrum 9.3.1 natively interleaves text and attachments.
+
+    The compatibility hook must recognize that implementation and leave the
+    dependency byte-for-byte unchanged instead of treating an upgrade as a
+    fatal patch failure.
+    """
+    dist = tmp_path / "node_modules" / "@spectrum-ts" / "imessage" / "dist"
+    dist.mkdir(parents=True)
+    chunk = dist / "index.js"
+    source = _tabify(
+        """
+const toOrderedParts = (text, attachments) => [{ type: "text", text }, ...attachments];
+const buildOrderedPartMessage = async (client, base, part) => ({ ...base, content: part });
+const buildUnwrappedContentMessage = async (client, base, message, messageGuidStr) => {
+  const attachments = messageAttachments(message);
+  const parts = toOrderedParts(message.content.text, attachments);
+  return { ...base, id: messageGuidStr, content: asProviderGroup(parts) };
+};
+const rebuildFromAppleMessage = async (client, message) => buildUnwrappedContentMessage(client, {}, message, message.guid);
+const toInboundMessages = async (client, cache, event) => [await rebuildFromAppleMessage(client, event.message)];
+"""
+    )
+    chunk.write_text(source, encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", str(_PATCHER), str(tmp_path)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "upstream native" in result.stderr
+    assert chunk.read_text(encoding="utf-8") == source
 
 
 def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:

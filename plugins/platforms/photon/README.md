@@ -127,17 +127,17 @@ All env vars are documented in `plugin.yaml`. The most important:
 
 ## Attachments & limitations
 
-- **Inbound attachments and voice notes are downloaded.** The sidecar reads
-  the bytes (`content.read()`) and base64-inlines them on the NDJSON event; the
-  adapter caches them to the shared media cache and populates `media_urls` /
-  `media_types`, so the agent sees the real image/file or can transcribe the
-  voice note — parity with the BlueBubbles iMessage channel. Mixed iMessage
-  bubbles that contain both text and attachments are normalized as a grouped
-  payload so the user's typed text is preserved alongside the cached media.
-  Media larger than `PHOTON_MAX_INLINE_ATTACHMENT_BYTES` (default 20 MB), or
-  any byte read that fails, falls back to a text marker (`[Photon attachment
-  received: …]` or `[Photon voice received: …]`) so the agent still knows
-  something arrived.
+- **Inbound attachments and voice notes use memory-only opaque handles.** The
+  sidecar never puts bytes in NDJSON or a plaintext media cache. Mixed bubbles
+  preserve text and attachment metadata in a grouped payload. Authorized Keez
+  consumers lease the bytes from loopback, upload them to the secure store,
+  and explicitly consume the handle only after the durable upload receipt.
+  Keez handle consumers bind durable upload and submit receipts to the random
+  `deliveryId`. On replay, the consumer queries that receipt before any
+  `/attachment/<handle>/lease` request. A committed upload finalizes the exact
+  handle and resumes at submit;
+  a committed submit returns its prior approval result and allows ACK. An
+  absent, mismatched, or unknown commit never authorizes ACK.
 - **Outbound attachments are supported.** Images, voice notes, video, and
   documents are sent via `space.send(attachment(...))` /
   `space.send(voice(...))` through the sidecar's `/send-attachment`
