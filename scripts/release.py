@@ -179,6 +179,7 @@ AUTHOR_MAP = {
     "80915+DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",  # PR #52272 salvage (route reasoning-model thinking-timeouts to timeout not context_overflow + reasoning-specific guidance; #52271)
     "DavidMetcalfe@users.noreply.github.com": "DavidMetcalfe",  # Official v2026.7.7.2 commit alias
     "photon-candidate@localhost": "ragnos-dev",  # RAGnos Photon rebaseline candidate
+    "doctor@ragnos.io": "ragnos-dev",  # RAGnos fork overlay history
     "66773372+Tranquil-Flow@users.noreply.github.com": "Tranquil-Flow",  # PR #52623 salvage (auxiliary Anthropic base_url host validation; #52608)
     "nikshepsvn@gmail.com": "nikshepsvn",  # PR #27426 salvage (two-layer guard against hallucinated acp_command crashing the gateway on hosts with no ACP CLI)
     "65363919+coygeek@users.noreply.github.com": "coygeek",  # PR #37735 salvage (redact provider error text at api-server HTTP boundary; #37733)
