@@ -11,9 +11,20 @@ green.
 """
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from typing import Any, Optional
 
-from . import governance
+if __package__:
+    from . import governance
+else:
+    _spec = importlib.util.spec_from_file_location(
+        "ragnos_governance_governance", Path(__file__).with_name("governance.py")
+    )
+    if _spec is None or _spec.loader is None:
+        raise ImportError("unable to load RAGnos governance policy")
+    governance = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(governance)
 
 
 def _on_pre_tool_call(*, tool_name: str = "", args: Optional[dict] = None, **_kwargs: Any) -> Optional[dict]:
