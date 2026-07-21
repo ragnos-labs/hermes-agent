@@ -8,6 +8,7 @@ spawning Node or binding ports.
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from typing import Any, Dict, List, Tuple
 
@@ -47,6 +48,54 @@ class _ProbeClient:
             status_code = 401  # orphan with a different token
 
         return _Resp()
+
+
+class _ConnectClient:
+    """Minimal client used to exercise the adapter's connect orchestration."""
+
+    def __init__(self, *a: Any, **k: Any) -> None:
+        pass
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_connect_starts_exactly_one_sidecar_health_monitor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the tracked health monitor may run, so disconnect can cancel it."""
+    adapter = _make_adapter(monkeypatch)
+
+    async def _no_start() -> None:
+        pass
+
+    monitor_starts = 0
+    blocked = asyncio.Event()
+
+    async def _blocked_inbound() -> None:
+        await blocked.wait()
+
+    async def _blocked_monitor() -> None:
+        nonlocal monitor_starts
+        monitor_starts += 1
+        await blocked.wait()
+
+    monkeypatch.setattr(photon_adapter.httpx, "AsyncClient", _ConnectClient)
+    monkeypatch.setattr(adapter, "_start_sidecar", _no_start)
+    monkeypatch.setattr(adapter, "_inbound_loop", _blocked_inbound)
+    monkeypatch.setattr(adapter, "_monitor_sidecar_health", _blocked_monitor)
+
+    before = asyncio.all_tasks()
+    try:
+        assert await adapter.connect() is True
+        await asyncio.sleep(0)
+        assert monitor_starts == 1
+    finally:
+        spawned = asyncio.all_tasks() - before
+        for task in spawned:
+            task.cancel()
+        await asyncio.gather(*spawned, return_exceptions=True)
 
 
 def _capture_kills(monkeypatch: pytest.MonkeyPatch) -> List[Tuple[int, int]]:

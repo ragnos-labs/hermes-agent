@@ -563,9 +563,6 @@ class PhotonAdapter(BasePlatformAdapter):
         self._sidecar_health_task = asyncio.get_event_loop().create_task(
             self._monitor_sidecar_health()
         )
-        self._sidecar_health_task = asyncio.get_event_loop().create_task(
-            self._monitor_sidecar_health()
-        )
 
         self._mark_connected()
         logger.info(

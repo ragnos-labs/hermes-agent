@@ -11,13 +11,13 @@
     "postinstall": "node patch-spectrum-mixed-attachments.mjs"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "spectrum-ts": "9.3.1"
+    "spectrum-ts": "12.2.0"
   },
   "overrides": {
-    "protobufjs": "8.6.1",
+    "protobufjs": "8.6.6",
     "@opentelemetry/otlp-transformer": "0.218.0",
     "@opentelemetry/otlp-exporter-base": "0.218.0",
     "@opentelemetry/exporter-trace-otlp-http": "0.218.0",

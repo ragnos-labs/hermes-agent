@@ -215,7 +215,7 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
 
 
 def test_spectrum_patch_accepts_upstream_ordered_mixed_parts(tmp_path: Path) -> None:
-    """Spectrum 9.3.1 natively interleaves text and attachments.
+    """Spectrum 9.3.1+ natively interleaves text and attachments.
 
     The compatibility hook must recognize that implementation and leave the
     dependency byte-for-byte unchanged instead of treating an upgrade as a

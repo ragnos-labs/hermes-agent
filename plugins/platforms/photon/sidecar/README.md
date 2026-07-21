@@ -24,9 +24,9 @@ npm install
 The Hermes plugin's `hermes photon setup` command runs `npm install`
 here automatically.
 
-The SDK is pinned to `spectrum-ts` 9.3.1. That release natively preserves
+The SDK is pinned to `spectrum-ts` 12.2.0. That release natively preserves
 ordered mixed text and attachment parts. The postinstall compatibility hook
-still recognizes and patches the older 8.x mapper, but leaves the 9.3.1
+still recognizes and patches the older 8.x mapper, but leaves the 12.2.0
 implementation unchanged after verifying the native ordered-parts behavior.
 
 ## Message action contract
@@ -45,7 +45,7 @@ string. Both fields are omitted when unavailable or malformed.
 
 ## Catch-up capability audit
 
-Spectrum 9.3.1 does not expose application-level history or cursor replay.
+Spectrum 12.2.0 does not expose application-level history or cursor replay.
 The public `Space` contract supports only one-message lookup through
 `getMessage(id)`, and the root `spectrum-ts` package exports no `history`,
 `catchUp`, `fetchMissed`, or `resumableOrderedStream` API. The iMessage
@@ -61,7 +61,9 @@ Executable audit from this directory after `npm ci`:
 ```bash
 node --input-type=module -e '
   import fs from "node:fs";
-  const d = fs.readFileSync("node_modules/@spectrum-ts/core/dist/attachment-ChqzKngn.d.ts", "utf8");
+  const dir = "node_modules/@spectrum-ts/core/dist";
+  const file = fs.readdirSync(dir).find((name) => name.startsWith("attachment-") && name.endsWith(".d.ts"));
+  const d = fs.readFileSync(`${dir}/${file}`, "utf8");
   const s = d.slice(d.indexOf("interface Space<_Def = unknown>"), d.indexOf("//#endregion", d.indexOf("interface Space<_Def = unknown>")));
   console.log({getMessage: /getMessage\\(id: string\\)/.test(s), history: /\\bhistory\\b/i.test(s), catchUp: /\\bcatchUp\\b/.test(s), cursor: /\\bcursor\\b/.test(s)});
 '
@@ -163,7 +165,7 @@ provider-to-sidecar process-crash window.
 
 ## Reply and edit crash boundary
 
-Spectrum 9.3.1 does not accept `clientMessageId` or other caller reference
+Spectrum 12.2.0 does not accept `clientMessageId` or other caller reference
 metadata in `Space.send`, `Message.reply`, or `Message.edit`. Reply returns a
 provider `Message`, edit returns `void`, and the only public lookup is
 `getMessage(id)`. There is no lookup by caller reference. Therefore a process

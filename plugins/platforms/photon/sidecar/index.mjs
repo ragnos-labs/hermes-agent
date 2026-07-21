@@ -55,7 +55,7 @@
 // On SIGINT/SIGTERM the sidecar calls `app.stop()` (3s graceful) before
 // exiting. Logs go to stderr; Python supervises restart.
 //
-// Requires spectrum-ts 9.3.1 - pinned exactly in package.json because the SDK
+// Requires spectrum-ts 12.2.0 - pinned exactly in package.json because the SDK
 // ships breaking majors; see README "Upgrading spectrum-ts".
 //
 // Env vars (required):
@@ -81,13 +81,11 @@ import {
 } from "./send-contract.mjs";
 import {
   editMessage,
-  normalizeEventPosition,
   replyToMessage,
 } from "./message-actions.mjs";
 import {
   AttachmentHandleStore,
   mutateAttachmentLease,
-  normalizeInboundBinaryContent,
   serveAttachmentLease,
 } from "./attachment-handles.mjs";
 import {
@@ -96,6 +94,7 @@ import {
   eventHasAttachmentHandle,
   parseDeliveryAck,
 } from "./inbound-deliveries.mjs";
+import { normalizeInboundEvent } from "./inbound-normalization.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -107,7 +106,7 @@ const telemetry = /^(1|true|yes|on)$/i.test(
   (process.env.PHOTON_TELEMETRY || "").trim()
 );
 
-// spectrum-ts 9.3.1's official Space.send type accepts content only. Keep
+// spectrum-ts 12.2.0's official Space.send type accepts content only. Keep
 // this false until a pinned SDK version exposes and tests a documented
 // clientMessageId send option; the sidecar still echoes the caller's stable
 // ID as its delivery correlation key.
@@ -314,7 +313,11 @@ const app = await Spectrum({
   projectId,
   projectSecret,
   providers: [imessage.config()],
-  options: { flattenGroups: true },
+  // Keep native groups intact until the sidecar has normalized every child.
+  // Flattening here creates separate delivery/ACK boundaries and can lose the
+  // text sibling or deadlock an attachment-first replay behind the one-entry
+  // durable queue.
+  options: { flattenGroups: false },
   telemetry,
 });
 
@@ -484,100 +487,6 @@ async function deliver(line) {
   }
 }
 
-// Best-effort text preview of a reaction's resolved target Message, so the
-// Python adapter can populate the gateway's `reply_to_text` (context: WHAT was
-// tapped back). The SDK only emits a reaction once it has resolved the full
-// target Message (toReactionMessages bails otherwise), so `target.content` is
-// hydrated here — no extra round trip. Handles plain text and our patched mixed
-// text+attachment groups (first text child); null for attachment/voice-only
-// targets. Capped so one long bubble can't balloon the NDJSON line.
-const REACTION_TARGET_TEXT_CAP = 2000;
-function reactionTargetText(target) {
-  const c = target && typeof target === "object" ? target.content : null;
-  if (!c || typeof c !== "object") return null;
-  let text = null;
-  if (c.type === "text") {
-    text = c.text;
-  } else if (c.type === "group") {
-    for (const item of Array.isArray(c.items) ? c.items : []) {
-      const ic = item && typeof item === "object" ? item.content : null;
-      if (ic && ic.type === "text" && ic.text) {
-        text = ic.text;
-        break;
-      }
-    }
-  }
-  if (typeof text !== "string" || !text) return null;
-  return text.length > REACTION_TARGET_TEXT_CAP
-    ? text.slice(0, REACTION_TARGET_TEXT_CAP)
-    : text;
-}
-
-async function normalizeContent(content) {
-  if (!content || typeof content !== "object") {
-    return { type: "unknown" };
-  }
-  if (content.type === "text") {
-    return { type: "text", text: content.text || "" };
-  }
-  if (content.type === "attachment" || content.type === "voice") {
-    return await normalizeInboundBinaryContent(content, attachmentHandles);
-  }
-  if (content.type === "group") {
-    const items = [];
-    for (const item of Array.isArray(content.items) ? content.items : []) {
-      items.push({
-        id: item && typeof item === "object" ? item.id ?? null : null,
-        content: await normalizeContent(item?.content),
-      });
-    }
-    return { type: "group", items };
-  }
-  if (content.type === "reaction") {
-    const target = content.target;
-    return {
-      type: "reaction",
-      emoji: content.emoji || "",
-      targetMessageId: target?.id ?? null,
-      // Lets Python gate "is this a reaction to one of MY messages" without
-      // tracking every outbound id. May be null if the provider doesn't
-      // hydrate the target — Python falls back to its own sent-id cache.
-      targetDirection: target?.direction ?? null,
-      // Text of the reacted-to message, so Python can correlate the tapback to
-      // the gateway's reply_to_text. Null for attachment/voice-only targets.
-      targetText: reactionTargetText(target),
-    };
-  }
-  return { type: content.type || "unknown" };
-}
-
-async function normalizeEvent(space, message) {
-  try {
-    const msgSpace = message.space || {};
-    const ts = message.timestamp;
-    return {
-      messageId: message.id ?? null,
-      ...normalizeEventPosition(message),
-      platform: message.platform || space.__platform || "iMessage",
-      space: {
-        id: space.id ?? msgSpace.id ?? null,
-        // iMessage spaces carry `type` ("dm"|"group") and `phone` directly.
-        type: space.type ?? msgSpace.type ?? "dm",
-        phone: space.phone ?? msgSpace.phone ?? null,
-      },
-      sender: { id: message.sender ? message.sender.id : null },
-      content: await normalizeContent(message.content),
-      timestamp:
-        ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
-    };
-  } catch (e) {
-    console.error(
-      "photon-sidecar: failed to normalize inbound message: " + String(e)
-    );
-    return null;
-  }
-}
-
 function inboundStreamErrorMessage(e) {
   const msg = e && e.message ? e.message : String(e);
   let out = "photon-sidecar: inbound stream errored — restarting: " + msg;
@@ -624,7 +533,11 @@ function inboundStreamErrorMessage(e) {
         }
         rememberInboundSpace(space, message);
         rememberKnownMessage(message);
-        const event = await normalizeEvent(space, message);
+        const event = await normalizeInboundEvent(
+          space,
+          message,
+          attachmentHandles
+        );
         if (!event) continue;
         if (eventHasAttachmentHandle(event)) {
           const delivery = inboundDeliveries.begin(event, {
