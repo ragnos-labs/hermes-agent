@@ -16,6 +16,16 @@ from plugins.platforms.photon.adapter import _env_enablement
 from plugins.platforms.photon import cli
 
 
+def test_sidecar_install_missing_npm_requires_node_20(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setattr(cli.shutil, "which", lambda _command: None)
+
+    assert cli._install_sidecar() == 1
+
+    assert "Install Node.js 20+" in capsys.readouterr().err
+
+
 def test_autoconfigure_access_fills_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PHOTON_ALLOWED_USERS", raising=False)
     monkeypatch.delenv("PHOTON_HOME_CHANNEL", raising=False)

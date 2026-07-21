@@ -144,7 +144,7 @@ export function patchSpectrumTs(root = scriptDir()) {
     const CRLF = CR + "\n";
     const usedCRLF = raw.includes(CRLF);
     const original = usedCRLF ? raw.split(CRLF).join("\n") : raw;
-    // Spectrum 9.3.1 fixed this upstream with a shared ordered-parts mapper.
+    // Spectrum 9.3.1+ fixed this upstream with a shared ordered-parts mapper.
     // Detect the behavior, rather than a version number, so compatible future
     // releases remain installable and a repackaged old release is not trusted.
     if (

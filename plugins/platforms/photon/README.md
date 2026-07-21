@@ -41,6 +41,8 @@ talks to it over loopback.
 
 ## First-time setup
 
+Prerequisite: Node.js 20 or newer is required for the pinned Spectrum sidecar.
+
 ```bash
 # One-shot setup: device login (opens browser) + project + user + sidecar deps
 hermes photon setup --phone +15551234567
