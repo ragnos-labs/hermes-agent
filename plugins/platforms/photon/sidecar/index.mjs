@@ -95,6 +95,7 @@ import {
   parseDeliveryAck,
 } from "./inbound-deliveries.mjs";
 import { normalizeInboundEvent } from "./inbound-normalization.mjs";
+import { resolveDirectMessageSpace } from "./direct-space-resolution.mjs";
 import fs from "node:fs";
 
 const projectId = process.env.PHOTON_PROJECT_ID;
@@ -670,27 +671,35 @@ function handleInbound(req, res) {
 }
 
 async function resolveSpace(spaceId) {
+  const phoneTarget = phoneTargetFromSpaceId(spaceId);
   const cached = knownSpaces.get(spaceId);
-  if (cached) return cached;
+  if (cached && !phoneTarget) return cached;
 
   const im = imessage(app);
-  const phoneTarget = phoneTargetFromSpaceId(spaceId);
   let space = null;
+  let directResolutionError = null;
 
   // A bare E.164 phone number addresses a DM, so callers can pass just
   // "+1..." (e.g. PHOTON_HOME_CHANNEL for cron delivery) instead of an opaque
   // inbound space id. Photon also represents DM chat ids as `any;-;+1...`;
   // normalize those through the same path. `space.create` accepts the raw
-  // phone string directly.
+  // phone string directly. Spectrum 12 only accepts the canonical
+  // `any;-;+1...` chat id for outbound operations, including when an inbound
+  // event had populated this cache with a raw E.164 id.
   if (phoneTarget) {
     try {
-      space = await im.space.create(phoneTarget);
+      space = await resolveDirectMessageSpace(im, phoneTarget, cached);
     } catch (e) {
+      directResolutionError = e;
       console.error(
-        "photon-sidecar: phone->DM space.create failed: " +
+        "photon-sidecar: phone->DM space resolution failed: " +
           (e && e.stack ? e.stack : String(e))
       );
     }
+  }
+  if (phoneTarget && !space) {
+    throw directResolutionError ??
+      new Error(`unable to resolve direct iMessage space ${spaceId}`);
   }
   // Anything else — typically an opaque group GUID — is rehydrated from the
   // persisted id via `space.get`, so group spaces stay reachable after a
