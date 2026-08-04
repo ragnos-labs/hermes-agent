@@ -6,11 +6,13 @@ synth path are all mocked. Covers the registry/resolver, provider availability,
 the chunked-streamer playback path, and the universal per-sentence sync fallback.
 """
 
+import io
 import os
 import queue
 import tempfile
 import threading
 import time
+import wave
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -152,6 +154,75 @@ def test_openai_streamer_prefers_configured_api_key(monkeypatch):
     assert streamer is not None
     assert list(streamer.stream("Streaming test.")) == [b"\x01\x00"]
     assert captured["client"]["api_key"] == "cfg-key"
+
+
+def _pcm_wav(payload=b"\x01\x00\x02\x00", *, rate=24000, channels=1, width=2):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(rate)
+        wav.writeframes(payload)
+    return out.getvalue()
+
+
+def test_local_http_available_requires_explicit_loopback_url(monkeypatch):
+    monkeypatch.setattr(ts, "_local_http_config", lambda: {"url": "http://127.0.0.1:8765/api/voice/stream"})
+    assert ts.LocalHTTPStreamer.available() is True
+    monkeypatch.setattr(ts, "_local_http_config", lambda: {"url": "https://tts.example.com/render"})
+    assert ts.LocalHTTPStreamer.available() is False
+    monkeypatch.setattr(ts, "_local_http_config", lambda: {"url": "http://127.0.0.1/api/voice/stream"})
+    assert ts.LocalHTTPStreamer.available() is False
+
+
+def test_local_http_streamer_posts_text_and_yields_pcm(monkeypatch):
+    captured = {}
+
+    class _Raw:
+        def read(self, _limit):
+            return _pcm_wav()
+
+    class _Response:
+        raw = _Raw()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    def _post(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return _Response()
+
+    monkeypatch.setattr("requests.post", _post)
+    provider = ts.LocalHTTPStreamer(
+        {}, {"url": "http://localhost:8765/api/voice/stream", "timeout": 12}
+    )
+
+    assert b"".join(provider.stream("Local voice.")) == b"\x01\x00\x02\x00"
+    assert captured["url"] == "http://localhost:8765/api/voice/stream"
+    assert captured["json"] == {"text": "Local voice."}
+    assert captured["stream"] is True
+
+
+def test_local_http_streamer_rejects_wrong_pcm_shape(monkeypatch):
+    class _Raw:
+        def read(self, _limit):
+            return _pcm_wav(rate=16000)
+
+    response = MagicMock()
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    response.raw = _Raw()
+    monkeypatch.setattr("requests.post", lambda *_args, **_kwargs: response)
+    provider = ts.LocalHTTPStreamer({}, {"url": "http://127.0.0.1:8765/tts"})
+
+    with pytest.raises(RuntimeError, match="24 kHz mono 16-bit"):
+        list(provider.stream("Wrong rate."))
 
 
 # ── Dispatch: chunked streamer path ──────────────────────────────────────
