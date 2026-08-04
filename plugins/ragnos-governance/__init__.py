@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 if __package__:
     from . import governance
+    from .local_tts import register_local_http_streamer
 else:
     _spec = importlib.util.spec_from_file_location(
         "ragnos_governance_governance", Path(__file__).with_name("governance.py")
@@ -25,6 +26,7 @@ else:
         raise ImportError("unable to load RAGnos governance policy")
     governance = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(governance)
+    register_local_http_streamer = None
 
 
 def _on_pre_tool_call(*, tool_name: str = "", args: Optional[dict] = None, **_kwargs: Any) -> Optional[dict]:
@@ -51,6 +53,8 @@ def _on_session_end(**_kwargs: Any) -> None:
 
 
 def register(ctx) -> None:
+    if register_local_http_streamer is not None:
+        register_local_http_streamer()
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("on_session_end", _on_session_end)
