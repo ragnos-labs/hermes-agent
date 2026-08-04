@@ -56,7 +56,15 @@ class RagnosLocalHTTPStreamer(StreamingTTSProvider):
         if not url:
             raise RuntimeError("ragnos_local TTS requires a loopback http URL with an explicit port")
         timeout = max(1.0, min(float(self.section.get("timeout", 60)), 300.0))
-        with requests.post(url, json={"text": text}, timeout=timeout, stream=True) as response:
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+        with requests.post(
+            url,
+            json={"text": text},
+            headers={"Origin": origin},
+            timeout=timeout,
+            stream=True,
+        ) as response:
             response.raise_for_status()
             body = response.raw.read(_MAX_SENTENCE_BYTES + 1)
         if len(body) > _MAX_SENTENCE_BYTES:

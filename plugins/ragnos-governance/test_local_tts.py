@@ -58,6 +58,7 @@ def test_stream_posts_text_and_yields_pcm(monkeypatch):
 
     assert b"".join(provider.stream("Local voice.")) == b"\x01\x00\x02\x00"
     assert captured["json"] == {"text": "Local voice."}
+    assert captured["headers"] == {"Origin": "http://localhost:8766"}
     assert captured["stream"] is True
 
 
