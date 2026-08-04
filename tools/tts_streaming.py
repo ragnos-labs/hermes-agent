@@ -21,14 +21,11 @@ the dispatcher, config gate (`tts.<name>.streaming`), and resolver come free.
 
 from __future__ import annotations
 
-import io
 import logging
 import re
 import time
-import wave
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
-from urllib.parse import urlparse
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
@@ -219,78 +216,6 @@ def resolve_streaming_provider(
 # ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
-
-
-def _local_http_config() -> Dict:
-    """Return the configured loopback HTTP TTS section, or an empty dict."""
-    try:
-        return dict(_load_tts_config().get("local_http") or {})
-    except Exception:
-        return {}
-
-
-def _safe_loopback_http_url(raw: object) -> str:
-    """Accept only explicit loopback HTTP endpoints.
-
-    This provider is an adapter for a TTS service already running on the same
-    machine. Keeping the destination loopback-only prevents a voice config
-    value from becoming a general server-side request primitive.
-    """
-    value = str(raw or "").strip()
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        return ""
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        return ""
-    if parsed.username or parsed.password or not parsed.port:
-        return ""
-    return value
-
-
-@register("local_http")
-class LocalHTTPStreamer(StreamingTTSProvider):
-    """Loopback JSON-to-WAV adapter for an existing local TTS service.
-
-    The endpoint receives ``{"text": ...}`` and must return 24 kHz, mono,
-    16-bit PCM WAV. Hermes already cuts model output into clauses, so even a
-    render-then-return local service gains clause-level playback and barge-in
-    without replacing the operator's chosen local voice.
-    """
-
-    sample_rate = 24000
-
-    @staticmethod
-    def available() -> bool:
-        return bool(_safe_loopback_http_url(_local_http_config().get("url")))
-
-    def stream(self, text: str) -> Iterator[bytes]:
-        import requests
-
-        url = _safe_loopback_http_url(self.section.get("url"))
-        if not url:
-            raise RuntimeError("local_http TTS requires a loopback http URL with an explicit port")
-        timeout = max(1.0, min(float(self.section.get("timeout", 60)), 300.0))
-        with requests.post(url, json={"text": text}, timeout=timeout, stream=True) as response:
-            response.raise_for_status()
-            body = response.raw.read(_STREAM_SENTENCE_BYTE_CAP + 1)
-        if len(body) > _STREAM_SENTENCE_BYTE_CAP:
-            raise RuntimeError("local_http TTS response exceeded the per-sentence byte cap")
-
-        try:
-            with wave.open(io.BytesIO(body), "rb") as wav:
-                if (
-                    wav.getnchannels() != self.channels
-                    or wav.getsampwidth() != self.sample_width
-                    or wav.getframerate() != self.sample_rate
-                ):
-                    raise RuntimeError(
-                        "local_http TTS must return 24 kHz mono 16-bit PCM WAV"
-                    )
-                while chunk := wav.readframes(4096):
-                    yield chunk
-        except (EOFError, wave.Error) as exc:
-            raise RuntimeError("local_http TTS returned invalid WAV audio") from exc
 
 @register("elevenlabs")
 class ElevenLabsStreamer(StreamingTTSProvider):
