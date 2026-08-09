@@ -18,7 +18,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
+const MIXED_MARKER = "Hermes patch: Preserve mixed text + attachment iMessage payloads";
+const IDEMPOTENCY_MARKER = "Hermes patch: Forward stable clientMessageId on text sends";
 
 function scriptDir() {
   return path.dirname(fileURLToPath(import.meta.url));
@@ -115,6 +116,21 @@ function patchChildIndices(source) {
   );
 }
 
+function patchOutboundIdempotency(source) {
+  source = replaceOnce(
+    source,
+    `\t\tcase "text": return outboundMessage(spaceId, await remote.messages.sendText(chat, content.text, withReply(effectOption(effect), replyTo)), content);`,
+    `\t\tcase "text": return outboundMessage(spaceId, await remote.messages.sendText(chat, content.text, withReply({ ...effectOption(effect), clientMessageId: content.clientMessageId }, replyTo)), content);`,
+    "outbound text client message id"
+  );
+  return replaceOnce(
+    source,
+    `\t\t\treturn outboundMessage(spaceId, await remote.messages.sendText(chat, rendered.text, withReply({\n\t\t\t\t...effectOption(effect),\n\t\t\t\t...formattingOption(rendered.formatting)\n\t\t\t}, replyTo)), content);`,
+    `\t\t\treturn outboundMessage(spaceId, await remote.messages.sendText(chat, rendered.text, withReply({\n\t\t\t\t...effectOption(effect),\n\t\t\t\t...formattingOption(rendered.formatting),\n\t\t\t\tclientMessageId: content.clientMessageId\n\t\t\t}, replyTo)), content);`,
+    "outbound markdown client message id"
+  );
+}
+
 export function patchSpectrumTs(root = scriptDir()) {
   const dist = path.join(
     root,
@@ -132,7 +148,7 @@ export function patchSpectrumTs(root = scriptDir()) {
 
   for (const file of files) {
     const raw = fs.readFileSync(file, "utf8");
-    if (raw.includes(MARKER)) {
+    if (raw.includes(MIXED_MARKER) && raw.includes(IDEMPOTENCY_MARKER)) {
       return { patched: false, file, reason: "already patched" };
     }
     // Normalize to LF for matching so the patch works regardless of the
@@ -144,15 +160,24 @@ export function patchSpectrumTs(root = scriptDir()) {
     const CRLF = CR + "\n";
     const usedCRLF = raw.includes(CRLF);
     const original = usedCRLF ? raw.split(CRLF).join("\n") : raw;
-    if (!original.includes("const toInboundMessages = async") ||
-        !original.includes("const rebuildFromAppleMessage = async")) {
+    if (!original.includes("const sendContent = async")) {
       continue;
     }
     let patched = original;
-    patched = patchRebuild(patched);
-    patched = patchInbound(patched);
-    patched = patchChildIndices(patched);
-    patched = `// ${MARKER}\n${patched}`;
+    if (!patched.includes(MIXED_MARKER)) {
+      if (!patched.includes("const toInboundMessages = async") ||
+          !patched.includes("const rebuildFromAppleMessage = async")) {
+        continue;
+      }
+      patched = patchRebuild(patched);
+      patched = patchInbound(patched);
+      patched = patchChildIndices(patched);
+      patched = `// ${MIXED_MARKER}\n${patched}`;
+    }
+    if (!patched.includes(IDEMPOTENCY_MARKER)) {
+      patched = patchOutboundIdempotency(patched);
+      patched = `// ${IDEMPOTENCY_MARKER}\n${patched}`;
+    }
     if (usedCRLF) {
       patched = patched.split("\n").join(CRLF);
     }

@@ -25,9 +25,11 @@
 //   - POST /attachment/<opaque-handle>/(consume|release) -> finalize only
 //                         after durable consumer commit, or release for retry
 //   - POST /healthz     -> {"ok": true}
-//   - POST /send        -> {"ok": true, "messageId": "..."}
+//   - POST /send        -> {"ok": true, "messageId": "..."} or a confirmed
+//                         provider receipt when clientMessageId is supplied
 //       body: {"spaceId": "...", "text": "...",
-//              "format": "text" | "markdown" (default "text")}
+//              "format": "text" | "markdown" (default "text"),
+//              "clientMessageId": "..." | null}
 //   - POST /send-richlink -> {"ok": true, "messageId": "..."}
 //       body: {"spaceId": "...", "url": "https://..."}
 //   - POST /send-attachment -> {"ok": true, "messageId": "..."}
@@ -74,6 +76,10 @@ import crypto from "node:crypto";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 import { chooseSendFormat } from "./send-format.mjs";
+import {
+  confirmedSendResponse,
+  withClientMessageId,
+} from "./outbound-confirmation.mjs";
 import {
   classifyProbeRejection,
   shouldProbe,
@@ -1052,7 +1058,7 @@ const server = http.createServer(async (req, res) => {
       return ok(res, { deliveryId, status });
     }
     if (req.url === "/send") {
-      const { spaceId, text, format = "text" } = body || {};
+      const { spaceId, text, format = "text", clientMessageId } = body || {};
       if (!spaceId || typeof text !== "string") {
         return badRequest(res, "spaceId and text are required");
       }
@@ -1068,12 +1074,14 @@ const server = http.createServer(async (req, res) => {
       // messages that contain URLs through spectrumText while preserving
       // spectrumMarkdown for URL-free markdown. The decision lives in
       // send-format.mjs so tests can exercise it directly.
-      const builder =
+      const builder = withClientMessageId(
         chooseSendFormat(format, text) === "markdown"
           ? spectrumMarkdown(text)
-          : spectrumText(text);
+          : spectrumText(text),
+        clientMessageId
+      );
       const result = await space.send(builder);
-      return ok(res, { messageId: result?.id || null });
+      return ok(res, confirmedSendResponse(result, clientMessageId));
     }
     if (req.url === "/send-richlink") {
       const { spaceId, url } = body || {};

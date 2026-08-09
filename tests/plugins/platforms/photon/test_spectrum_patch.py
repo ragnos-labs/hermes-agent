@@ -225,7 +225,29 @@ const toInboundMessages = async (client, cache, event, phone) => {
   cacheMessage(cache, msg);
   return [msg];
 };
-export { rebuildFromAppleMessage, toInboundMessages };
+const outboundMessage = (spaceId, message, content) => ({
+  id: message.guid,
+  content,
+  space: { id: spaceId },
+  timestamp: message.dateCreated
+});
+const withReply = (options, replyTo) => replyTo ? { ...options, replyTo } : options;
+const effectOption = (effect) => effect ? { effect } : {};
+const formattingOption = (formatting) => formatting.length > 0 ? { formatting } : {};
+const renderMarkdown = (markdown) => ({ text: markdown, formatting: [] });
+const sendContent = async (remote, spaceId, chat, content, replyTo, effect) => {
+  switch (content.type) {
+    case "text": return outboundMessage(spaceId, await remote.messages.sendText(chat, content.text, withReply(effectOption(effect), replyTo)), content);
+    case "markdown": {
+      const rendered = renderMarkdown(content.markdown);
+      return outboundMessage(spaceId, await remote.messages.sendText(chat, rendered.text, withReply({
+        ...effectOption(effect),
+        ...formattingOption(rendered.formatting)
+      }, replyTo)), content);
+    }
+  }
+};
+export { rebuildFromAppleMessage, sendContent, toInboundMessages };
 """
 
 
@@ -262,6 +284,31 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     # The text is captured in both mappers before the attachment branches run.
     assert "const text2 = message.content.text;" in patched
     assert "const text2 = event.message.content.text;" in patched
+    assert "clientMessageId: content.clientMessageId" in patched
+
+    behavior = subprocess.run(
+        [
+            "node",
+            "--input-type=module",
+            "-e",
+            (
+                f'import {{ sendContent }} from {json.dumps(chunk.as_uri())};'
+                'const seen=[]; const remote={messages:{sendText:async(...args)=>'
+                '(seen.push(args),{guid:"spc-msg-1",dateCreated:new Date(0)})}};'
+                'await sendContent(remote,"space","any;-;+10000000000",'
+                '{type:"text",text:"private",clientMessageId:"stable-1"});'
+                'await sendContent(remote,"space","any;-;+10000000000",'
+                '{type:"markdown",markdown:"private",clientMessageId:"stable-2"});'
+                'console.log(JSON.stringify(seen.map(args=>args[2].clientMessageId)));'
+            ),
+        ],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert behavior.returncode == 0, behavior.stderr
+    assert json.loads(behavior.stdout) == ["stable-1", "stable-2"]
 
     # Re-running is a no-op (idempotent self-heal on every sidecar start).
     again = subprocess.run(
@@ -273,5 +320,3 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     )
     assert again.returncode == 0, again.stderr
     assert chunk.read_text(encoding="utf-8") == patched
-
-
