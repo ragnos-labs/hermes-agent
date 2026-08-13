@@ -456,6 +456,22 @@ function clearConsumer(res) {
   }
 }
 
+// Operational heartbeat: stamp a file whenever the inbound consumer pipe is
+// actively serviced (on connect + every keepalive tick). A watchdog treats a
+// stale file as a dead inbound pipe and restarts the bridge -- this is the one
+// failure mode launchd KeepAlive + the process-liveness reaper miss (the bridge
+// process stays up while the /inbound pipe silently dies). Opt-in: only writes
+// when PHOTON_SIDECAR_HEARTBEAT_PATH is set, so upstream behavior is unchanged.
+const HEARTBEAT_PATH = process.env.PHOTON_SIDECAR_HEARTBEAT_PATH || "";
+function stampInboundHeartbeat() {
+  if (!HEARTBEAT_PATH) return;
+  try {
+    fs.writeFileSync(HEARTBEAT_PATH, String(Date.now()));
+  } catch {
+    /* heartbeat is best-effort; never let it break inbound */
+  }
+}
+
 function waitForConsumerChange(version) {
   if (consumerVersion !== version) {
     return { promise: Promise.resolve("consumer_changed"), cancel() {} };
@@ -917,11 +933,13 @@ function handleInbound(req, res) {
     }
   }
   setConsumer(res);
+  stampInboundHeartbeat();
   // Heartbeat keeps the socket warm through idle periods and lets the Python
   // side detect a dead pipe promptly.
   const heartbeat = setInterval(() => {
     try {
       res.write("\n");
+      stampInboundHeartbeat();
     } catch {
       /* ignore */
     }
