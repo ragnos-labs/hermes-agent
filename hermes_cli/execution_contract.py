@@ -1285,8 +1285,6 @@ class ExecutionContractStore:
             raise ContractValidationError("expires_at must be timezone-aware")
         if instant_dt.tzinfo is None or instant_dt.utcoffset() is None:
             raise ContractValidationError("now must be timezone-aware")
-        if expires_at.astimezone(timezone.utc) <= instant_dt.astimezone(timezone.utc):
-            raise ContractValidationError("expires_at must be in the future")
         instant = _timestamp(instant_dt)
         expiry = _timestamp(expires_at)
         decision_id = self._new_id("dec")
@@ -1328,6 +1326,10 @@ class ExecutionContractStore:
                             "decision request digest has conflicting bindings"
                         )
                     return self._decision_from_row(existing)
+                if expires_at.astimezone(timezone.utc) <= instant_dt.astimezone(
+                    timezone.utc
+                ):
+                    raise ContractValidationError("expires_at must be in the future")
                 published_effect = connection.execute(
                     "SELECT 1 FROM effect_evidence WHERE execution_id=? "
                     "UNION ALL SELECT 1 FROM receipts WHERE execution_id=? LIMIT 1",
@@ -2106,38 +2108,72 @@ class ExecutionContractStore:
         connection = self._connect_write()
         try:
             with write_txn(connection):
+                self._after_write_lock_acquired("prune", "")
+                try:
+                    prior = int(
+                        connection.execute(
+                            "SELECT value FROM execution_contract_metadata "
+                            "WHERE key='events_pruned_through'"
+                        ).fetchone()[0]
+                    )
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    raise ContractDataError(
+                        "event retention watermark is corrupt"
+                    ) from exc
+                sequence_row = connection.execute(
+                    "SELECT seq FROM sqlite_sequence "
+                    "WHERE name='execution_events'"
+                ).fetchone()
+                allocated_high_water = int(sequence_row[0]) if sequence_row else 0
+                current_high_water = int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(sequence), 0) FROM execution_events"
+                    ).fetchone()[0]
+                )
+                if (
+                    prior < 0
+                    or allocated_high_water < 0
+                    or current_high_water < 0
+                    or prior > allocated_high_water
+                    or current_high_water > allocated_high_water
+                ):
+                    raise ContractDataError("event high-water metadata is corrupt")
                 rows = connection.execute(
                     """
                     SELECT ev.sequence, ev.occurred_at, ex.lifecycle
                     FROM execution_events ev
                     JOIN executions ex ON ex.execution_id = ev.execution_id
+                    WHERE ev.sequence > ?
                     ORDER BY ev.sequence ASC
-                    """
+                    """,
+                    (prior,),
                 ).fetchall()
-                through = 0
+                through = allocated_high_water
                 for row in rows:
                     if not (
                         str(row["occurred_at"]) < cutoff_text
                         and str(row["lifecycle"]).startswith("terminal_")
                     ):
+                        through = int(row["sequence"]) - 1
                         break
-                    through = int(row["sequence"])
-                if through <= 0:
+                if through <= prior:
                     return 0
+                self._validate_global_event_continuity(
+                    connection,
+                    pruned_through=prior,
+                    snapshot_high_water=through,
+                )
                 deleted = connection.execute(
                     "DELETE FROM execution_events WHERE sequence <= ?",
                     (through,),
                 ).rowcount
-                prior = int(
-                    connection.execute(
-                        "SELECT value FROM execution_contract_metadata "
-                        "WHERE key='events_pruned_through'"
-                    ).fetchone()[0]
-                )
+                expected_deleted = through - prior
+                if int(deleted or 0) != expected_deleted:
+                    raise ContractDataError("event pruning row count is inconsistent")
                 connection.execute(
                     "UPDATE execution_contract_metadata SET value=? "
                     "WHERE key='events_pruned_through'",
-                    (str(max(prior, through)),),
+                    (str(through),),
                 )
                 return int(deleted or 0)
         finally:
@@ -2957,8 +2993,6 @@ class ExecutionContractStore:
                 execution["terminal_at"],
                 field="execution_terminal_at",
             )
-            if terminal < execution_terminal:
-                raise ContractDataError("receipt terminal timestamp precedes execution")
             evidence = connection.execute(
                 "SELECT * FROM effect_evidence WHERE execution_id=?",
                 (execution_id,),
@@ -2966,6 +3000,24 @@ class ExecutionContractStore:
             if evidence is None:
                 raise ContractDataError("receipt effect evidence is missing")
             self._evidence_from_row(evidence, connection=connection)
+            evidence_recorded = _parse_timestamp(
+                evidence["recorded_at"],
+                field="evidence_recorded_at",
+            )
+            if evidence_recorded > execution_terminal:
+                if (
+                    reconciliation_ref is None
+                    or outcome != "ambiguous"
+                    or execution["lifecycle"] != "terminal_ambiguous"
+                    or terminal != evidence_recorded
+                ):
+                    raise ContractDataError(
+                        "reconciled receipt terminal timestamp must equal evidence recorded timestamp"
+                    )
+            elif terminal != execution_terminal:
+                raise ContractDataError(
+                    "receipt terminal timestamp must equal execution terminal timestamp"
+                )
             for field, expected in (
                 ("effect_id", effect_id),
                 ("outcome", outcome),

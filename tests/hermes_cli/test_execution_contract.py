@@ -610,6 +610,108 @@ def test_retention_does_not_prune_across_a_live_execution_gap(tmp_path):
     assert len(events) == 3
 
 
+@pytest.mark.parametrize("missing_sequence", [1, 2, 4])
+def test_prune_rejects_global_gap_without_mutating_rows_or_watermark(
+    tmp_path,
+    missing_sequence,
+):
+    store = _store(tmp_path)
+    old = NOW - timedelta(days=40)
+    executions = []
+    for index in range(2):
+        execution = store.create_execution(
+            lifecycle="running",
+            source_run_id=f"prune-gap-{index}",
+            now=old + timedelta(microseconds=index),
+        )
+        executions.append(execution)
+        store.transition_execution(
+            execution["execution_id"],
+            "terminal_failed",
+            now=old + timedelta(seconds=1, microseconds=index),
+        )
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "DELETE FROM execution_events WHERE sequence=?",
+            (missing_sequence,),
+        )
+        connection.commit()
+        before_rows = connection.execute(
+            "SELECT sequence, event_id FROM execution_events ORDER BY sequence"
+        ).fetchall()
+        before_watermark = connection.execute(
+            "SELECT value FROM execution_contract_metadata "
+            "WHERE key='events_pruned_through'"
+        ).fetchone()[0]
+
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.prune_events(now=NOW)
+
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT sequence, event_id FROM execution_events ORDER BY sequence"
+        ).fetchall() == before_rows
+        assert connection.execute(
+            "SELECT value FROM execution_contract_metadata "
+            "WHERE key='events_pruned_through'"
+        ).fetchone()[0] == before_watermark == "0"
+
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.list_events()
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.list_events(execution_id=executions[0]["execution_id"])
+
+
+def test_prune_boundary_excludes_append_waiting_on_same_write_lock(tmp_path):
+    seed = _store(tmp_path, runtime="prune-race")
+    old = NOW - timedelta(days=40)
+    execution = seed.create_execution(lifecycle="running", now=old)
+    seed.transition_execution(
+        execution["execution_id"],
+        "terminal_failed",
+        now=old + timedelta(seconds=1),
+    )
+    pruner = _store(tmp_path, runtime="prune-race")
+    writer = _store(tmp_path, runtime="prune-race")
+    prune_locked = threading.Event()
+    release_prune = threading.Event()
+    writer_attempted = threading.Event()
+
+    def hold_prune(operation, _execution_id):
+        if operation == "prune":
+            prune_locked.set()
+            assert release_prune.wait(timeout=5)
+
+    pruner._after_write_lock_acquired = hold_prune
+
+    def append_event():
+        writer_attempted.set()
+        return writer.create_execution(
+            lifecycle="queued",
+            source_run_id="after-prune-boundary",
+            now=NOW,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        prune_future = pool.submit(pruner.prune_events, now=NOW)
+        assert prune_locked.wait(timeout=5)
+        append_future = pool.submit(append_event)
+        assert writer_attempted.wait(timeout=5)
+        assert not append_future.done()
+        release_prune.set()
+        assert prune_future.result(timeout=10) == 2
+        appended = append_future.result(timeout=10)
+
+    page = seed.list_events(after=2)
+    assert [event["execution_id"] for event in page["items"]] == [
+        appended["execution_id"]
+    ]
+    assert page["page"]["pruned_through"] == 2
+    assert page["page"]["snapshot_high_water"] == 3
+    assert page["page"]["completeness"] == "complete"
+
+
 def test_profile_crossing_and_malformed_identifiers_are_distinct(tmp_path):
     first = _store(tmp_path, profile="first")
     second = _store(tmp_path, profile="second")
@@ -986,6 +1088,79 @@ def test_evidence_blocks_new_decisions_but_preserves_idempotent_resolved_retry(
         )
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_state"),
+    [
+        ("pending", "pending"),
+        ("expired", "expired"),
+        ("resolved", "resolved"),
+        ("superseded", "superseded"),
+        ("evidence", "resolved"),
+        ("receipt", "resolved"),
+    ],
+)
+def test_exact_decision_retry_remains_idempotent_after_expiry_and_effects(
+    tmp_path,
+    case,
+    expected_state,
+):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix=f"retry-{case}")
+    expires_at = NOW + timedelta(seconds=1)
+    request_digest = _digest(f"retry-{case}")
+    create = {
+        "execution_id": execution["execution_id"],
+        "effect_id": execution["effect_id"],
+        "proposal_ref": execution["proposal_ref"],
+        "request_digest": request_digest,
+        "candidate_digest": _digest(f"candidate-retry-{case}"),
+        "policy_digest": _digest(f"policy-retry-{case}"),
+        "allowed_choices": ["once", "deny"],
+        "expires_at": expires_at,
+    }
+    decision = store.create_decision(**create, now=NOW)
+
+    if case == "expired":
+        assert store.expire_decisions(now=NOW + timedelta(seconds=2)) == [
+            decision["decision_id"]
+        ]
+    elif case in {"resolved", "evidence", "receipt"}:
+        decision = store.resolve_decision(
+            decision["decision_id"],
+            choice="once",
+            resolution_evidence_digest=_digest(f"resolution-retry-{case}"),
+            now=NOW + timedelta(microseconds=500_000),
+        )
+        if case in {"evidence", "receipt"}:
+            _record_evidence(
+                store,
+                execution,
+                decision_id=decision["decision_id"],
+                suffix=f"retry-{case}",
+            )
+        if case == "receipt":
+            store.transition_execution(
+                execution["execution_id"],
+                "terminal_succeeded",
+                now=NOW + timedelta(seconds=3),
+            )
+    elif case == "superseded":
+        decision = store.supersede_decision(
+            decision["decision_id"],
+            reason_code="retry-test",
+            now=NOW + timedelta(microseconds=500_000),
+        )
+
+    exact = store.create_decision(**create, now=NOW + timedelta(days=1))
+    assert exact["decision_id"] == decision["decision_id"]
+    assert exact["state"] == expected_state
+
+    conflicting = dict(create)
+    conflicting["allowed_choices"] = ["once", "deny", "always"]
+    with pytest.raises(ContractConflictError, match="conflicting bindings"):
+        store.create_decision(**conflicting, now=NOW + timedelta(days=1))
+
+
 @pytest.mark.parametrize("first_operation", ["decision", "evidence"])
 def test_decision_and_evidence_race_is_serialized_by_write_transaction(
     tmp_path,
@@ -1311,6 +1486,92 @@ def test_late_ambiguous_evidence_publishes_receipt_transactionally(tmp_path):
             recovery_ref="recovery:conflicting-retry",
             reconciliation_ref="reconcile:late-ambiguous",
             now=NOW + timedelta(seconds=4),
+        )
+
+
+@pytest.mark.parametrize("offset_seconds", [-86400, 0, 86400])
+def test_normal_receipt_terminal_timestamp_must_equal_execution_terminal(
+    tmp_path,
+    offset_seconds,
+):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix=f"receipt-time-{offset_seconds}")
+    _record_evidence(
+        store,
+        execution,
+        suffix=f"receipt-time-{offset_seconds}",
+        reconciliation_ref=(
+            "reconcile:ordinary-terminal" if offset_seconds == 0 else None
+        ),
+    )
+    terminal_time = NOW + timedelta(seconds=3)
+    terminal = store.transition_execution(
+        execution["execution_id"],
+        "terminal_succeeded",
+        now=terminal_time,
+    )
+    receipt_id = terminal["receipt_id"]
+    if offset_seconds:
+        changed = (terminal_time + timedelta(seconds=offset_seconds)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute(
+                "UPDATE receipts SET terminal_at=? WHERE receipt_id=?",
+                (changed, receipt_id),
+            )
+            connection.commit()
+        with pytest.raises(
+            ContractDataError,
+            match="must equal execution terminal timestamp",
+        ):
+            store.get_receipt(receipt_id)
+    else:
+        assert store.get_receipt(receipt_id)["terminal_at"] == terminal["terminal_at"]
+
+
+@pytest.mark.parametrize("offset_seconds", [-1, 0, 1])
+def test_reconciled_receipt_terminal_timestamp_must_equal_evidence_recorded_at(
+    tmp_path,
+    offset_seconds,
+):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix=f"reconcile-time-{offset_seconds}")
+    store.transition_execution(
+        execution["execution_id"],
+        "terminal_failed",
+        recovery_ref=f"recovery:reconcile-time-{offset_seconds}",
+        now=NOW + timedelta(seconds=1),
+    )
+    evidence_time = NOW + timedelta(seconds=2)
+    receipt = store.reconcile_ambiguous_evidence(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        outcome="ambiguous",
+        subject_digest=_digest(f"reconcile-subject-{offset_seconds}"),
+        evidence_digest=_digest(f"reconcile-evidence-{offset_seconds}"),
+        result_digest=_digest(f"reconcile-result-{offset_seconds}"),
+        reconciliation_ref=f"reconcile:timestamp-{offset_seconds}",
+        now=evidence_time,
+    )
+    if offset_seconds:
+        changed = (evidence_time + timedelta(seconds=offset_seconds)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute(
+                "UPDATE receipts SET terminal_at=? WHERE receipt_id=?",
+                (changed, receipt["receipt_id"]),
+            )
+            connection.commit()
+        with pytest.raises(
+            ContractDataError,
+            match="must equal evidence recorded timestamp",
+        ):
+            store.get_receipt(receipt["receipt_id"])
+    else:
+        assert store.get_receipt(receipt["receipt_id"])["terminal_at"] == (
+            evidence_time.isoformat(timespec="microseconds").replace("+00:00", "Z")
         )
 
 

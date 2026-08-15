@@ -98,6 +98,11 @@ Before returning `completeness=complete`, every event request proves the
 unfiltered global sequence interval from `pruned_through + 1` through its
 pinned snapshot. Start, interior, and trailing gaps fail closed, including
 when the requested feed is filtered to one execution.
+Before retention deletes events or advances `pruned_through`, the same write
+transaction proves the complete global sequence from the previous watermark
+through the exact prune boundary against SQLite's independent allocation
+high-water. A start, interior, or tail gap aborts the transaction without
+deleting rows or changing the watermark.
 
 ## Execution lifecycle
 
@@ -134,7 +139,9 @@ decision; a newer pending or closed decision invalidates older authorization.
 No new decision may be created after effect evidence or a receipt exists.
 Decision requests and evidence publication share the same immediate write
 transaction boundary, so either ordering is deterministic; an exact retry of
-an already-created decision remains idempotent.
+an already-created decision remains idempotent even after its expiry or after
+effect evidence and a receipt exist. Expiry-in-the-future validation applies
+only when a genuinely new decision is created.
 
 ## Terminal receipts
 
@@ -148,6 +155,9 @@ Receipt insertion, terminal execution state, and their ordered events commit
 in one `BEGIN IMMEDIATE` transaction. Duplicate identical evidence is
 idempotent. A changed digest, effect, decision, profile, or outcome conflicts
 and fails closed.
+An ordinary receipt's `terminal_at` exactly equals the execution terminal
+timestamp. A late ambiguous reconciliation instead binds `terminal_at` to the
+authoritative effect-evidence `recorded_at` timestamp.
 
 An execution already recorded as `terminal_ambiguous`/`unproven` uses a
 separate late-reconciliation hook. It accepts only explicit authoritative
