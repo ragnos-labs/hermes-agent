@@ -100,9 +100,10 @@ pinned snapshot. Start, interior, and trailing gaps fail closed, including
 when the requested feed is filtered to one execution.
 Before retention deletes events or advances `pruned_through`, the same write
 transaction proves the complete global sequence from the previous watermark
-through the exact prune boundary against SQLite's independent allocation
-high-water. A start, interior, or tail gap aborts the transaction without
-deleting rows or changing the watermark.
+through SQLite's independent allocation high-water. Only after the complete
+retained suffix passes that check does the transaction select a prunable
+prefix. A start, interior, or tail gap anywhere in the allocated interval
+aborts without deleting rows or changing the watermark.
 
 ## Execution lifecycle
 

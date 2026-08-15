@@ -2138,6 +2138,11 @@ class ExecutionContractStore:
                     or current_high_water > allocated_high_water
                 ):
                     raise ContractDataError("event high-water metadata is corrupt")
+                self._validate_global_event_continuity(
+                    connection,
+                    pruned_through=prior,
+                    snapshot_high_water=allocated_high_water,
+                )
                 rows = connection.execute(
                     """
                     SELECT ev.sequence, ev.occurred_at, ex.lifecycle
@@ -2158,11 +2163,6 @@ class ExecutionContractStore:
                         break
                 if through <= prior:
                     return 0
-                self._validate_global_event_continuity(
-                    connection,
-                    pruned_through=prior,
-                    snapshot_high_water=through,
-                )
                 deleted = connection.execute(
                     "DELETE FROM execution_events WHERE sequence <= ?",
                     (through,),

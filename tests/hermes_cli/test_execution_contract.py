@@ -663,6 +663,82 @@ def test_prune_rejects_global_gap_without_mutating_rows_or_watermark(
         store.list_events(execution_id=executions[0]["execution_id"])
 
 
+@pytest.mark.parametrize("missing_sequence", [4, 5, 6])
+def test_prune_rejects_gap_in_retained_suffix_before_deleting_terminal_prefix(
+    tmp_path,
+    missing_sequence,
+):
+    store = _store(tmp_path)
+    old = NOW - timedelta(days=40)
+    terminal = store.create_execution(
+        lifecycle="running",
+        source_run_id="prunable-terminal-prefix",
+        now=old,
+    )
+    store.transition_execution(
+        terminal["execution_id"],
+        "terminal_failed",
+        now=old + timedelta(seconds=1),
+    )
+    live = store.create_execution(
+        lifecycle="running",
+        source_run_id="live-prune-boundary",
+        now=old + timedelta(seconds=2),
+    )
+    retained = store.create_execution(
+        lifecycle="accepted",
+        source_run_id="retained-terminal-suffix",
+        now=NOW,
+    )
+    store.transition_execution(
+        retained["execution_id"],
+        "running",
+        now=NOW + timedelta(seconds=1),
+    )
+    store.transition_execution(
+        retained["execution_id"],
+        "terminal_failed",
+        now=NOW + timedelta(seconds=2),
+    )
+
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT sequence FROM execution_events ORDER BY sequence"
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        connection.execute(
+            "DELETE FROM execution_events WHERE sequence=?",
+            (missing_sequence,),
+        )
+        connection.commit()
+        before_rows = connection.execute(
+            "SELECT sequence, event_id, execution_id FROM execution_events "
+            "ORDER BY sequence"
+        ).fetchall()
+        before_watermark = connection.execute(
+            "SELECT value FROM execution_contract_metadata "
+            "WHERE key='events_pruned_through'"
+        ).fetchone()[0]
+
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.prune_events(now=NOW)
+
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT sequence, event_id, execution_id FROM execution_events "
+            "ORDER BY sequence"
+        ).fetchall() == before_rows
+        assert connection.execute(
+            "SELECT value FROM execution_contract_metadata "
+            "WHERE key='events_pruned_through'"
+        ).fetchone()[0] == before_watermark == "0"
+
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.list_events()
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.list_events(execution_id=terminal["execution_id"])
+    assert live["lifecycle"] == "running"
+
+
 def test_prune_boundary_excludes_append_waiting_on_same_write_lock(tmp_path):
     seed = _store(tmp_path, runtime="prune-race")
     old = NOW - timedelta(days=40)
