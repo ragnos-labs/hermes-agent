@@ -5,8 +5,9 @@ name: GHCR Execution Read Release
 # to a registry. Publishing is limited to an exact workflow_dispatch of this
 # audited workflow on protected main. A dispatch confirmation records intent;
 # it is not approval. Publication also fails closed unless gh-image has required
-# reviewers and a main-only deployment policy. Protected CalVer tags and GHCR
-# package-writer restrictions remain external release gates owned by the pilot.
+# reviewers, prevent-self-review, disabled administrator bypass, and a main-only
+# deployment policy. Protected CalVer tags and GHCR package-writer restrictions
+# remain external release gates owned by the pilot.
 # This workflow never creates main or latest tags.
 on:
   pull_request:
@@ -33,7 +34,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ghcr-execution-read-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event.pull_request.number }}
+  # Every dispatch can address the same immutable sha-SOURCE_SHA tag even when
+  # the approved CalVer tags differ, so publication is globally serialized.
+  group: ${{ github.event_name == 'workflow_dispatch' && 'ghcr-execution-read-publication' || format('ghcr-execution-read-pr-{0}', github.event.pull_request.number) }}
   cancel-in-progress: false
 
 env:
@@ -56,6 +59,7 @@ jobs:
       workflow_ref: ${{ steps.source.outputs.workflow_ref }}
       workflow_sha: ${{ steps.source.outputs.workflow_sha }}
       workflow_run_id: ${{ steps.source.outputs.workflow_run_id }}
+      workflow_run_attempt: ${{ steps.source.outputs.workflow_run_attempt }}
     steps:
       - name: Validate event inputs
         id: source
@@ -69,6 +73,7 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
@@ -156,6 +161,7 @@ jobs:
             echo "workflow_ref=$WORKFLOW_REF"
             echo "workflow_sha=$WORKFLOW_SHA"
             echo "workflow_run_id=$WORKFLOW_RUN_ID"
+            echo "workflow_run_attempt=$WORKFLOW_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out audited workflow revision
@@ -192,6 +198,12 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check out workflow under policy test
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.resolve.outputs.workflow_sha || github.event.pull_request.head.sha }}
+          persist-credentials: false
+
       - name: Test audited workflow dispatch fence
         run: |
           python3 - <<'PY'
@@ -202,7 +214,7 @@ jobs:
           SHA = "a" * 40
 
 
-          def accepted(*, repository, event_ref, workflow_ref, event_sha, workflow_sha, protected):
+          def accepted(*, repository, event_ref, workflow_ref, event_sha, workflow_sha, protected, source_ancestor):
               return (
                   repository == "ragnos-labs/hermes-agent"
                   and event_ref == "refs/heads/main"
@@ -211,6 +223,7 @@ jobs:
                   and len(workflow_sha) == 40
                   and all(character in "0123456789abcdef" for character in workflow_sha)
                   and protected
+                  and source_ancestor
               )
 
 
@@ -221,6 +234,7 @@ jobs:
               event_sha=SHA,
               workflow_sha=SHA,
               protected=True,
+              source_ancestor=True,
           )
           assert accepted(**valid)
           for field, unsafe in (
@@ -231,6 +245,7 @@ jobs:
               ("event_sha", "b" * 40),
               ("workflow_sha", "not-an-exact-sha"),
               ("protected", False),
+              ("source_ancestor", False),
           ):
               candidate = valid | {field: unsafe}
               assert not accepted(**candidate), (field, unsafe)
@@ -268,6 +283,88 @@ jobs:
           assert not accepted(**(protected | {"policy": None}))
           assert not accepted(**(custom_main | {"custom_names": ["release-copy"]}))
           print("external_environment_authorization_policy=passed")
+          PY
+
+      - name: Test fail-closed registry inspection and ambiguous delivery recovery
+        run: |
+          python3 - <<'PY'
+          import re
+
+          ABSENT = re.compile(
+              r"(?:MANIFEST_UNKNOWN|manifest unknown|"
+              r"ghcr\.io/v2/.+/manifests/.+: not found|"
+              r"ghcr\.io/ragnos-labs/hermes-agent:(?:sha-[0-9a-f]{40}|v[0-9.]+): not found|"
+              r"unexpected status from HEAD request to https://ghcr\.io/v2/.+/manifests/.+: 404 Not Found)"
+          )
+
+
+          def classify_attempt(returncode, stderr, raw_valid=False, digest_valid=False):
+              if returncode == 0:
+                  return "present" if raw_valid and digest_valid else "unknown"
+              return "absent" if ABSENT.search(stderr) else "unknown"
+
+
+          assert classify_attempt(0, "", True, True) == "present"
+          assert classify_attempt(0, "", False, True) == "unknown"
+          assert classify_attempt(1, "MANIFEST_UNKNOWN: manifest unknown") == "absent"
+          assert classify_attempt(1, "ghcr.io/ragnos-labs/hermes-agent:v2026.8.15: not found") == "absent"
+          assert classify_attempt(
+              1, "unexpected status from HEAD request to https://ghcr.io/v2/ragnos-labs/hermes-agent/manifests/v1: 404 Not Found"
+          ) == "absent"
+          for error in (
+              "unauthorized: authentication required",
+              "context deadline exceeded",
+              "TLS handshake timeout",
+              "unexpected EOF",
+              "malformed registry response",
+          ):
+              assert classify_attempt(1, error) == "unknown", error
+
+          def bounded_result(attempts):
+              if "present" in attempts:
+                  return "present"
+              if len(attempts) == 3 and set(attempts) == {"absent"}:
+                  return "absent"
+              return "unknown"
+
+
+          assert bounded_result(["absent", "absent", "absent"]) == "absent"
+          assert bounded_result(["unknown", "absent", "absent"]) == "unknown"
+          assert bounded_result(["timeout", "unknown", "present"]) == "present"
+
+          def unchanged(expected_state, expected_digest, observed_state, observed_digest):
+              if observed_state == "unknown":
+                  return False
+              if expected_state == "absent":
+                  return observed_state == "absent"
+              return observed_state == "present" and observed_digest == expected_digest
+
+
+          digest = "sha256:" + "a" * 64
+          assert unchanged("absent", "", "absent", "")
+          assert unchanged("matching", digest, "present", digest)
+          assert not unchanged("absent", "", "unknown", "")
+          assert not unchanged("matching", digest, "unknown", "")
+          assert not unchanged("matching", digest, "present", "sha256:" + "b" * 64)
+
+          def reconcile(create_result, reinspections):
+              if create_result == "success":
+                  return "delivered"
+              final = reinspections[-1]
+              if final == "present_matching":
+                  return "delivered_after_transport_error"
+              if create_result == "timeout" or final == "timeout":
+                  return "timed_out_unknown"
+              if final == "absent":
+                  return "delivery_failed_confirmed_absent"
+              return "delivery_unknown"
+
+
+          assert reconcile("error", ["unknown", "present_matching"]) == "delivered_after_transport_error"
+          assert reconcile("error", ["absent", "absent", "absent"]) == "delivery_failed_confirmed_absent"
+          assert reconcile("error", ["unknown", "unknown", "unknown"]) == "delivery_unknown"
+          assert reconcile("timeout", ["unknown", "timeout", "unknown"]) == "timed_out_unknown"
+          print("registry_inspection_and_delivery_recovery=passed")
           PY
 
       - name: Test fail-closed tag and recovery transitions
@@ -345,6 +442,34 @@ jobs:
           assert results["recovery_from_sha_tag"]["actions"] == ["create_release_from_sha"], results
           assert results["recovery_from_release_tag"]["actions"] == ["create_sha_from_release"], results
           print(json.dumps(results, indent=2, sort_keys=True))
+          PY
+
+      - name: Test publication graph, global lock, and exact-digest copy fences
+        env:
+          WORKFLOW_PATH: .github/workflows/ghcr-execution-read-release.yml
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          text = Path(os.environ["WORKFLOW_PATH"]).read_text(encoding="utf-8")
+          assert "'ghcr-execution-read-publication'" in text
+          assert text.index("\n  registry-preflight:\n") < text.index("\n  publish:\n") < text.index("\n  manifest:\n")
+          assert "needs: [resolve, authorize, registry-preflight]" in text
+          assert "needs.registry-preflight.outputs.rebuild == 'true'" in text
+          assert "name: ghcr-execution-read-proof-" in text
+          assert "name: ghcr-execution-read-preflight-" in text
+          assert text.count("github.run_attempt") >= 5
+          assert '"${IMAGE_NAME}@${release_preflight_digest}"' in text
+          assert '"${IMAGE_NAME}@${sha_digest}"' in text
+          mutable_sha_copy = 'docker buildx imagetools create --tag "$sha_ref" ' + '"$release_ref"'
+          mutable_release_copy = 'docker buildx imagetools create --tag "$release_ref" ' + '"$sha_ref"'
+          assert mutable_sha_copy not in text
+          assert mutable_release_copy not in text
+          assert 'git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA"' in text
+          assert '"${IMAGE_NAME}@${final_release_digest}" --raw' in text
+          assert "application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json" in text
+          print("publication_graph_and_exact_digest_fences=passed")
           PY
 
   conformance:
@@ -531,12 +656,44 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
+          authorization_receipt="$RUNNER_TEMP/authorization-receipt.json"
+          record_authorization_failure() {
+            AUTHORIZATION_RECEIPT="$authorization_receipt" \
+            FAILURE_STATUS="$1" \
+            SOURCE_SHA="$SOURCE_SHA" \
+            WORKFLOW_SHA="$WORKFLOW_SHA" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path(os.environ["AUTHORIZATION_RECEIPT"]).write_text(json.dumps({
+              "receipt_version": "hermes.execution.read.authorization-receipt.v1",
+              "status": os.environ["FAILURE_STATUS"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          }
           current_main="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
           [ "$current_main" = "$WORKFLOW_SHA" ] || {
+            record_authorization_failure "workflow_revision_stale"
             echo "::error::main moved after the audited workflow revision; dispatch is stale."
+            exit 1
+          }
+          comparison_status="$(gh api "repos/${REPOSITORY}/compare/${SOURCE_SHA}...${WORKFLOW_SHA}" --jq '.status')" || {
+            record_authorization_failure "source_ancestry_unavailable"
+            echo "::error::Could not prove source ancestry against the audited workflow revision."
+            exit 1
+          }
+          [[ "$comparison_status" =~ ^(ahead|identical)$ ]] || {
+            record_authorization_failure "source_not_ancestor_of_workflow"
+            echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
             exit 1
           }
           environment_json="$RUNNER_TEMP/gh-image.json"
@@ -577,10 +734,263 @@ jobs:
           echo "External hold passed: gh-image required review and main deployment restriction are present."
           echo "CalVer tag protection and GHCR package-writer restriction remain pilot-owned external gates."
 
-  publish:
-    name: Publish untagged digest (${{ matrix.arch }})
+      - name: Upload authorization failure receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-execution-read-authorization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/authorization-receipt.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  registry-preflight:
+    name: Authenticated destination preflight
     if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
     needs: [resolve, authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      rebuild: ${{ steps.preflight.outputs.rebuild }}
+      sha_state: ${{ steps.preflight.outputs.sha_state }}
+      sha_digest: ${{ steps.preflight.outputs.sha_digest }}
+      release_state: ${{ steps.preflight.outputs.release_state }}
+      release_digest: ${{ steps.preflight.outputs.release_digest }}
+    steps:
+      - name: Check out audited workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to fork-owned GHCR for authenticated inspection
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Fail-closed preflight before any child rebuild or push
+        id: preflight
+        env:
+          RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-preflight.json
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
+          [ "$SOURCE_REF" = "refs/tags/${RELEASE_TAG}" ]
+
+          record_preflight_failure() {
+            RECEIPT_PATH="$RECEIPT_PATH" FAILURE_STATUS="$1" FAILURE_STATE="$2" \
+            RELEASE_TAG="$RELEASE_TAG" SOURCE_REF="$SOURCE_REF" SOURCE_SHA="$SOURCE_SHA" \
+            WORKFLOW_REF="$WORKFLOW_REF" WORKFLOW_SHA="$WORKFLOW_SHA" \
+            WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" WORKFLOW_RUN_ATTEMPT="$WORKFLOW_RUN_ATTEMPT" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path(os.environ["RECEIPT_PATH"]).write_text(json.dumps({
+              "receipt_version": "hermes.execution.read.release-receipt.v1",
+              "status": os.environ["FAILURE_STATUS"],
+              "destination": "ghcr.io/ragnos-labs/hermes-agent",
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source": {"sha": os.environ["SOURCE_SHA"], "ref": os.environ["SOURCE_REF"]},
+              "workflow": {
+                  "sha": os.environ["WORKFLOW_SHA"],
+                  "ref": os.environ["WORKFLOW_REF"],
+                  "run_id": os.environ["WORKFLOW_RUN_ID"],
+                  "run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"],
+              },
+              "contract": "hermes.execution.read.v1",
+              "schema_sha256": "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3",
+              "tag_states": {"preflight": {}, "final": {}},
+              "recovery": {"state": os.environ["FAILURE_STATE"], "instruction": "No registry mutation is allowed. Reinspect with authenticated registry access and reconcile with the pilot."},
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          }
+
+          explicit_absence() {
+            grep -Eiq '(MANIFEST_UNKNOWN|manifest unknown|ghcr\.io/v2/.+/manifests/.+: not found|ghcr\.io/ragnos-labs/hermes-agent:(sha-[0-9a-f]{40}|v[0-9.]+): not found|unexpected status from HEAD request to https://ghcr\.io/v2/.+/manifests/.+: 404 Not Found)' "$1"
+          }
+
+          inspect_ref() {
+            local ref="$1" raw_path="$2" digest_path="$3" state_path="$4"
+            local attempt raw_tmp digest_tmp error_path saw_unknown=false
+            rm -f "$raw_path" "$digest_path" "$state_path"
+            error_path="${raw_path}.error"
+            for attempt in 1 2 3; do
+              raw_tmp="${raw_path}.attempt-${attempt}"
+              digest_tmp="${digest_path}.attempt-${attempt}"
+              : > "$error_path"
+              if timeout 45 docker buildx imagetools inspect "$ref" --raw > "$raw_tmp" 2> "$error_path"; then
+                if timeout 45 docker buildx imagetools inspect "$ref" > "$digest_tmp" 2>> "$error_path" && \
+                  RAW_PATH="$raw_tmp" DIGEST_OUTPUT="$digest_tmp" python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          payload = json.loads(Path(os.environ["RAW_PATH"]).read_text(encoding="utf-8"))
+          assert isinstance(payload, dict) and payload, "malformed registry manifest"
+          text = Path(os.environ["DIGEST_OUTPUT"]).read_text(encoding="utf-8")
+          match = re.search(r"(?m)^Digest:\s+(sha256:[0-9a-f]{64})\s*$", text)
+          assert match, "missing canonical registry digest"
+          Path(os.environ["DIGEST_OUTPUT"]).write_text(match.group(1) + "\n", encoding="utf-8")
+          PY
+                then
+                  mv "$raw_tmp" "$raw_path"
+                  mv "$digest_tmp" "$digest_path"
+                  echo present > "$state_path"
+                  rm -f "$error_path"
+                  return 0
+                fi
+                saw_unknown=true
+              elif explicit_absence "$error_path"; then
+                rm -f "$raw_tmp" "$digest_tmp"
+                if [ "$attempt" -eq 3 ] && [ "$saw_unknown" = false ]; then
+                  echo absent > "$state_path"
+                  rm -f "$error_path"
+                  return 0
+                fi
+              else
+                saw_unknown=true
+                rm -f "$raw_tmp" "$digest_tmp"
+              fi
+              echo "::warning::Authenticated registry inspection attempt ${attempt}/3 was not conclusive for ${ref}."
+              sleep "$attempt"
+            done
+            rm -f "$error_path"
+            return 1
+          }
+
+          git fetch --force --no-tags origin refs/heads/main
+          current_main="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          git fetch --force --no-tags origin "$SOURCE_REF"
+          resolved_source="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          [ "$current_main" = "$WORKFLOW_SHA" ] || {
+            record_preflight_failure workflow_revision_stale main_moved
+            exit 1
+          }
+          [ "$resolved_source" = "$SOURCE_SHA" ] || {
+            record_preflight_failure source_tag_moved moved_tag
+            exit 1
+          }
+          git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
+            record_preflight_failure source_not_ancestor_of_workflow invalid_ancestry
+            exit 1
+          }
+
+          sha_ref="${IMAGE_NAME}:sha-${SOURCE_SHA}"
+          release_ref="${IMAGE_NAME}:${RELEASE_TAG}"
+          sha_raw="$RUNNER_TEMP/preflight-sha.json"
+          sha_digest_path="$RUNNER_TEMP/preflight-sha.digest"
+          sha_state_path="$RUNNER_TEMP/preflight-sha.state"
+          release_raw="$RUNNER_TEMP/preflight-release.json"
+          release_digest_path="$RUNNER_TEMP/preflight-release.digest"
+          release_state_path="$RUNNER_TEMP/preflight-release.state"
+          inspect_ref "$sha_ref" "$sha_raw" "$sha_digest_path" "$sha_state_path" || {
+            record_preflight_failure registry_inspection_unknown sha_inspection_unknown
+            exit 1
+          }
+          inspect_ref "$release_ref" "$release_raw" "$release_digest_path" "$release_state_path" || {
+            record_preflight_failure registry_inspection_unknown release_inspection_unknown
+            exit 1
+          }
+
+          RECEIPT_PATH="$RECEIPT_PATH" RELEASE_RAW="$release_raw" RELEASE_DIGEST_PATH="$release_digest_path" \
+          RELEASE_STATE_PATH="$release_state_path" SHA_RAW="$sha_raw" SHA_DIGEST_PATH="$sha_digest_path" \
+          SHA_STATE_PATH="$sha_state_path" SOURCE_REF="$SOURCE_REF" SOURCE_SHA="$SOURCE_SHA" \
+          RELEASE_TAG="$RELEASE_TAG" WORKFLOW_REF="$WORKFLOW_REF" WORKFLOW_SHA="$WORKFLOW_SHA" \
+          WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" WORKFLOW_RUN_ATTEMPT="$WORKFLOW_RUN_ATTEMPT" \
+          GITHUB_OUTPUT="$GITHUB_OUTPUT" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def classify(prefix):
+              state = Path(os.environ[f"{prefix}_STATE_PATH"]).read_text(encoding="utf-8").strip()
+              if state == "absent":
+                  return {"state": "absent", "digest": None}
+              raw = json.loads(Path(os.environ[f"{prefix}_RAW"]).read_text(encoding="utf-8"))
+              manifests = raw.get("manifests", [])
+              runtime = {
+                  (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture")): item.get("digest")
+                  for item in manifests if item.get("platform", {}).get("os") == "linux"
+              }
+              attested = {
+                  item.get("annotations", {}).get("vnd.docker.reference.digest")
+                  for item in manifests
+                  if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+              }
+              annotations = raw.get("annotations", {})
+              matches = (
+                  set(runtime) == {("linux", "amd64"), ("linux", "arm64")}
+                  and set(runtime.values()).issubset(attested)
+                  and annotations.get("org.opencontainers.image.revision") == os.environ["SOURCE_SHA"]
+                  and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
+                  and annotations.get("io.ragnos.hermes.execution.schema-sha256") == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+              )
+              digest = Path(os.environ[f"{prefix}_DIGEST_PATH"]).read_text(encoding="utf-8").strip()
+              return {"state": "matching" if matches else "conflict", "digest": digest}
+
+          sha = classify("SHA")
+          release = classify("RELEASE")
+          errors = []
+          if release["state"] == "conflict":
+              errors.append("release tag conflicts")
+          if sha["state"] == "conflict":
+              errors.append("SHA tag conflicts")
+          if sha["state"] == release["state"] == "matching" and sha["digest"] != release["digest"]:
+              errors.append("matching-content tags resolve to different digests")
+          rebuild = sha["state"] == release["state"] == "absent"
+          receipt = {
+              "receipt_version": "hermes.execution.read.release-receipt.v1",
+              "status": "conflict" if errors else "preflight_passed",
+              "destination": "ghcr.io/ragnos-labs/hermes-agent",
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source": {"sha": os.environ["SOURCE_SHA"], "ref": os.environ["SOURCE_REF"]},
+              "workflow": {"sha": os.environ["WORKFLOW_SHA"], "ref": os.environ["WORKFLOW_REF"], "run_id": os.environ["WORKFLOW_RUN_ID"], "run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"]},
+              "contract": "hermes.execution.read.v1",
+              "schema_sha256": "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3",
+              "children": {}, "orphan_children": {}, "missing_architectures": [],
+              "tag_states": {"preflight": {"sha": sha, "release": release}, "final": {}},
+              "index_digest": None,
+              "recovery": {"state": "conflict" if errors else "preflight_passed", "instruction": "Do not mutate on conflict; otherwise reuse exact proved digests or rebuild only when both destination tags are absent."},
+          }
+          Path(os.environ["RECEIPT_PATH"]).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"rebuild={'true' if rebuild else 'false'}\n")
+              output.write(f"sha_state={sha['state']}\nsha_digest={sha['digest'] or ''}\n")
+              output.write(f"release_state={release['state']}\nrelease_digest={release['digest'] or ''}\n")
+          print(json.dumps(receipt, indent=2, sort_keys=True))
+          if errors:
+              raise SystemExit("; ".join(errors))
+          PY
+
+      - name: Upload current-attempt preflight receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-execution-read-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ghcr-execution-read-preflight.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish untagged digest (${{ matrix.arch }})
+    if: needs.resolve.outputs.publish == 'true' && needs.registry-preflight.outputs.rebuild == 'true' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, authorize, registry-preflight]
     strategy:
       fail-fast: false
       matrix:
@@ -610,20 +1020,60 @@ jobs:
 
       - name: Re-prove approved source and schema
         env:
+          ARCH: ${{ matrix.arch }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
           [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
+          evidence_dir="$RUNNER_TEMP/publication-evidence/${ARCH}"
+          mkdir -p "$evidence_dir"
+          record_arch_failure() {
+            RECEIPT_JSON="$evidence_dir/architecture.json" FAILURE_STATUS="$1" ARCH="$ARCH" \
+            SOURCE_SHA="$SOURCE_SHA" SOURCE_REF="$SOURCE_REF" WORKFLOW_SHA="$WORKFLOW_SHA" \
+            WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" WORKFLOW_RUN_ATTEMPT="$WORKFLOW_RUN_ATTEMPT" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          Path(os.environ["RECEIPT_JSON"]).write_text(json.dumps({
+              "architecture": os.environ["ARCH"],
+              "status": os.environ["FAILURE_STATUS"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "source_ref": os.environ["SOURCE_REF"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
+              "workflow_run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"],
+              "pushed_digest_verified": False,
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          }
           git fetch --force --no-tags origin refs/heads/main
           [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA" ] || {
+            record_arch_failure workflow_revision_stale
             echo "::error::main moved after the audited workflow revision; no digest may be pushed."
             exit 1
           }
-          git fetch --force --no-tags origin "$SOURCE_REF"
-          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
-          [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ]
+          git fetch --force --no-tags origin "$SOURCE_REF" || {
+            record_arch_failure source_tag_unavailable
+            exit 1
+          }
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ] || {
+            record_arch_failure source_tag_moved
+            exit 1
+          }
+          [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ] || {
+            record_arch_failure source_checkout_mismatch
+            exit 1
+          }
+          git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
+            record_arch_failure source_not_ancestor_of_workflow
+            echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main; no digest may be pushed."
+            exit 1
+          }
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
 
       - name: Set up Docker Buildx
@@ -665,6 +1115,7 @@ jobs:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
           WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
@@ -679,6 +1130,7 @@ jobs:
           SOURCE_SHA="$SOURCE_SHA" \
           WORKFLOW_REF="$WORKFLOW_REF" \
           WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" \
+          WORKFLOW_RUN_ATTEMPT="$WORKFLOW_RUN_ATTEMPT" \
           WORKFLOW_SHA="$WORKFLOW_SHA" \
           python3 - <<'PY'
           import json
@@ -694,6 +1146,7 @@ jobs:
               "workflow_sha": os.environ["WORKFLOW_SHA"],
               "workflow_ref": os.environ["WORKFLOW_REF"],
               "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
+              "workflow_run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"],
               "contract": "hermes.execution.read.v1",
               "schema_sha256": "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3",
               "status": "pushed_unverified",
@@ -716,6 +1169,7 @@ jobs:
           WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
           WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -775,6 +1229,7 @@ jobs:
           SOURCE_SHA="$SOURCE_SHA" \
           WORKFLOW_REF="$WORKFLOW_REF" \
           WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" \
+          WORKFLOW_RUN_ATTEMPT="$WORKFLOW_RUN_ATTEMPT" \
           WORKFLOW_SHA="$WORKFLOW_SHA" \
           python3 - <<'PY'
           import json
@@ -817,6 +1272,7 @@ jobs:
           assert receipt["workflow_sha"] == os.environ["WORKFLOW_SHA"]
           assert receipt["workflow_ref"] == os.environ["WORKFLOW_REF"]
           assert receipt["workflow_run_id"] == os.environ["WORKFLOW_RUN_ID"]
+          assert receipt["workflow_run_attempt"] == os.environ["WORKFLOW_RUN_ATTEMPT"]
           assert receipt["contract"] == os.environ["CONTRACT_VERSION"]
           assert receipt["schema_sha256"] == os.environ["SCHEMA_SHA256"]
           with open(os.environ["RECEIPT_JSON"], "w", encoding="utf-8") as handle:
@@ -826,42 +1282,51 @@ jobs:
           PY
 
       - name: Upload durable architecture proof
-        if: always() && steps.push.outputs.digest != ''
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ghcr-execution-read-proof-${{ matrix.arch }}
+          name: ghcr-execution-read-proof-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publication-evidence/${{ matrix.arch }}
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 90
 
   manifest:
     name: Publish immutable SHA and approved release tag
-    if: always() && needs.resolve.outputs.publish == 'true' && needs.authorize.result == 'success' && github.repository == 'ragnos-labs/hermes-agent'
-    needs: [resolve, authorize, publish]
+    if: always() && needs.resolve.outputs.publish == 'true' && needs.authorize.result == 'success' && needs.registry-preflight.result == 'success' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, authorize, registry-preflight, publish]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Download architecture proofs
+      - name: Download current-attempt authenticated preflight receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/publication-preflight
+          name: ghcr-execution-read-preflight-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Download current-attempt architecture proofs
         id: download
         continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: ${{ runner.temp }}/publication-proofs
-          pattern: ghcr-execution-read-proof-*
+          pattern: ghcr-execution-read-proof-*-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Initialize recoverable publication receipt
         id: children
         env:
           PROOF_DIR: ${{ runner.temp }}/publication-proofs
+          PREFLIGHT_RECEIPT: ${{ runner.temp }}/publication-preflight/ghcr-execution-read-preflight.json
+          REBUILD: ${{ needs.registry-preflight.outputs.rebuild }}
           RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-receipt.json
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
           WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
@@ -870,12 +1335,25 @@ jobs:
           import os
           from pathlib import Path
 
+          receipt = json.loads(Path(os.environ["PREFLIGHT_RECEIPT"]).read_text(encoding="utf-8"))
+          expected_workflow = {
+              "sha": os.environ["WORKFLOW_SHA"],
+              "ref": os.environ["WORKFLOW_REF"],
+              "run_id": os.environ["WORKFLOW_RUN_ID"],
+              "run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"],
+          }
+          assert receipt["source"] == {"sha": os.environ["SOURCE_SHA"], "ref": os.environ["SOURCE_REF"]}
+          assert receipt["workflow"] == expected_workflow
+          assert receipt["release_tag"] == os.environ["RELEASE_TAG"]
+
           proof_root = Path(os.environ["PROOF_DIR"])
           children = {}
           orphan_children = {}
           missing = []
-          for arch in ("amd64", "arm64"):
-              path = proof_root / f"ghcr-execution-read-proof-{arch}" / "architecture.json"
+          rebuild = os.environ["REBUILD"] == "true"
+          for arch in (("amd64", "arm64") if rebuild else ()):
+              artifact = f"ghcr-execution-read-proof-{arch}-{os.environ['WORKFLOW_RUN_ID']}-{os.environ['WORKFLOW_RUN_ATTEMPT']}"
+              path = proof_root / artifact / "architecture.json"
               if not path.is_file():
                   missing.append(arch)
                   continue
@@ -887,6 +1365,8 @@ jobs:
                   "source_ref": os.environ["SOURCE_REF"],
                   "workflow_sha": os.environ["WORKFLOW_SHA"],
                   "workflow_ref": os.environ["WORKFLOW_REF"],
+                  "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
+                  "workflow_run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"],
               }
               for key, value in expected.items():
                   if proof.get(key) != value:
@@ -901,36 +1381,17 @@ jobs:
               children[arch] = proof
 
           ready = not missing
-          receipt = {
-              "receipt_version": "hermes.execution.read.release-receipt.v1",
-              "status": "children_ready" if ready else "partial_children",
-              "destination": "ghcr.io/ragnos-labs/hermes-agent",
-              "release_tag": os.environ["RELEASE_TAG"],
-              "source": {"sha": os.environ["SOURCE_SHA"], "ref": os.environ["SOURCE_REF"]},
-              "workflow": {
-                  "sha": os.environ["WORKFLOW_SHA"],
-                  "ref": os.environ["WORKFLOW_REF"],
-                  "run_id": os.environ["WORKFLOW_RUN_ID"],
-                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-              },
-              "contract": "hermes.execution.read.v1",
-              "schema_sha256": "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3",
-              "children": children,
-              "orphan_children": orphan_children,
-              "missing_architectures": missing,
-              "tag_states": {"preflight": {}, "final": {}},
-              "index_digest": None,
-              "recovery": {
-                  "state": "ready_for_preflight" if ready else "orphan_children",
-                  "instruction": (
-                      "Re-run the same destination release_tag after repairing the failed architecture. "
-                      "No SHA or release tag is permitted while a child proof is missing; reconcile any "
-                      "available untagged child index by this receipt before registry retention cleanup."
-                      if missing else
-                      "If tagging stops after the SHA tag, rerun the same destination release_tag. A matching "
-                      "SHA tag resumes release-tag creation; any conflict fails before mutation."
-                  ),
-              },
+          receipt["status"] = "children_ready" if ready else "partial_children"
+          receipt["children"] = children
+          receipt["orphan_children"] = orphan_children
+          receipt["missing_architectures"] = missing
+          receipt["recovery"] = {
+              "state": "ready_for_finalization" if ready else "orphan_children",
+              "instruction": (
+                  "Re-run the same globally serialized dispatch after repairing the failed architecture; no destination tag was created."
+                  if missing else
+                  "Finalize only from exact preflight or current-attempt child digests; reconcile any ambiguous delivery before rerun."
+              ),
           }
           Path(os.environ["RECEIPT_PATH"]).write_text(
               json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -953,17 +1414,24 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to fork-owned GHCR
-        if: steps.children.outputs.ready == 'true'
+        if: always()
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Set up ORAS for release-lifetime receipt attachment
+        if: always()
+        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        with:
+          version: 1.3.3
+
       - name: Preflight and create recoverable multi-architecture tags
         if: steps.children.outputs.ready == 'true'
         id: manifest
         env:
+          REBUILD: ${{ needs.registry-preflight.outputs.rebuild }}
           RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-receipt.json
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
@@ -1025,69 +1493,221 @@ jobs:
               echo "::error::CalVer source tag moved to $resolved_sha; expected $SOURCE_SHA."
               exit 1
             }
+            git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
+              record_failure \
+                "source_not_ancestor_of_workflow" \
+                "invalid_ancestry" \
+                "No further image tag mutation is allowed. SOURCE_SHA must be an ancestor of WORKFLOW_SHA/current protected main."
+              echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
+              exit 1
+            }
           }
 
           inspect_ref() {
-            local ref="$1"
-            local raw_path="$2"
-            local digest_path="$3"
-            if docker buildx imagetools inspect "$ref" --raw > "$raw_path" 2>/dev/null; then
-              docker buildx imagetools inspect "$ref" \
-                | awk '/^Digest:/ {print $2; exit}' > "$digest_path"
-            else
-              rm -f "$raw_path" "$digest_path"
-            fi
+            local ref="$1" raw_path="$2" digest_path="$3" state_path="$4"
+            local attempt raw_tmp digest_tmp error_path saw_unknown=false
+            rm -f "$raw_path" "$digest_path" "$state_path"
+            error_path="${raw_path}.error"
+            for attempt in 1 2 3; do
+              raw_tmp="${raw_path}.attempt-${attempt}"
+              digest_tmp="${digest_path}.attempt-${attempt}"
+              : > "$error_path"
+              if timeout 45 docker buildx imagetools inspect "$ref" --raw > "$raw_tmp" 2> "$error_path"; then
+                if timeout 45 docker buildx imagetools inspect "$ref" > "$digest_tmp" 2>> "$error_path" && \
+                  RAW_PATH="$raw_tmp" DIGEST_OUTPUT="$digest_tmp" python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          payload = json.loads(Path(os.environ["RAW_PATH"]).read_text(encoding="utf-8"))
+          assert isinstance(payload, dict) and payload, "malformed registry manifest"
+          text = Path(os.environ["DIGEST_OUTPUT"]).read_text(encoding="utf-8")
+          match = re.search(r"(?m)^Digest:\s+(sha256:[0-9a-f]{64})\s*$", text)
+          assert match, "missing canonical registry digest"
+          Path(os.environ["DIGEST_OUTPUT"]).write_text(match.group(1) + "\n", encoding="utf-8")
+          PY
+                then
+                  mv "$raw_tmp" "$raw_path"
+                  mv "$digest_tmp" "$digest_path"
+                  echo present > "$state_path"
+                  rm -f "$error_path"
+                  return 0
+                fi
+                saw_unknown=true
+              elif grep -Eiq '(MANIFEST_UNKNOWN|manifest unknown|ghcr\.io/v2/.+/manifests/.+: not found|ghcr\.io/ragnos-labs/hermes-agent:(sha-[0-9a-f]{40}|v[0-9.]+): not found|unexpected status from HEAD request to https://ghcr\.io/v2/.+/manifests/.+: 404 Not Found)' "$error_path"; then
+                rm -f "$raw_tmp" "$digest_tmp"
+                if [ "$attempt" -eq 3 ] && [ "$saw_unknown" = false ]; then
+                  echo absent > "$state_path"
+                  rm -f "$error_path"
+                  return 0
+                fi
+              else
+                saw_unknown=true
+                rm -f "$raw_tmp" "$digest_tmp"
+              fi
+              echo "::warning::Authenticated registry inspection attempt ${attempt}/3 was not conclusive for ${ref}."
+              sleep "$attempt"
+            done
+            rm -f "$error_path"
+            return 1
           }
 
           assert_ref_unchanged() {
             local ref="$1"
             local expected_state="$2"
             local expected_digest="$3"
-            local current_digest
-            if current_digest="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')"; then
-              [ "$expected_state" = "matching" ] && [ "$current_digest" = "$expected_digest" ] || {
-                record_failure \
-                  "registry_state_changed" \
-                  "tag_race" \
-                  "Stop publication and reconcile the changed GHCR tag against the preflight receipt."
-                echo "::error::Registry tag state changed after preflight: $ref"
+            local key current_state current_digest raw_path digest_path state_path
+            key="$(printf '%s' "$ref" | sha256sum | cut -d' ' -f1)"
+            raw_path="$RUNNER_TEMP/assert-${key}.json"
+            digest_path="$RUNNER_TEMP/assert-${key}.digest"
+            state_path="$RUNNER_TEMP/assert-${key}.state"
+            inspect_ref "$ref" "$raw_path" "$digest_path" "$state_path" || {
+              record_failure \
+                "registry_inspection_unknown" \
+                "tag_state_unknown" \
+                "Registry authentication, timeout, outage, or malformed output prevented an exact unchanged assertion. No mutation is allowed."
+              exit 1
+            }
+            current_state="$(<"$state_path")"
+            if test -f "$digest_path"; then
+              current_digest="$(<"$digest_path")"
+            else
+              current_digest=""
+            fi
+            if [ "$expected_state" = "matching" ]; then
+              [ "$current_state" = present ] && [ "$current_digest" = "$expected_digest" ] || {
+                record_failure registry_state_changed tag_race "Stop publication and reconcile the changed or missing GHCR tag against the authenticated preflight receipt."
                 exit 1
               }
             else
-              [ "$expected_state" = "absent" ] || {
-                record_failure \
-                  "registry_state_changed" \
-                  "tag_race" \
-                  "Stop publication and reconcile the missing GHCR tag against the preflight receipt."
-                echo "::error::Registry tag disappeared after preflight: $ref"
+              [ "$expected_state" = absent ] && [ "$current_state" = absent ] || {
+                record_failure registry_state_changed tag_race "Stop publication and reconcile the unexpectedly present GHCR tag against the authenticated preflight receipt."
                 exit 1
               }
             fi
           }
 
-          prove_source_tag
-          amd64_index="$(jq -r '.children.amd64.build_index_digest' "$RECEIPT_PATH")"
-          arm64_index="$(jq -r '.children.arm64.build_index_digest' "$RECEIPT_PATH")"
-          amd64_runtime="$(jq -r '.children.amd64.runtime_digest' "$RECEIPT_PATH")"
-          arm64_runtime="$(jq -r '.children.arm64.runtime_digest' "$RECEIPT_PATH")"
-          for digest in "$amd64_index" "$arm64_index" "$amd64_runtime" "$arm64_runtime"; do
-            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          done
-          [ "$amd64_runtime" != "$arm64_runtime" ]
-          sources=(
-            "${IMAGE_NAME}@${amd64_index}"
-            "${IMAGE_NAME}@${arm64_index}"
-          )
+          reconcile_delivery_failure() {
+            local operation="$1" target_ref="$2" expected_digest="$3" create_rc="$4"
+            local raw_path="$RUNNER_TEMP/delivery-reinspect.json"
+            local digest_path="$RUNNER_TEMP/delivery-reinspect.digest"
+            local state_path="$RUNNER_TEMP/delivery-reinspect.state"
+            local status=delivery_unknown state=delivery_unknown actual_digest=""
+            if inspect_ref "$target_ref" "$raw_path" "$digest_path" "$state_path"; then
+              if [ "$(<"$state_path")" = present ]; then
+                actual_digest="$(<"$digest_path")"
+                if [ -n "$expected_digest" ] && [ "$actual_digest" = "$expected_digest" ]; then
+                  status=delivered_after_transport_error
+                  state=delivery_confirmed
+                fi
+              else
+                status=delivery_failed_confirmed_absent
+                state=confirmed_absent
+              fi
+            fi
+            if [ "$create_rc" -eq 124 ] && [ "$status" = delivery_unknown ]; then
+              status=timed_out_unknown
+              state=timed_out_unknown
+            fi
+            RECEIPT_PATH="$RECEIPT_PATH" DELIVERY_STATUS="$status" DELIVERY_STATE="$state" \
+            DELIVERY_OPERATION="$operation" DELIVERY_TARGET="$target_ref" \
+            DELIVERY_EXPECTED_DIGEST="$expected_digest" DELIVERY_ACTUAL_DIGEST="$actual_digest" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["RECEIPT_PATH"])
+          receipt = json.loads(path.read_text(encoding="utf-8"))
+          receipt["status"] = os.environ["DELIVERY_STATUS"]
+          receipt["delivery"] = {
+              "operation": os.environ["DELIVERY_OPERATION"],
+              "target": os.environ["DELIVERY_TARGET"],
+              "expected_digest": os.environ["DELIVERY_EXPECTED_DIGEST"] or None,
+              "reinspected_digest": os.environ["DELIVERY_ACTUAL_DIGEST"] or None,
+              "state": os.environ["DELIVERY_STATE"],
+          }
+          if os.environ["DELIVERY_OPERATION"].startswith("create_sha") and os.environ["DELIVERY_ACTUAL_DIGEST"]:
+              receipt["index_digest"] = os.environ["DELIVERY_ACTUAL_DIGEST"]
+          receipt["recovery"] = {
+              "state": os.environ["DELIVERY_STATE"],
+              "instruction": "Do not retry blindly. Reinspect both destination tags and reconcile this receipt before another globally serialized dispatch.",
+          }
+          path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          }
 
+          create_tag() {
+            local operation="$1" target_ref="$2" expected_digest="$3"
+            shift 3
+            local rc=0
+            set +e
+            timeout 120 docker buildx imagetools create "$@"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              reconcile_delivery_failure "$operation" "$target_ref" "$expected_digest" "$rc"
+              return "$rc"
+            fi
+          }
+
+          prove_source_tag
           sha_ref="${IMAGE_NAME}:sha-${SOURCE_SHA}"
           release_ref="${IMAGE_NAME}:${RELEASE_TAG}"
+          initial_sha_state="$(jq -r '.tag_states.preflight.sha.state' "$RECEIPT_PATH")"
+          initial_sha_digest="$(jq -r '.tag_states.preflight.sha.digest // ""' "$RECEIPT_PATH")"
+          initial_release_state="$(jq -r '.tag_states.preflight.release.state' "$RECEIPT_PATH")"
+          initial_release_digest="$(jq -r '.tag_states.preflight.release.digest // ""' "$RECEIPT_PATH")"
+          assert_ref_unchanged "$sha_ref" "$initial_sha_state" "$initial_sha_digest"
+          assert_ref_unchanged "$release_ref" "$initial_release_state" "$initial_release_digest"
+
+          sources=()
+          if [ "$REBUILD" = true ]; then
+            amd64_index="$(jq -r '.children.amd64.build_index_digest' "$RECEIPT_PATH")"
+            arm64_index="$(jq -r '.children.arm64.build_index_digest' "$RECEIPT_PATH")"
+            amd64_runtime="$(jq -r '.children.amd64.runtime_digest' "$RECEIPT_PATH")"
+            arm64_runtime="$(jq -r '.children.arm64.runtime_digest' "$RECEIPT_PATH")"
+            for digest in "$amd64_index" "$arm64_index" "$amd64_runtime" "$arm64_runtime"; do
+              [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            done
+            sources=("${IMAGE_NAME}@${amd64_index}" "${IMAGE_NAME}@${arm64_index}")
+          else
+            existing_digest="$initial_sha_digest"
+            [ -n "$existing_digest" ] || existing_digest="$initial_release_digest"
+            [[ "$existing_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect "${IMAGE_NAME}@${existing_digest}" --raw > "$RUNNER_TEMP/existing-exact-manifest.json"
+            read -r amd64_runtime arm64_runtime < <(
+              MANIFEST_JSON="$RUNNER_TEMP/existing-exact-manifest.json" python3 - <<'PY'
+          import json
+          import os
+          payload = json.load(open(os.environ["MANIFEST_JSON"], encoding="utf-8"))
+          runtime = {
+              (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture")): item.get("digest")
+              for item in payload.get("manifests", []) if item.get("platform", {}).get("os") == "linux"
+          }
+          assert set(runtime) == {("linux", "amd64"), ("linux", "arm64")}, runtime
+          print(runtime[("linux", "amd64")], runtime[("linux", "arm64")])
+          PY
+            )
+          fi
+          [[ "$amd64_runtime" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_runtime" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [ "$amd64_runtime" != "$arm64_runtime" ]
+
           sha_raw="$RUNNER_TEMP/preflight-sha.json"
           sha_digest_path="$RUNNER_TEMP/preflight-sha.digest"
+          sha_state_path="$RUNNER_TEMP/preflight-sha.state"
           release_raw="$RUNNER_TEMP/preflight-release.json"
           release_digest_path="$RUNNER_TEMP/preflight-release.digest"
+          release_state_path="$RUNNER_TEMP/preflight-release.state"
           plan_path="$RUNNER_TEMP/publication-plan.json"
-          inspect_ref "$sha_ref" "$sha_raw" "$sha_digest_path"
-          inspect_ref "$release_ref" "$release_raw" "$release_digest_path"
+          inspect_ref "$sha_ref" "$sha_raw" "$sha_digest_path" "$sha_state_path" || {
+            record_failure registry_inspection_unknown sha_inspection_unknown "Authenticated SHA-tag reinspection was inconclusive; no tag mutation is allowed."
+            exit 1
+          }
+          inspect_ref "$release_ref" "$release_raw" "$release_digest_path" "$release_state_path" || {
+            record_failure registry_inspection_unknown release_inspection_unknown "Authenticated release-tag reinspection was inconclusive; no tag mutation is allowed."
+            exit 1
+          }
 
           AMD64_RUNTIME="$amd64_runtime" \
           ARM64_RUNTIME="$arm64_runtime" \
@@ -1182,7 +1802,7 @@ jobs:
             prove_source_tag
             assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
             assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
-            docker buildx imagetools create \
+            create_tag create_sha_from_children "$sha_ref" "" \
               --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
               --annotation "index:io.ragnos.hermes.execution.contract=${CONTRACT_VERSION}" \
               --annotation "index:io.ragnos.hermes.execution.schema-sha256=${SCHEMA_SHA256}" \
@@ -1192,14 +1812,22 @@ jobs:
             prove_source_tag
             assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
             assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
-            docker buildx imagetools create --tag "$sha_ref" "$release_ref"
+            create_tag create_sha_from_release "$sha_ref" "$release_preflight_digest" \
+              --tag "$sha_ref" "${IMAGE_NAME}@${release_preflight_digest}"
           else
             assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
           fi
 
-          sha_digest="$(docker buildx imagetools inspect "$sha_ref" | awk '/^Digest:/ {print $2; exit}')"
+          inspect_ref "$sha_ref" "$RUNNER_TEMP/verified-sha.json" "$RUNNER_TEMP/verified-sha.digest" "$RUNNER_TEMP/verified-sha.state" || {
+            record_failure registry_inspection_unknown sha_delivery_unknown "SHA tag delivery could not be proved after bounded authenticated reinspection."
+            exit 1
+          }
+          [ "$(<"$RUNNER_TEMP/verified-sha.state")" = present ] || {
+            record_failure sha_tag_absent sha_delivery_absent "SHA tag is absent after finalization; reconcile the current-attempt child digests before rerun."
+            exit 1
+          }
+          sha_digest="$(<"$RUNNER_TEMP/verified-sha.digest")"
           [[ "$sha_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          docker buildx imagetools inspect "$sha_ref" --raw > "$RUNNER_TEMP/verified-sha.json"
           AMD64_RUNTIME="$amd64_runtime" \
           ARM64_RUNTIME="$arm64_runtime" \
           MANIFEST_JSON="$RUNNER_TEMP/verified-sha.json" \
@@ -1265,16 +1893,29 @@ jobs:
             prove_source_tag
             assert_ref_unchanged "$sha_ref" "matching" "$sha_digest"
             assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
-            docker buildx imagetools create --tag "$release_ref" "$sha_ref"
+            create_tag create_release_from_sha "$release_ref" "$sha_digest" \
+              --tag "$release_ref" "${IMAGE_NAME}@${sha_digest}"
           fi
 
-          final_release_digest="$(docker buildx imagetools inspect "$release_ref" | awk '/^Digest:/ {print $2; exit}')"
+          inspect_ref "$release_ref" "$RUNNER_TEMP/final-release-tag.json" "$RUNNER_TEMP/final-release.digest" "$RUNNER_TEMP/final-release.state" || {
+            record_failure registry_inspection_unknown release_delivery_unknown "Release tag delivery could not be proved after bounded authenticated reinspection."
+            exit 1
+          }
+          [ "$(<"$RUNNER_TEMP/final-release.state")" = present ] || {
+            record_failure release_tag_absent release_delivery_absent "Release tag is absent after finalization; preserve the verified SHA tag and reconcile before rerun."
+            exit 1
+          }
+          final_release_digest="$(<"$RUNNER_TEMP/final-release.digest")"
           [ "$final_release_digest" = "$sha_digest" ]
-          docker buildx imagetools inspect "$sha_ref" --raw > "$RUNNER_TEMP/final-manifest.json"
+          docker buildx imagetools inspect "${IMAGE_NAME}@${final_release_digest}" --raw > "$RUNNER_TEMP/final-release-exact-manifest.json"
+          cmp -s "$RUNNER_TEMP/final-release-tag.json" "$RUNNER_TEMP/final-release-exact-manifest.json" || {
+            record_failure release_exact_digest_mismatch release_verification_failed "The release tag raw manifest differs from its exact resolved digest; stop and reconcile."
+            exit 1
+          }
 
           AMD64_RUNTIME="$amd64_runtime" \
           ARM64_RUNTIME="$arm64_runtime" \
-          MANIFEST_JSON="$RUNNER_TEMP/final-manifest.json" \
+          MANIFEST_JSON="$RUNNER_TEMP/final-release-exact-manifest.json" \
           RECEIPT_PATH="$RECEIPT_PATH" \
           RELEASE_DIGEST="$final_release_digest" \
           SHA_DIGEST="$sha_digest" \
@@ -1335,15 +1976,71 @@ jobs:
             echo "- approved release tag: \`$release_ref\`"
             echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
             echo "- workflow revision: \`${{ needs.resolve.outputs.workflow_sha }}\`"
-            echo "- receipt artifact: \`ghcr-execution-read-receipt-${RELEASE_TAG}\`"
+            echo "- receipt artifact: \`ghcr-execution-read-receipt-${RELEASE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach authoritative receipt to the immutable index
+        if: always()
+        id: receipt
+        env:
+          RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-receipt.json
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          subject_digest="$(jq -r '[.index_digest, .tag_states.preflight.sha.digest, .tag_states.preflight.release.digest, .children.amd64.build_index_digest, .children.arm64.build_index_digest, .orphan_children.amd64.proof.build_index_digest, .orphan_children.arm64.proof.build_index_digest] | map(select(type == "string" and test("^sha256:[0-9a-f]{64}$"))) | first // ""' "$RECEIPT_PATH")"
+          if ! [[ "$subject_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::notice::No registry object was delivered, so there is no immutable OCI subject for this no-mutation failure receipt."
+            exit 0
+          fi
+          receipt_dir="$RUNNER_TEMP/oci-receipt"
+          verify_dir="$RUNNER_TEMP/oci-receipt-verify"
+          mkdir -p "$receipt_dir" "$verify_dir"
+          cp "$RECEIPT_PATH" "$receipt_dir/receipt.json"
+          cd "$receipt_dir"
+          receipt_digest=""
+          for attempt in 1 2 3; do
+            set +e
+            receipt_digest="$(timeout 120 oras attach \
+              --artifact-type application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json \
+              --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+              --annotation "io.ragnos.hermes.release-tag=${RELEASE_TAG}" \
+              --annotation "io.ragnos.hermes.workflow-revision=${WORKFLOW_SHA}" \
+              --format go-template --template '{{.digest}}' \
+              "${IMAGE_NAME}@${subject_digest}" \
+              receipt.json:application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json)"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ] && [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              break
+            fi
+            receipt_digest=""
+            sleep "$attempt"
+          done
+          [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::Authoritative receipt could not be attached durably after bounded retry."
+            exit 1
+          }
+          oras manifest fetch "${IMAGE_NAME}@${receipt_digest}" > "$RUNNER_TEMP/oci-receipt-manifest.json"
+          [ "$(jq -r '.subject.digest' "$RUNNER_TEMP/oci-receipt-manifest.json")" = "$subject_digest" ]
+          oras pull --output "$verify_dir" "${IMAGE_NAME}@${receipt_digest}"
+          cmp -s receipt.json "$verify_dir/receipt.json"
+          cp "$RUNNER_TEMP/oci-receipt-manifest.json" "$RUNNER_TEMP/ghcr-execution-read-receipt-oci-manifest.json"
+          echo "digest=$receipt_digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "- authoritative OCI receipt: \`${IMAGE_NAME}@${receipt_digest}\`"
+            echo "- receipt subject: \`${IMAGE_NAME}@${subject_digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload durable machine-readable receipt
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ghcr-execution-read-receipt-${{ needs.resolve.outputs.release_tag }}
-          path: ${{ runner.temp }}/ghcr-execution-read-receipt.json
+          name: ghcr-execution-read-receipt-${{ needs.resolve.outputs.release_tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ghcr-execution-read-receipt.json
+            ${{ runner.temp }}/ghcr-execution-read-receipt-oci-manifest.json
           if-no-files-found: error
           retention-days: 90
 
