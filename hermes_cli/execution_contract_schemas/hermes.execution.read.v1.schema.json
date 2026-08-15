@@ -37,24 +37,37 @@
         {"type": "string", "pattern": "^rcp_[0-9a-f]{12}_[0-9a-f]{32}$"}
       ]
     },
+    "profileId": {
+      "type": "string",
+      "pattern": "^hermes-profile-instance:[0-9a-f]{24}$"
+    },
+    "authorityId": {
+      "type": "string",
+      "pattern": "^hermes-execution-authority:[0-9a-f]{24}$"
+    },
+    "executorId": {
+      "type": "string",
+      "pattern": "^hermes-agent-executor:[0-9a-f]{24}$"
+    },
     "authority": {
       "type": "object",
       "additionalProperties": false,
       "required": ["profile_id", "profile_name", "authority_id", "executor_id"],
       "properties": {
-        "profile_id": {"type": "string", "minLength": 1},
+        "profile_id": {"$ref": "#/$defs/profileId"},
         "profile_name": {"type": "string", "minLength": 1},
-        "authority_id": {"type": "string", "minLength": 1},
-        "executor_id": {"type": "string", "minLength": 1}
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "executor_id": {"$ref": "#/$defs/executorId"}
       }
     },
     "page": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["cursor", "high_water", "minimum_available", "has_more", "completeness"],
+      "required": ["cursor", "high_water", "snapshot_high_water", "minimum_available", "has_more", "completeness"],
       "properties": {
         "cursor": {"type": "integer", "minimum": 0},
         "high_water": {"type": "integer", "minimum": 0},
+        "snapshot_high_water": {"type": "integer", "minimum": 0},
         "minimum_available": {"type": "integer", "minimum": 0},
         "has_more": {"type": "boolean"},
         "completeness": {"const": "complete"}
@@ -63,10 +76,11 @@
     "eventPage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["cursor", "high_water", "minimum_available", "has_more", "completeness", "pruned_through", "retention_seconds"],
+      "required": ["cursor", "high_water", "snapshot_high_water", "minimum_available", "has_more", "completeness", "pruned_through", "retention_seconds"],
       "properties": {
         "cursor": {"type": "integer", "minimum": 0},
         "high_water": {"type": "integer", "minimum": 0},
+        "snapshot_high_water": {"type": "integer", "minimum": 0},
         "minimum_available": {"type": "integer", "minimum": 0},
         "has_more": {"type": "boolean"},
         "completeness": {"const": "complete"},
@@ -86,9 +100,9 @@
       "properties": {
         "contract_version": {"const": "hermes.execution.read.v1"},
         "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
-        "profile_id": {"type": "string", "minLength": 1},
-        "authority_id": {"type": "string", "minLength": 1},
-        "executor_id": {"type": "string", "minLength": 1},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "executor_id": {"$ref": "#/$defs/executorId"},
         "source_run_id": {"$ref": "#/$defs/nullableString"},
         "work_ref": {"$ref": "#/$defs/nullableString"},
         "proposal_ref": {"$ref": "#/$defs/nullableString"},
@@ -125,8 +139,8 @@
         "contract_version": {"const": "hermes.execution.read.v1"},
         "decision_id": {"type": "string", "pattern": "^dec_[0-9a-f]{12}_[0-9a-f]{32}$"},
         "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
-        "profile_id": {"type": "string", "minLength": 1},
-        "authority_id": {"type": "string", "minLength": 1},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
         "effect_id": {"type": "string", "minLength": 1},
         "proposal_ref": {"type": "string", "minLength": 1},
         "request_digest": {"$ref": "#/$defs/digest"},
@@ -163,9 +177,9 @@
         "receipt_id": {"type": "string", "pattern": "^rcp_[0-9a-f]{12}_[0-9a-f]{32}$"},
         "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
         "effect_id": {"type": "string", "minLength": 1},
-        "profile_id": {"type": "string", "minLength": 1},
-        "authority_id": {"type": "string", "minLength": 1},
-        "executor_id": {"type": "string", "minLength": 1},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "executor_id": {"$ref": "#/$defs/executorId"},
         "outcome": {"enum": ["succeeded", "failed", "cancelled", "partial", "ambiguous"]},
         "subject_digest": {"$ref": "#/$defs/digest"},
         "evidence_digest": {"$ref": "#/$defs/digest"},
@@ -190,8 +204,8 @@
         "sequence": {"type": "integer", "minimum": 1},
         "event_id": {"type": "string", "pattern": "^evt_[0-9a-f]{12}_[0-9a-f]{32}$"},
         "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
-        "profile_id": {"type": "string", "minLength": 1},
-        "authority_id": {"type": "string", "minLength": 1},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
         "event_type": {
           "enum": [
             "execution.created", "execution.transitioned", "execution.recovered",
@@ -346,6 +360,7 @@
             "type": {"const": "execution_contract_error"},
             "code": {
               "enum": [
+                "execution_contract_unauthorized",
                 "execution_contract_invalid_request",
                 "execution_contract_profile_forbidden",
                 "execution_contract_not_found",

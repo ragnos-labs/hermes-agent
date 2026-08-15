@@ -430,10 +430,13 @@ Contract version: `hermes.execution.read.v1`
 | `GET` | `/v1/execution-contract/receipts` | Read authoritative terminal effect receipts |
 | `GET` | `/v1/execution-contract/receipts/{receipt_id}` | Read one receipt |
 
-Collections accept `after` and `limit` (maximum 200). Events include a
-monotonic sequence, high-water mark, minimum available cursor, completeness,
-and explicit retention watermark. A pruned cursor returns `410`, so consumers
-can detect a replay gap instead of silently treating missing history as empty.
+Collections accept `after`, `limit` (maximum 200), and
+`snapshot_high_water`. The first page pins a high-water mark in the same read
+transaction as row selection; carry that value to subsequent pages so
+concurrent inserts cannot skip or duplicate data. Events also include a
+monotonic sequence, minimum available cursor, completeness, and explicit
+retention watermark. A pruned cursor returns `410`, so consumers can detect a
+replay gap instead of silently treating missing history as empty.
 
 Use `API_SERVER_READ_KEY` when a service needs these GETs without run, approval,
 steer, stop, chat, or other mutation authority:
@@ -444,9 +447,13 @@ curl http://localhost:8642/v1/execution-contract/capabilities \
   -H "Hermes-Execution-Contract-Version: hermes.execution.read.v1"
 ```
 
-The server asserts the profile, authority, and executor identity in every
-response. Under multiplexing, `/p/<profile>/v1/execution-contract/...` uses
-that profile's home, ledger, and keys. Release 1 does not expose proposal/action
+The server derives and asserts the profile-instance, authority, and executor
+identity from the active scoped Hermes home in every response; URL labels do
+not create authority. Under multiplexing,
+`/p/<profile>/v1/execution-contract/...` uses that profile's home, ledger, and
+keys. Late authoritative ambiguous evidence has a dedicated atomic
+reconciliation path, while generic chat/process state remains non-authoritative.
+Release 1 does not expose proposal/action
 dispatch, public decision mutation, or WebAuthn step-up; capability discovery
 reports those features as disabled.
 
@@ -570,7 +577,8 @@ Configure the key via `API_SERVER_KEY` env var. If you need a browser to call He
 For read-only execution consumers, configure a distinct
 `API_SERVER_READ_KEY`. It is accepted only by `/v1/capabilities` and
 `GET /v1/execution-contract/*`; presenting it to any other route returns
-`403`.
+`403`. Hermes refuses to start if it equals `API_SERVER_KEY` for the default
+or any served named profile.
 
 ### Multi-profile routing (`/p/<profile>/…`)
 

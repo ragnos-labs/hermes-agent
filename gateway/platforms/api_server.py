@@ -1819,17 +1819,51 @@ class APIServerAdapter(BasePlatformAdapter):
             return ""
 
     @staticmethod
+    def _request_path(request: "web.Request") -> str:
+        """Return the request path for aiohttp and narrow auth-test doubles."""
+        path = getattr(request, "path", None)
+        if not isinstance(path, str):
+            path_qs = getattr(request, "path_qs", "")
+            path = path_qs.split("?", 1)[0] if isinstance(path_qs, str) else ""
+        if path.startswith("/p/"):
+            parts = path.split("/", 3)
+            path = f"/{parts[3]}" if len(parts) == 4 else "/"
+        return path
+
+    @staticmethod
     def _read_key_path_allowed(request: "web.Request") -> bool:
         """True only for Release 1 contract reads and capability negotiation."""
         if request.method != "GET":
             return False
-        path = request.path
-        if path.startswith("/p/"):
-            parts = path.split("/", 3)
-            path = f"/{parts[3]}" if len(parts) == 4 else "/"
+        path = APIServerAdapter._request_path(request)
         return path == "/v1/capabilities" or path.startswith(
             "/v1/execution-contract/"
         )
+
+    @staticmethod
+    def _is_execution_contract_public_request(request: "web.Request") -> bool:
+        path = APIServerAdapter._request_path(request)
+        return path == "/v1/capabilities" or path.startswith(
+            "/v1/execution-contract/"
+        )
+
+    def _execution_contract_auth_response(
+        self,
+        *,
+        status: int,
+        message: str,
+    ) -> "web.Response":
+        from hermes_cli.execution_contract import (
+            ContractForbiddenError,
+            ContractUnauthorizedError,
+        )
+
+        error = (
+            ContractUnauthorizedError(message)
+            if status == 401
+            else ContractForbiddenError(message)
+        )
+        return self._execution_contract_error_response(error)
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
@@ -1843,6 +1877,29 @@ class APIServerAdapter(BasePlatformAdapter):
         is_named_profile = bool(profile and profile != "default")
         expected_key = self._expected_api_key()
         expected_read_key = self._expected_read_api_key()
+        contract_request = self._is_execution_contract_public_request(request)
+        if expected_key and expected_read_key and hmac.compare_digest(
+            expected_key.encode(),
+            expected_read_key.encode(),
+        ):
+            if contract_request:
+                from hermes_cli.execution_contract import ContractUnavailableError
+
+                return self._execution_contract_error_response(
+                    ContractUnavailableError(
+                        "execution contract credentials are misconfigured"
+                    )
+                )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Gateway API credentials are misconfigured",
+                        "type": "gateway_auth_error",
+                        "code": "gateway_auth_misconfigured",
+                    }
+                },
+                status=503,
+            )
         if not expected_key and not expected_read_key:
             # Preserve the historical no-key test/manual-wiring behavior only
             # for the default listener. Named profiles must fail closed rather
@@ -1855,6 +1912,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 profile,
                 self._request_audit_log_suffix(request),
             )
+            if contract_request:
+                return self._execution_contract_auth_response(
+                    status=401,
+                    message="Execution contract bearer token is invalid",
+                )
             return web.json_response(
                 {
                     "error": {
@@ -1886,6 +1948,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ):
                 if self._read_key_path_allowed(request):
                     return None
+                if contract_request:
+                    return self._execution_contract_auth_response(
+                        status=403,
+                        message="Bearer token lacks the required contract scope",
+                    )
                 return web.json_response(
                     {
                         "error": {
@@ -1903,6 +1970,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "API server rejected invalid API key: %s",
             self._request_audit_log_suffix(request),
         )
+        if contract_request:
+            return self._execution_contract_auth_response(
+                status=401,
+                message="Execution contract bearer token is invalid",
+            )
         return web.json_response(
             {"error": {"message": "Invalid gateway API key (API_SERVER_KEY)", "type": "gateway_auth_error", "code": "gateway_auth_failed"}},
             status=401,
@@ -2111,6 +2183,12 @@ class APIServerAdapter(BasePlatformAdapter):
         async def profile_prefix_middleware(request: "web.Request", handler):
             profile = self._resolve_request_profile(request)
             if profile is _PROFILE_REJECTED:
+                if self._is_execution_contract_public_request(request):
+                    from hermes_cli.execution_contract import ContractNotFoundError
+
+                    return self._execution_contract_error_response(
+                        ContractNotFoundError("profile is unknown or unconfigured")
+                    )
                 return web.json_response(
                     {"error": "Unknown or unconfigured profile"},
                     status=404,
@@ -3222,9 +3300,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _execution_contract_store(self):
         from hermes_cli.execution_contract import ExecutionContractStore
+        from hermes_constants import get_hermes_home
 
         return ExecutionContractStore(
-            profile_name=self._execution_contract_profile_name(),
+            profile_home=get_hermes_home(),
             runtime_instance_id=self._execution_contract_runtime_id,
         )
 
@@ -3260,6 +3339,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ContractForbiddenError,
             ContractNotFoundError,
             ContractRateLimitedError,
+            ContractUnauthorizedError,
             ContractUnavailableError,
             ContractValidationError,
             UnsupportedContractVersionError,
@@ -3269,7 +3349,10 @@ class APIServerAdapter(BasePlatformAdapter):
         code = "execution_contract_internal_error"
         details: dict[str, Any] = {}
         headers = {"Hermes-Execution-Contract-Version": CONTRACT_VERSION}
-        if isinstance(exc, ContractValidationError):
+        headers["Cache-Control"] = "no-store"
+        if isinstance(exc, ContractUnauthorizedError):
+            status, code = 401, "execution_contract_unauthorized"
+        elif isinstance(exc, ContractValidationError):
             status, code = 400, "execution_contract_invalid_request"
         elif isinstance(exc, ContractForbiddenError):
             status, code = 403, "execution_contract_profile_forbidden"
@@ -3347,8 +3430,13 @@ class APIServerAdapter(BasePlatformAdapter):
             return guard
         from hermes_cli.execution_contract import contract_capabilities
 
+        store = self._execution_contract_store()
+
         return web.json_response(
-            contract_capabilities(self._execution_contract_profile_name()),
+            contract_capabilities(
+                store.profile_home,
+                store.authority.profile_name,
+            ),
             headers=self._execution_contract_headers(),
         )
 
@@ -3399,6 +3487,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 after=request.query.get("after", 0),
                 limit=request.query.get("limit", 50),
                 lifecycle=request.query.get("lifecycle"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
             )
             return web.json_response(
                 self._execution_contract_envelope(
@@ -3441,6 +3530,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 after=request.query.get("after", 0),
                 limit=request.query.get("limit", 50),
                 state=request.query.get("state"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
             )
             return web.json_response(
                 self._execution_contract_envelope(
@@ -3483,6 +3573,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 after=request.query.get("after", 0),
                 limit=request.query.get("limit", 50),
                 execution_id=request.query.get("execution_id"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
             )
             return web.json_response(
                 self._execution_contract_envelope(
@@ -3507,6 +3598,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 after=request.query.get("after", 0),
                 limit=request.query.get("limit", 50),
                 outcome=request.query.get("outcome"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
             )
             return web.json_response(
                 self._execution_contract_envelope(
@@ -7249,7 +7341,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id
             )
             execution_id = execution["execution_id"]
-        return self._execution_contract_store().record_effect_evidence(
+        store = self._execution_contract_store()
+        if reconciliation_ref is not None:
+            return store.reconcile_ambiguous_evidence(
+                execution_id=execution_id,
+                effect_id=effect_id,
+                outcome=outcome,
+                subject_digest=subject_digest,
+                evidence_digest=evidence_digest,
+                result_digest=result_digest,
+                decision_id=decision_id,
+                recovery_ref=recovery_ref,
+                reconciliation_ref=reconciliation_ref,
+            )
+        return store.record_effect_evidence(
             execution_id=execution_id,
             effect_id=effect_id,
             outcome=outcome,
@@ -8166,9 +8271,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return True
 
     def _read_api_key_passes_startup_guard(self) -> bool:
-        """Reject a configured read-only key that is weak or placeholder-like."""
-        if not self._read_api_key:
-            return True
+        """Validate read keys and reject equality for every served profile."""
         try:
             from hermes_cli.auth import has_usable_secret
         except Exception as exc:
@@ -8179,13 +8282,50 @@ class APIServerAdapter(BasePlatformAdapter):
                 type(exc).__name__,
             )
             return False
-        if not has_usable_secret(self._read_api_key, min_length=16):
-            logger.error(
-                "[%s] Refusing to start: API_SERVER_READ_KEY is a placeholder "
-                "or too short (<16 chars)",
-                self.name,
-            )
-            return False
+        for profile in self._execution_contract_profiles():
+            token = _api_request_profile.set(profile)
+            try:
+                with self._profile_scope(profile):
+                    if not profile or profile == "default":
+                        full_key = self._api_key or ""
+                        read_key = self._read_api_key or ""
+                    else:
+                        from agent.secret_scope import get_secret
+
+                        full_key = get_secret("API_SERVER_KEY", "") or ""
+                        read_key = get_secret("API_SERVER_READ_KEY", "") or ""
+            except Exception as exc:
+                logger.error(
+                    "[%s] Refusing to start: profile-scoped API keys could not "
+                    "be resolved for %r (%s)",
+                    self.name,
+                    profile or "default",
+                    type(exc).__name__,
+                )
+                return False
+            finally:
+                _api_request_profile.reset(token)
+            if not read_key:
+                continue
+            if not has_usable_secret(read_key, min_length=16):
+                logger.error(
+                    "[%s] Refusing to start: API_SERVER_READ_KEY is a placeholder "
+                    "or too short (<16 chars) for profile %r",
+                    self.name,
+                    profile or "default",
+                )
+                return False
+            if full_key and hmac.compare_digest(
+                full_key.encode(),
+                read_key.encode(),
+            ):
+                logger.error(
+                    "[%s] Refusing to start: API_SERVER_READ_KEY must differ "
+                    "from API_SERVER_KEY for profile %r",
+                    self.name,
+                    profile or "default",
+                )
+                return False
         return True
 
     def _execution_contract_profiles(self) -> list[Optional[str]]:

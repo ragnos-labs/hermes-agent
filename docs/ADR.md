@@ -25,8 +25,9 @@ Decision:
   public GET.
 - Treat the ordered event table as a transactional outbox. Terminal state,
   evidence-backed receipt, and publication events commit in one transaction.
-- Assert profile, authority, and executor identity in responses. Embed a
-  profile fingerprint in public IDs so a cross-profile identifier fails with
+- Derive profile-instance, authority, and executor identity from the active
+  scoped Hermes home, never a URL label or literal default. Embed that home
+  fingerprint in public IDs so a cross-profile identifier fails with
   `403` instead of becoming an ambiguous `404`. Bind store metadata and every
   persisted public row to that same authority so a misplaced database cannot
   be projected under a different profile.
@@ -37,6 +38,18 @@ Decision:
 - Add an optional profile-scoped `API_SERVER_READ_KEY` with only
   `execution:read`. Keep run submission, decision resolution, steering,
   stopping, and all other API authority behind the full `API_SERVER_KEY`.
+  Refuse startup if the read and full keys are equal in any served profile.
+- Enforce the execution transition graph for decision creation and closure;
+  cancellation and restart recovery close pending decisions transactionally.
+  Bind effect evidence to the latest resolved decision so an older resolution
+  cannot authorize work after a newer decision exists.
+- Pin an explicit snapshot high-water in the same read transaction as every
+  collection query and require clients to carry it across pages.
+- Allow late evidence only through a dedicated atomic reconciliation hook
+  that can publish an authoritative ambiguous receipt without upgrading the
+  execution to success.
+- Deep-validate persisted identifiers, references, digests, bindings, states,
+  revisions, and timestamp ordering before projecting any stored object.
 - Retain ordered events for 30 days by default. Prune only a contiguous global
   prefix and return `410` with an explicit minimum cursor when replay history
   is gone.

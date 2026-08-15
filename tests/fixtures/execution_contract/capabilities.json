@@ -2,10 +2,10 @@
   "contract_version": "hermes.execution.read.v1",
   "api_version": "v1",
   "authority": {
-    "profile_id": "hermes-profile:synthetic",
+    "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
     "profile_name": "synthetic",
-    "authority_id": "hermes-execution-authority:synthetic",
-    "executor_id": "hermes-agent:synthetic"
+    "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+    "executor_id": "hermes-agent-executor:0123456789ab0123456789ab"
   },
   "read_scope": "execution:read",
   "mutation_scopes": [

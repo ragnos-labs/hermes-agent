@@ -18,6 +18,11 @@ effect receipts. It is profile scoped. The server returns the profile,
 execution authority, and executor identities in every response; clients do
 not infer authority from a URL, model name, provider, process, or config file.
 
+Authority IDs are derived from a fingerprint of the active scoped
+`get_hermes_home()` profile instance and bound into ledger metadata. A URL
+profile label is routing context only; it cannot assert authority. Moving a
+ledger to another profile home fails closed.
+
 The following are projections, not authoritative effect evidence:
 
 - `/v1/runs` process-local state;
@@ -53,12 +58,12 @@ scope before the store or key is resolved.
 
 | Method | Route | Filters |
 | --- | --- | --- |
-| `GET` | `/v1/execution-contract/executions` | `after`, `limit`, `lifecycle` |
+| `GET` | `/v1/execution-contract/executions` | `after`, `limit`, `lifecycle`, `snapshot_high_water` |
 | `GET` | `/v1/execution-contract/executions/{execution_id}` | none |
-| `GET` | `/v1/execution-contract/decisions` | `after`, `limit`, `state` |
+| `GET` | `/v1/execution-contract/decisions` | `after`, `limit`, `state`, `snapshot_high_water` |
 | `GET` | `/v1/execution-contract/decisions/{decision_id}` | none |
-| `GET` | `/v1/execution-contract/events` | `after`, `limit`, `execution_id` |
-| `GET` | `/v1/execution-contract/receipts` | `after`, `limit`, `outcome` |
+| `GET` | `/v1/execution-contract/events` | `after`, `limit`, `execution_id`, `snapshot_high_water` |
+| `GET` | `/v1/execution-contract/receipts` | `after`, `limit`, `outcome`, `snapshot_high_water` |
 | `GET` | `/v1/execution-contract/receipts/{receipt_id}` | none |
 
 `limit` is 1 through 200. Collection order is immutable creation order. Event
@@ -69,9 +74,15 @@ Every collection returns:
 
 - `cursor`: the last sequence/ordinal covered by the response;
 - `high_water`: the newest durable sequence/ordinal at read time;
+- `snapshot_high_water`: the immutable upper bound for this page sequence;
 - `minimum_available`: the earliest retained position;
 - `has_more`: whether another page exists within this snapshot;
 - `completeness=complete`: returned only when the ledger is trustworthy.
+
+The first page pins `snapshot_high_water` in the same SQLite read transaction
+as row selection. Clients carry it unchanged to later pages. Every query is
+bounded by that snapshot, so concurrent inserts cannot skip or duplicate
+items. A snapshot ahead of durable state or behind its cursor is `409`.
 
 The event page also returns `pruned_through` and
 `retention_seconds=2592000`. Events form a transactional outbox and are kept
@@ -107,6 +118,11 @@ One execution may have only one pending decision at a time. Resolution is
 idempotent only for the exact same choice and evidence. Expiry terminates the
 waiting execution as ambiguous. Any other terminal transition supersedes its
 pending decision transactionally.
+Cancellation and restart recovery also supersede pending decisions in the
+same transaction. Create, resolve, and supersede operations enforce the
+execution transition graph and cannot revive a cancelling or terminal
+execution. Effect evidence is accepted only against the latest resolved
+decision; a newer pending or closed decision invalidates older authorization.
 
 ## Terminal receipts
 
@@ -121,6 +137,12 @@ in one `BEGIN IMMEDIATE` transaction. Duplicate identical evidence is
 idempotent. A changed digest, effect, decision, profile, or outcome conflicts
 and fails closed.
 
+An execution already recorded as `terminal_ambiguous`/`unproven` uses a
+separate late-reconciliation hook. It accepts only explicit authoritative
+`ambiguous` evidence with a reconciliation reference and atomically records
+evidence, publishes the receipt, updates the execution, and appends both
+events. It cannot upgrade ambiguity to success.
+
 ## Authentication and errors
 
 `API_SERVER_KEY` retains full API authority. A distinct optional
@@ -128,7 +150,9 @@ and fails closed.
 `GET /v1/execution-contract/*`. The read key receives `403` for run submission,
 decision resolution, steering, stopping, chat/responses, unrelated reads, and
 all other mutation paths. Both keys are profile scoped and must pass the same
-minimum-strength guard. Reads never create or migrate the database.
+minimum-strength guard. Startup fails if the two keys are equal for the
+default or any served named/multiplex profile. Reads never create or migrate
+the database.
 
 Contract errors use a closed JSON shape and these statuses:
 
@@ -156,7 +180,10 @@ closed. Public reads open the existing file with SQLite `mode=ro` and
 `query_only=ON`; a missing ledger returns an empty complete collection without
 creating a file. Startup rejects an unknown store or contract version, recovers
 orphaned nonterminal executions, expires decisions, and applies event
-retention before accepting reads.
+retention before accepting reads. Each returned persisted object is deeply
+validated for scoped IDs, references, digests, bindings, lifecycle/receipt
+combinations, revisions, and timestamp ordering before HTTP `200`; corruption
+returns the closed `500 execution_contract_corrupt` envelope.
 
 ## Release 2 hold
 

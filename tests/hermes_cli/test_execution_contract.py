@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import os
 import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -105,6 +106,7 @@ def test_absent_read_is_side_effect_free_then_create_reopen_and_migrate(tmp_path
     assert empty["page"] == {
         "cursor": 0,
         "high_water": 0,
+        "snapshot_high_water": 0,
         "minimum_available": 0,
         "has_more": False,
         "completeness": "complete",
@@ -149,10 +151,19 @@ def test_packaged_schema_and_synthetic_fixtures_are_closed():
             assert item_definition["additionalProperties"] is False
             assert set(payload[collection][0]) == set(item_definition["required"])
 
-    capabilities = contract_capabilities("synthetic")
-    assert capabilities == json.loads(
+    capabilities = contract_capabilities(Path("/synthetic/profile"), "synthetic")
+    fixture_capabilities = json.loads(
         (FIXTURES / "capabilities.json").read_text(encoding="utf-8")
     )
+    assert capabilities["authority"]["profile_name"] == "synthetic"
+    assert capabilities["authority"]["profile_id"].startswith(
+        "hermes-profile-instance:"
+    )
+    assert {
+        key: value for key, value in capabilities.items() if key != "authority"
+    } == {
+        key: value for key, value in fixture_capabilities.items() if key != "authority"
+    }
     assert schema["$defs"]["errorDetail"]["additionalProperties"] is False
 
 
@@ -594,13 +605,13 @@ def test_store_file_is_bound_to_exact_profile_authority(tmp_path):
     path = tmp_path / "shared" / "execution_contract.sqlite3"
     first = ExecutionContractStore(
         database_path=path,
-        profile_name="first",
+        profile_home=tmp_path / "first-home",
         runtime_instance_id="runtime-a",
     )
     first.create_execution(lifecycle="queued", now=NOW)
     misplaced = ExecutionContractStore(
         database_path=path,
-        profile_name="second",
+        profile_home=tmp_path / "second-home",
         runtime_instance_id="runtime-a",
     )
 
@@ -654,3 +665,344 @@ def test_closed_reference_and_digest_validation(tmp_path):
             now=NOW,
         )
     assert CONTRACT_VERSION == execution["contract_version"]
+
+
+def test_restart_recovery_transactionally_supersedes_pending_decision(tmp_path):
+    first_runtime = _store(tmp_path, runtime="runtime-a")
+    execution = _bound_execution(first_runtime, suffix="restart-pending")
+    decision = first_runtime.create_decision(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        proposal_ref=execution["proposal_ref"],
+        request_digest=_digest("restart-pending"),
+        allowed_choices=["once", "deny"],
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+
+    second_runtime = _store(tmp_path, runtime="runtime-b")
+    assert second_runtime.recover_orphaned_executions(
+        recovery_ref="restart:pending",
+        now=NOW + timedelta(seconds=1),
+    ) == [execution["execution_id"]]
+
+    assert second_runtime.get_execution(execution["execution_id"])["lifecycle"] == (
+        "terminal_ambiguous"
+    )
+    assert second_runtime.get_decision(decision["decision_id"])["state"] == (
+        "superseded"
+    )
+    assert second_runtime.list_decisions(state="pending")["items"] == []
+
+
+def test_decision_request_racing_cancellation_never_leaves_pending(tmp_path):
+    seed = _store(tmp_path, runtime="runtime-race")
+    execution = _bound_execution(seed, suffix="cancel-race")
+    seed.transition_execution(execution["execution_id"], "running", now=NOW)
+    decision_store = _store(tmp_path, runtime="runtime-race")
+    cancel_store = _store(tmp_path, runtime="runtime-race")
+    barrier = threading.Barrier(2)
+
+    def request_decision():
+        barrier.wait()
+        try:
+            return decision_store.create_decision(
+                execution_id=execution["execution_id"],
+                effect_id=execution["effect_id"],
+                proposal_ref=execution["proposal_ref"],
+                request_digest=_digest("cancel-race"),
+                allowed_choices=["once", "deny"],
+                expires_at=NOW + timedelta(minutes=5),
+                now=NOW,
+            )
+        except ContractConflictError:
+            return None
+
+    def request_cancel():
+        barrier.wait()
+        return cancel_store.transition_execution(
+            execution["execution_id"],
+            "cancellation_requested",
+            now=NOW + timedelta(seconds=1),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        decision_future = pool.submit(request_decision)
+        cancel_future = pool.submit(request_cancel)
+        decision_result = decision_future.result()
+        cancel_future.result()
+
+    current = seed.get_execution(execution["execution_id"])
+    assert current["lifecycle"] == "cancellation_requested"
+    assert seed.list_decisions(state="pending")["items"] == []
+    if decision_result is not None:
+        assert seed.get_decision(decision_result["decision_id"])["state"] == (
+            "superseded"
+        )
+
+
+@pytest.mark.parametrize("operation", ["resolve", "supersede"])
+def test_decision_close_cannot_revive_terminal_execution(tmp_path, operation):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix=f"terminal-{operation}")
+    decision = store.create_decision(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        proposal_ref=execution["proposal_ref"],
+        request_digest=_digest(f"terminal-{operation}"),
+        allowed_choices=["once", "deny"],
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    terminal = "2026-08-15T12:00:01.000000Z"
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE executions SET lifecycle='terminal_ambiguous', "
+            "receipt_state='unproven', terminal_at=?, updated_at=? "
+            "WHERE execution_id=?",
+            (terminal, terminal, execution["execution_id"]),
+        )
+        connection.commit()
+
+    with pytest.raises(ContractConflictError, match="terminal_ambiguous"):
+        if operation == "resolve":
+            store.resolve_decision(
+                decision["decision_id"],
+                choice="once",
+                resolution_evidence_digest=_digest("terminal-resolution"),
+                now=NOW + timedelta(seconds=2),
+            )
+        else:
+            store.supersede_decision(
+                decision["decision_id"],
+                reason_code="terminal",
+                now=NOW + timedelta(seconds=2),
+            )
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT lifecycle FROM executions WHERE execution_id=?",
+            (execution["execution_id"],),
+        ).fetchone()[0] == "terminal_ambiguous"
+        assert connection.execute(
+            "SELECT state FROM decisions WHERE decision_id=?",
+            (decision["decision_id"],),
+        ).fetchone()[0] == "pending"
+
+
+def test_old_resolution_cannot_authorize_newer_pending_decision(tmp_path):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix="decision-generation")
+    old = _resolved_decision(store, execution, suffix="old")
+    newer = store.create_decision(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        proposal_ref=execution["proposal_ref"],
+        request_digest=_digest("request-newer"),
+        allowed_choices=["once", "deny"],
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    with pytest.raises(ContractConflictError, match="newer pending"):
+        _record_evidence(
+            store,
+            execution,
+            decision_id=old["decision_id"],
+            suffix="old-resolution",
+        )
+    assert store.get_decision(newer["decision_id"])["state"] == "pending"
+
+
+def test_collection_snapshot_excludes_concurrent_insert(monkeypatch, tmp_path):
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        lambda connection, **_kwargs: connection.execute("PRAGMA journal_mode=WAL"),
+    )
+    store = _store(tmp_path)
+    writer = _store(tmp_path)
+    store.create_execution(lifecycle="queued", source_run_id="snapshot-1", now=NOW)
+    store.create_execution(lifecycle="queued", source_run_id="snapshot-2", now=NOW)
+    writer.initialize()
+    inserted = []
+
+    def append_after_pin(collection, _high_water):
+        if collection == "executions" and not inserted:
+            inserted.append(
+                writer.create_execution(
+                    lifecycle="queued",
+                    source_run_id="snapshot-concurrent",
+                    now=NOW,
+                )
+            )
+
+    store._after_snapshot_pinned = append_after_pin
+    first = store.list_executions(limit=1)
+    assert first["page"]["snapshot_high_water"] == 2
+    assert inserted
+    store._after_snapshot_pinned = lambda *_args: None
+    second = store.list_executions(
+        after=first["page"]["cursor"],
+        snapshot_high_water=first["page"]["snapshot_high_water"],
+    )
+    source_ids = [item["source_run_id"] for item in first["items"] + second["items"]]
+    assert source_ids == ["snapshot-1", "snapshot-2"]
+    assert "snapshot-concurrent" not in source_ids
+
+
+def test_event_snapshot_excludes_append_after_high_water(monkeypatch, tmp_path):
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        lambda connection, **_kwargs: connection.execute("PRAGMA journal_mode=WAL"),
+    )
+    store = _store(tmp_path)
+    writer = _store(tmp_path)
+    first_execution = store.create_execution(lifecycle="queued", now=NOW)
+    second_execution = store.create_execution(lifecycle="queued", now=NOW)
+    writer.initialize()
+    appended = []
+
+    def append_after_pin(collection, _high_water):
+        if collection == "events" and not appended:
+            appended.append(
+                writer.transition_execution(
+                    second_execution["execution_id"],
+                    "running",
+                    now=NOW + timedelta(seconds=1),
+                )
+            )
+
+    store._after_snapshot_pinned = append_after_pin
+    page = store.list_events(limit=200)
+    assert page["page"]["snapshot_high_water"] == 2
+    assert appended
+    assert [event["execution_id"] for event in page["items"]] == [
+        first_execution["execution_id"],
+        second_execution["execution_id"],
+    ]
+
+
+def test_late_ambiguous_evidence_publishes_receipt_transactionally(tmp_path):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix="late-ambiguous")
+    terminal = store.transition_execution(
+        execution["execution_id"],
+        "terminal_failed",
+        now=NOW + timedelta(seconds=1),
+    )
+    assert terminal["lifecycle"] == "terminal_ambiguous"
+    assert terminal["receipt_state"] == "unproven"
+
+    with pytest.raises(ContractConflictError, match="reconciliation path"):
+        _record_evidence(store, execution, outcome="ambiguous", suffix="late")
+
+    receipt = store.reconcile_ambiguous_evidence(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        outcome="ambiguous",
+        subject_digest=_digest("late-subject"),
+        evidence_digest=_digest("late-evidence"),
+        result_digest=_digest("late-result"),
+        reconciliation_ref="reconcile:late-ambiguous",
+        now=NOW + timedelta(seconds=2),
+    )
+    current = store.get_execution(execution["execution_id"])
+    assert receipt["outcome"] == "ambiguous"
+    assert current["lifecycle"] == "terminal_ambiguous"
+    assert current["receipt_state"] == "published"
+    assert current["receipt_id"] == receipt["receipt_id"]
+    assert store.get_receipt(receipt["receipt_id"])["reconciliation_ref"] == (
+        "reconcile:late-ambiguous"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("execution_id", "identifier"),
+        ("execution_timestamp", "timestamp ordering"),
+        ("execution_receipt_state", "receipt"),
+        ("decision_digest", "request_digest"),
+        ("decision_binding", "binding"),
+        ("receipt_digest", "evidence_digest"),
+    ],
+)
+def test_deep_persisted_corruption_fails_before_projection(tmp_path, case, message):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix=case)
+    target = "execution"
+    target_id = execution["execution_id"]
+
+    if case.startswith("decision_"):
+        decision = store.create_decision(
+            execution_id=execution["execution_id"],
+            effect_id=execution["effect_id"],
+            proposal_ref=execution["proposal_ref"],
+            request_digest=_digest(f"request-{case}"),
+            allowed_choices=["once", "deny"],
+            expires_at=NOW + timedelta(minutes=5),
+            now=NOW,
+        )
+        target = "decision"
+        target_id = decision["decision_id"]
+    elif case == "receipt_digest":
+        evidence = _record_evidence(store, execution, suffix=case)
+        assert evidence["outcome"] == "succeeded"
+        terminal = store.transition_execution(
+            execution["execution_id"],
+            "terminal_succeeded",
+            now=NOW + timedelta(seconds=3),
+        )
+        target = "receipt"
+        target_id = terminal["receipt_id"]
+
+    with sqlite3.connect(store.database_path) as connection:
+        if case == "execution_id":
+            connection.execute(
+                "UPDATE executions SET execution_id='bad-id' WHERE execution_id=?",
+                (execution["execution_id"],),
+            )
+        elif case == "execution_timestamp":
+            connection.execute(
+                "UPDATE executions SET updated_at='2026-08-14T00:00:00.000000Z' "
+                "WHERE execution_id=?",
+                (execution["execution_id"],),
+            )
+        elif case == "execution_receipt_state":
+            connection.execute(
+                "UPDATE executions SET receipt_state='published', "
+                "receipt_id=? WHERE execution_id=?",
+                (
+                    f"rcp_{store.authority.profile_key}_{'f' * 32}",
+                    execution["execution_id"],
+                ),
+            )
+        elif case == "decision_digest":
+            connection.execute(
+                "UPDATE decisions SET request_digest='bad' WHERE decision_id=?",
+                (target_id,),
+            )
+        elif case == "decision_binding":
+            connection.execute(
+                "UPDATE decisions SET effect_id='effect:other' WHERE decision_id=?",
+                (target_id,),
+            )
+        elif case == "receipt_digest":
+            connection.execute(
+                "UPDATE receipts SET evidence_digest='bad' WHERE receipt_id=?",
+                (target_id,),
+            )
+        connection.commit()
+
+    with pytest.raises(ContractDataError, match=message):
+        if target == "execution":
+            store.list_executions()
+        elif target == "decision":
+            store.get_decision(target_id)
+        else:
+            store.get_receipt(target_id)

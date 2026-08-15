@@ -20,7 +20,7 @@ import json
 import re
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -121,6 +121,7 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 _ID_RE = re.compile(r"^(exe|dec|rcp|evt)_([0-9a-f]{12})_([0-9a-f]{32})$")
+_EVIDENCE_ID_RE = re.compile(r"^evd_([0-9a-f]{12})_([0-9a-f]{32})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -139,6 +140,10 @@ class ContractNotFoundError(ExecutionContractError):
 
 class ContractForbiddenError(ExecutionContractError):
     """An identifier belongs to a different profile authority."""
+
+
+class ContractUnauthorizedError(ExecutionContractError):
+    """The request did not present valid credentials for this contract."""
 
 
 class ContractConflictError(ExecutionContractError):
@@ -219,17 +224,31 @@ def _normalize_profile_name(profile_name: str) -> str:
     return clean
 
 
-def authority_identity(profile_name: str) -> AuthorityIdentity:
-    """Return the server-asserted authority identity for one Hermes profile."""
+def authority_identity(
+    profile_home: Path,
+    profile_name: Optional[str] = None,
+) -> AuthorityIdentity:
+    """Derive authority from the active profile home, never request routing.
 
-    clean = _normalize_profile_name(profile_name)
-    profile_id = f"hermes-profile:{clean}"
-    profile_key = hashlib.sha256(profile_id.encode("utf-8")).hexdigest()[:12]
+    The canonical home path is hashed rather than exposed. The resulting
+    profile-instance identity is deterministic for that durable home and is
+    persisted in ledger metadata, so moving a database to another profile
+    home fails closed.
+    """
+
+    canonical_home = Path(profile_home).expanduser().resolve(strict=False)
+    home_fingerprint = hashlib.sha256(
+        b"hermes-execution-profile-home-v1\x00"
+        + str(canonical_home).encode("utf-8")
+    ).hexdigest()
+    profile_key = home_fingerprint[:12]
+    clean = _normalize_profile_name(profile_name or canonical_home.name or "profile")
+    instance = home_fingerprint[:24]
     return AuthorityIdentity(
-        profile_id=profile_id,
+        profile_id=f"hermes-profile-instance:{instance}",
         profile_name=clean,
-        authority_id=f"hermes-execution-authority:{clean}",
-        executor_id=f"hermes-agent:{clean}",
+        authority_id=f"hermes-execution-authority:{instance}",
+        executor_id=f"hermes-agent-executor:{instance}",
         profile_key=profile_key,
     )
 
@@ -314,6 +333,12 @@ def _validated_cursor(after: int) -> int:
     return value
 
 
+def _validated_snapshot(value: Optional[int]) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    return _validated_cursor(cast(int, value))
+
+
 class ExecutionContractStore:
     """Profile-local durable authority store and read projection."""
 
@@ -321,13 +346,17 @@ class ExecutionContractStore:
         self,
         *,
         database_path: Optional[Path] = None,
-        profile_name: str = "default",
+        profile_home: Optional[Path] = None,
+        profile_name: Optional[str] = None,
         runtime_instance_id: Optional[str] = None,
     ) -> None:
-        self.database_path = database_path or (
-            get_hermes_home() / "execution_contract.sqlite3"
-        )
-        self.authority = authority_identity(profile_name)
+        active_home = Path(
+            profile_home
+            or (database_path.parent if database_path is not None else get_hermes_home())
+        ).expanduser().resolve(strict=False)
+        self.profile_home = active_home
+        self.database_path = database_path or (active_home / "execution_contract.sqlite3")
+        self.authority = authority_identity(active_home, profile_name)
         self.runtime_instance_id = runtime_instance_id or uuid.uuid4().hex
 
     # ------------------------------------------------------------------
@@ -394,6 +423,7 @@ class ExecutionContractStore:
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("PRAGMA busy_timeout=1000")
+            connection.execute("BEGIN")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version != STORE_SCHEMA_VERSION:
                 raise UnsupportedContractVersionError(
@@ -417,6 +447,8 @@ class ExecutionContractStore:
         try:
             yield connection
         finally:
+            with suppress(sqlite3.Error):
+                connection.rollback()
             connection.close()
 
     def _tighten_permissions(self) -> None:
@@ -770,6 +802,7 @@ class ExecutionContractStore:
                         receipt_state = "unproven"
                         event_reason = event_reason or "effect_evidence_missing"
                     else:
+                        self._evidence_from_row(evidence, connection=connection)
                         actual_lifecycle = f"terminal_{evidence['outcome']}"
                         receipt_id = self._publish_receipt_in_txn(
                             connection,
@@ -790,7 +823,11 @@ class ExecutionContractStore:
                     "ORDER BY ordinal ASC",
                     (execution_id,),
                 ).fetchall()
-                if actual_lifecycle in TERMINAL_EXECUTION_STATES:
+                closes_decisions = (
+                    actual_lifecycle in TERMINAL_EXECUTION_STATES
+                    or actual_lifecycle == "cancellation_requested"
+                )
+                if closes_decisions:
                     for decision in pending_decisions:
                         connection.execute(
                             """
@@ -846,7 +883,7 @@ class ExecutionContractStore:
                     revision=new_revision,
                 )
                 for decision in pending_decisions:
-                    if actual_lifecycle in TERMINAL_EXECUTION_STATES:
+                    if closes_decisions:
                         self._append_event_in_txn(
                             connection,
                             execution_id=execution_id,
@@ -854,7 +891,11 @@ class ExecutionContractStore:
                             from_lifecycle=actual_lifecycle,
                             to_lifecycle=actual_lifecycle,
                             decision_id=decision["decision_id"],
-                            reason_code="execution_terminal",
+                            reason_code=(
+                                "execution_terminal"
+                                if actual_lifecycle in TERMINAL_EXECUTION_STATES
+                                else "execution_cancellation_requested"
+                            ),
                             occurred_at=instant,
                             revision=new_revision,
                         )
@@ -910,6 +951,20 @@ class ExecutionContractStore:
                     receipt_state = (
                         "unproven" if row["effect_id"] else "not_applicable"
                     )
+                    pending_decisions = connection.execute(
+                        "SELECT * FROM decisions WHERE execution_id=? AND state='pending' "
+                        "ORDER BY ordinal ASC",
+                        (row["execution_id"],),
+                    ).fetchall()
+                    for decision in pending_decisions:
+                        connection.execute(
+                            """
+                            UPDATE decisions
+                            SET state='superseded', updated_at=?, revision=revision+1
+                            WHERE decision_id=? AND state='pending'
+                            """,
+                            (instant, decision["decision_id"]),
+                        )
                     connection.execute(
                         """
                         UPDATE executions
@@ -938,6 +993,18 @@ class ExecutionContractStore:
                         occurred_at=instant,
                         revision=revision,
                     )
+                    for decision in pending_decisions:
+                        self._append_event_in_txn(
+                            connection,
+                            execution_id=row["execution_id"],
+                            event_type="decision.superseded",
+                            from_lifecycle="terminal_ambiguous",
+                            to_lifecycle="terminal_ambiguous",
+                            decision_id=decision["decision_id"],
+                            reason_code="runtime_restarted",
+                            occurred_at=instant,
+                            revision=revision,
+                        )
                     recovered.append(str(row["execution_id"]))
             return recovered
         finally:
@@ -1005,8 +1072,23 @@ class ExecutionContractStore:
                 execution = self._execution_row(connection, execution_id)
                 if execution is None:
                     raise ContractNotFoundError("execution not found")
-                if execution["lifecycle"] in TERMINAL_EXECUTION_STATES:
-                    raise ContractConflictError("terminal execution cannot request a decision")
+                current_lifecycle = str(execution["lifecycle"])
+                pending = connection.execute(
+                    "SELECT decision_id FROM decisions "
+                    "WHERE execution_id=? AND state='pending' LIMIT 1",
+                    (execution_id,),
+                ).fetchone()
+                if pending is not None:
+                    raise ContractConflictError(
+                        "execution already has a pending decision"
+                    )
+                if "awaiting_decision" not in _ALLOWED_TRANSITIONS.get(
+                    current_lifecycle,
+                    frozenset(),
+                ):
+                    raise ContractConflictError(
+                        f"execution cannot request a decision from {current_lifecycle}"
+                    )
                 if execution["effect_id"] != effect_id:
                     raise ContractConflictError("decision effect binding mismatch")
                 if execution["proposal_ref"] != proposal_ref:
@@ -1037,15 +1119,6 @@ class ExecutionContractStore:
                             "decision request digest has conflicting bindings"
                         )
                     return self._decision_from_row(existing)
-                pending = connection.execute(
-                    "SELECT decision_id FROM decisions "
-                    "WHERE execution_id=? AND state='pending' LIMIT 1",
-                    (execution_id,),
-                ).fetchone()
-                if pending is not None:
-                    raise ContractConflictError(
-                        "execution already has a pending decision"
-                    )
                 connection.execute(
                     """
                     INSERT INTO decisions(
@@ -1076,15 +1149,23 @@ class ExecutionContractStore:
                     """
                     UPDATE executions
                     SET lifecycle='awaiting_decision', updated_at=?, revision=?
-                    WHERE execution_id=?
+                    WHERE execution_id=? AND revision=? AND lifecycle=?
                     """,
-                    (instant, revision, execution_id),
+                    (
+                        instant,
+                        revision,
+                        execution_id,
+                        execution["revision"],
+                        current_lifecycle,
+                    ),
                 )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ContractConflictError("execution decision transition conflict")
                 self._append_event_in_txn(
                     connection,
                     execution_id=execution_id,
                     event_type="decision.requested",
-                    from_lifecycle=execution["lifecycle"],
+                    from_lifecycle=current_lifecycle,
                     to_lifecycle="awaiting_decision",
                     decision_id=decision_id,
                     occurred_at=instant,
@@ -1155,6 +1236,17 @@ class ExecutionContractStore:
                 choices = json.loads(row["allowed_choices_json"])
                 if choice not in choices:
                     raise ContractValidationError("choice is not allowed")
+                execution = self._execution_row(connection, row["execution_id"])
+                if execution is None:
+                    raise ContractDataError("decision execution is missing")
+                current_lifecycle = str(execution["lifecycle"])
+                if "running" not in _ALLOWED_TRANSITIONS.get(
+                    current_lifecycle,
+                    frozenset(),
+                ):
+                    raise ContractConflictError(
+                        f"decision cannot resolve execution from {current_lifecycle}"
+                    )
                 connection.execute(
                     """
                     UPDATE decisions
@@ -1164,21 +1256,29 @@ class ExecutionContractStore:
                     """,
                     (choice, evidence_digest, instant, instant, decision_id, expected_revision),
                 )
-                execution = self._execution_row(connection, row["execution_id"])
-                assert execution is not None
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ContractConflictError("decision revision conflict")
                 execution_revision = int(execution["revision"]) + 1
                 connection.execute(
                     """
                     UPDATE executions SET lifecycle='running', updated_at=?, revision=?
-                    WHERE execution_id=?
+                    WHERE execution_id=? AND revision=? AND lifecycle=?
                     """,
-                    (instant, execution_revision, row["execution_id"]),
+                    (
+                        instant,
+                        execution_revision,
+                        row["execution_id"],
+                        execution["revision"],
+                        current_lifecycle,
+                    ),
                 )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ContractConflictError("execution decision transition conflict")
                 self._append_event_in_txn(
                     connection,
                     execution_id=row["execution_id"],
                     event_type="decision.resolved",
-                    from_lifecycle=execution["lifecycle"],
+                    from_lifecycle=current_lifecycle,
                     to_lifecycle="running",
                     decision_id=decision_id,
                     occurred_at=instant,
@@ -1286,6 +1386,17 @@ class ExecutionContractStore:
                     raise ContractNotFoundError("decision not found")
                 if row["state"] != "pending":
                     raise ContractConflictError("decision is not pending")
+                execution = self._execution_row(connection, row["execution_id"])
+                if execution is None:
+                    raise ContractDataError("decision execution is missing")
+                current_lifecycle = str(execution["lifecycle"])
+                if "running" not in _ALLOWED_TRANSITIONS.get(
+                    current_lifecycle,
+                    frozenset(),
+                ):
+                    raise ContractConflictError(
+                        f"decision cannot be superseded from {current_lifecycle}"
+                    )
                 connection.execute(
                     """
                     UPDATE decisions SET state='superseded', updated_at=?,
@@ -1293,21 +1404,29 @@ class ExecutionContractStore:
                     """,
                     (instant, decision_id),
                 )
-                execution = self._execution_row(connection, row["execution_id"])
-                assert execution is not None
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ContractConflictError("decision supersession conflict")
                 revision = int(execution["revision"]) + 1
                 connection.execute(
                     """
                     UPDATE executions SET lifecycle='running', updated_at=?, revision=?
-                    WHERE execution_id=?
+                    WHERE execution_id=? AND revision=? AND lifecycle=?
                     """,
-                    (instant, revision, row["execution_id"]),
+                    (
+                        instant,
+                        revision,
+                        row["execution_id"],
+                        execution["revision"],
+                        current_lifecycle,
+                    ),
                 )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ContractConflictError("execution decision transition conflict")
                 self._append_event_in_txn(
                     connection,
                     execution_id=row["execution_id"],
                     event_type="decision.superseded",
-                    from_lifecycle=execution["lifecycle"],
+                    from_lifecycle=current_lifecycle,
                     to_lifecycle="running",
                     decision_id=decision_id,
                     reason_code=reason_code,
@@ -1388,41 +1507,47 @@ class ExecutionContractStore:
                     raise ContractNotFoundError("execution not found")
                 if execution["effect_id"] != effect_id:
                     raise ContractConflictError("effect evidence binding mismatch")
-                bound_decisions = connection.execute(
-                    "SELECT * FROM decisions WHERE execution_id=? ORDER BY ordinal DESC",
+                if (
+                    execution["lifecycle"] == "terminal_ambiguous"
+                    and execution["receipt_state"] == "unproven"
+                ):
+                    raise ContractConflictError(
+                        "late ambiguous evidence requires the reconciliation path"
+                    )
+                latest_decision = connection.execute(
+                    "SELECT * FROM decisions WHERE execution_id=? "
+                    "ORDER BY ordinal DESC LIMIT 1",
                     (execution_id,),
-                ).fetchall()
-                if bound_decisions:
+                ).fetchone()
+                if latest_decision is not None:
+                    if latest_decision["state"] == "pending":
+                        raise ContractConflictError(
+                            "newer pending decision blocks effect evidence"
+                        )
+                    if latest_decision["state"] != "resolved":
+                        raise ContractConflictError(
+                            "latest decision does not authorize effect evidence"
+                        )
                     if not decision_id:
                         raise ContractConflictError(
-                            "effect evidence requires its exact decision binding"
+                            "effect evidence requires its exact decision binding to the "
+                            "latest resolved decision"
                         )
-                    matching = next(
-                        (
-                            row
-                            for row in bound_decisions
-                            if row["decision_id"] == decision_id
-                        ),
-                        None,
-                    )
-                    if matching is None:
+                    if latest_decision["decision_id"] != decision_id:
                         raise ContractConflictError(
-                            "effect evidence decision is not bound to the execution"
+                            "effect evidence is not bound to the latest decision"
                         )
-                    if matching["state"] != "resolved":
-                        raise ContractConflictError("decision is not resolved")
-                if decision_id:
-                    decision = connection.execute(
-                        "SELECT * FROM decisions WHERE decision_id=?",
-                        (decision_id,),
-                    ).fetchone()
-                    if decision is None:
-                        raise ContractNotFoundError("decision not found")
                     if (
-                        decision["execution_id"] != execution_id
-                        or decision["effect_id"] != effect_id
+                        latest_decision["execution_id"] != execution_id
+                        or latest_decision["effect_id"] != effect_id
+                        or latest_decision["proposal_ref"]
+                        != execution["proposal_ref"]
                     ):
                         raise ContractConflictError("decision evidence binding mismatch")
+                elif decision_id:
+                    raise ContractConflictError(
+                        "effect evidence decision is not bound to the execution"
+                    )
                 existing = connection.execute(
                     "SELECT * FROM effect_evidence WHERE execution_id=?",
                     (execution_id,),
@@ -1497,6 +1622,236 @@ class ExecutionContractStore:
         finally:
             connection.close()
 
+    def reconcile_ambiguous_evidence(
+        self,
+        *,
+        execution_id: str,
+        effect_id: str,
+        outcome: str,
+        subject_digest: str,
+        evidence_digest: str,
+        result_digest: str,
+        reconciliation_ref: str,
+        decision_id: Optional[str] = None,
+        recovery_ref: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Publish late authoritative ambiguous evidence in one transaction.
+
+        This path never upgrades an ambiguous execution to success. It exists
+        only for an executor that can later prove that the terminal outcome
+        itself was ambiguous; generic process, chat, session, or Kanban state
+        is not accepted as evidence.
+        """
+
+        self.initialize()
+        self._assert_identifier_scope(execution_id, "exe")
+        if outcome != "ambiguous":
+            raise ContractValidationError(
+                "late reconciliation only accepts authoritative ambiguous evidence"
+            )
+        effect_id = cast(
+            str,
+            _validated_ref(effect_id, field="effect_id", required=True),
+        )
+        subject_digest = cast(
+            str,
+            _validated_digest(subject_digest, field="subject_digest", required=True),
+        )
+        evidence_digest = cast(
+            str,
+            _validated_digest(
+                evidence_digest,
+                field="evidence_digest",
+                required=True,
+            ),
+        )
+        result_digest = cast(
+            str,
+            _validated_digest(result_digest, field="result_digest", required=True),
+        )
+        if decision_id:
+            self._assert_identifier_scope(decision_id, "dec")
+        recovery_ref = _validated_ref(recovery_ref, field="recovery_ref")
+        reconciliation_ref = cast(
+            str,
+            _validated_ref(
+                reconciliation_ref,
+                field="reconciliation_ref",
+                required=True,
+            ),
+        )
+        instant = _timestamp(now)
+        evidence_id = f"evd_{self.authority.profile_key}_{uuid.uuid4().hex}"
+        connection = self._connect_write()
+        try:
+            with write_txn(connection):
+                execution = self._execution_row(connection, execution_id)
+                if execution is None:
+                    raise ContractNotFoundError("execution not found")
+                if execution["effect_id"] != effect_id:
+                    raise ContractConflictError("effect evidence binding mismatch")
+                if (
+                    execution["lifecycle"] != "terminal_ambiguous"
+                    or execution["receipt_state"] != "unproven"
+                    or execution["receipt_id"] is not None
+                ):
+                    existing_receipt = connection.execute(
+                        "SELECT * FROM receipts WHERE execution_id=?",
+                        (execution_id,),
+                    ).fetchone()
+                    if existing_receipt is not None:
+                        immutable = (
+                            effect_id,
+                            outcome,
+                            subject_digest,
+                            evidence_digest,
+                            result_digest,
+                            decision_id,
+                            reconciliation_ref,
+                        )
+                        actual = (
+                            existing_receipt["effect_id"],
+                            existing_receipt["outcome"],
+                            existing_receipt["subject_digest"],
+                            existing_receipt["evidence_digest"],
+                            existing_receipt["result_digest"],
+                            existing_receipt["decision_id"],
+                            existing_receipt["reconciliation_ref"],
+                        )
+                        if immutable == actual:
+                            return self._receipt_from_row(
+                                existing_receipt,
+                                connection=connection,
+                            )
+                    raise ContractConflictError(
+                        "execution is not eligible for late ambiguous reconciliation"
+                    )
+
+                latest_decision = connection.execute(
+                    "SELECT * FROM decisions WHERE execution_id=? "
+                    "ORDER BY ordinal DESC LIMIT 1",
+                    (execution_id,),
+                ).fetchone()
+                if latest_decision is not None:
+                    if latest_decision["state"] == "pending":
+                        raise ContractConflictError(
+                            "newer pending decision blocks effect evidence"
+                        )
+                    if (
+                        latest_decision["state"] != "resolved"
+                        or latest_decision["decision_id"] != decision_id
+                        or latest_decision["effect_id"] != effect_id
+                        or latest_decision["proposal_ref"]
+                        != execution["proposal_ref"]
+                    ):
+                        raise ContractConflictError(
+                            "late evidence requires the latest resolved decision"
+                        )
+                elif decision_id:
+                    raise ContractConflictError(
+                        "effect evidence decision is not bound to the execution"
+                    )
+
+                existing_evidence = connection.execute(
+                    "SELECT * FROM effect_evidence WHERE execution_id=?",
+                    (execution_id,),
+                ).fetchone()
+                if existing_evidence is not None:
+                    raise ContractDataError(
+                        "late effect evidence exists without its transactional receipt"
+                    )
+
+                actual_recovery_ref = recovery_ref or execution["recovery_ref"]
+                connection.execute(
+                    """
+                    INSERT INTO effect_evidence(
+                        evidence_id, execution_id, profile_id, authority_id,
+                        executor_id, effect_id, outcome, subject_digest,
+                        evidence_digest, result_digest, decision_id, recovery_ref,
+                        reconciliation_ref, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evidence_id,
+                        execution_id,
+                        self.authority.profile_id,
+                        self.authority.authority_id,
+                        self.authority.executor_id,
+                        effect_id,
+                        outcome,
+                        subject_digest,
+                        evidence_digest,
+                        result_digest,
+                        decision_id,
+                        actual_recovery_ref,
+                        reconciliation_ref,
+                        instant,
+                    ),
+                )
+                evidence = connection.execute(
+                    "SELECT * FROM effect_evidence WHERE evidence_id=?",
+                    (evidence_id,),
+                ).fetchone()
+                assert evidence is not None
+                receipt_id = self._publish_receipt_in_txn(
+                    connection,
+                    row=execution,
+                    evidence=evidence,
+                    terminal_at=instant,
+                )
+                revision = int(execution["revision"]) + 1
+                connection.execute(
+                    """
+                    UPDATE executions
+                    SET receipt_state='published', receipt_id=?, updated_at=?,
+                        recovery_ref=?, revision=?, runtime_instance_id=?
+                    WHERE execution_id=? AND revision=?
+                    """,
+                    (
+                        receipt_id,
+                        instant,
+                        actual_recovery_ref,
+                        revision,
+                        self.runtime_instance_id,
+                        execution_id,
+                        execution["revision"],
+                    ),
+                )
+                if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                    raise ContractConflictError("execution reconciliation conflict")
+                self._append_event_in_txn(
+                    connection,
+                    execution_id=execution_id,
+                    event_type="effect.evidence_recorded",
+                    from_lifecycle="terminal_ambiguous",
+                    to_lifecycle="terminal_ambiguous",
+                    decision_id=decision_id,
+                    reason_code="late_ambiguous_evidence",
+                    occurred_at=instant,
+                    revision=revision,
+                )
+                self._append_event_in_txn(
+                    connection,
+                    execution_id=execution_id,
+                    event_type="receipt.published",
+                    from_lifecycle="terminal_ambiguous",
+                    to_lifecycle="terminal_ambiguous",
+                    decision_id=decision_id,
+                    receipt_id=receipt_id,
+                    reason_code="late_ambiguous_reconciliation",
+                    occurred_at=instant,
+                    revision=revision,
+                )
+                receipt = connection.execute(
+                    "SELECT * FROM receipts WHERE receipt_id=?",
+                    (receipt_id,),
+                ).fetchone()
+                assert receipt is not None
+                return self._receipt_from_row(receipt, connection=connection)
+        finally:
+            connection.close()
+
     def prune_events(
         self,
         *,
@@ -1561,18 +1916,26 @@ class ExecutionContractStore:
         after: int = 0,
         limit: int = DEFAULT_PAGE_SIZE,
         lifecycle: Optional[str] = None,
+        snapshot_high_water: Optional[int] = None,
     ) -> dict[str, Any]:
         after = _validated_cursor(after)
         limit = _validated_limit(limit)
+        snapshot_high_water = _validated_snapshot(snapshot_high_water)
         if lifecycle is not None and lifecycle not in EXECUTION_STATES:
             raise ContractValidationError("unknown execution lifecycle")
         with self._read_connection() as connection:
             if connection is None:
-                if after > 0:
+                if after > 0 or snapshot_high_water not in (None, 0):
                     raise ContractConflictError("execution cursor is ahead of high-water")
-                return self._collection_page([], after, 0, 0, False)
-            params: list[Any] = [after]
-            where = "ordinal > ?"
+                return self._collection_page([], after, 0, 0, False, 0)
+            pinned = self._pin_collection_snapshot(
+                connection,
+                table="executions",
+                after=after,
+                requested=snapshot_high_water,
+            )
+            params: list[Any] = [after, pinned]
+            where = "ordinal > ? AND ordinal <= ?"
             if lifecycle:
                 where += " AND lifecycle = ?"
                 params.append(lifecycle)
@@ -1585,9 +1948,9 @@ class ExecutionContractStore:
                 rows,
                 after=after,
                 limit=limit,
-                table="executions",
                 decoder=self._execution_from_row,
                 connection=connection,
+                snapshot_high_water=pinned,
             )
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:
@@ -1598,7 +1961,7 @@ class ExecutionContractStore:
             row = self._execution_row(connection, execution_id)
             if row is None:
                 raise ContractNotFoundError("execution not found")
-            return self._execution_from_row(row)
+            return self._execution_from_row(row, connection=connection)
 
     def get_execution_by_source_run_id(self, source_run_id: str) -> dict[str, Any]:
         source_run_id = cast(
@@ -1618,7 +1981,7 @@ class ExecutionContractStore:
             ).fetchone()
             if row is None:
                 raise ContractNotFoundError("execution not found")
-            return self._execution_from_row(row)
+            return self._execution_from_row(row, connection=connection)
 
     def list_decisions(
         self,
@@ -1626,18 +1989,26 @@ class ExecutionContractStore:
         after: int = 0,
         limit: int = DEFAULT_PAGE_SIZE,
         state: Optional[str] = None,
+        snapshot_high_water: Optional[int] = None,
     ) -> dict[str, Any]:
         after = _validated_cursor(after)
         limit = _validated_limit(limit)
+        snapshot_high_water = _validated_snapshot(snapshot_high_water)
         if state is not None and state not in DECISION_STATES:
             raise ContractValidationError("unknown decision state")
         with self._read_connection() as connection:
             if connection is None:
-                if after > 0:
+                if after > 0 or snapshot_high_water not in (None, 0):
                     raise ContractConflictError("decision cursor is ahead of high-water")
-                return self._collection_page([], after, 0, 0, False)
-            params: list[Any] = [after]
-            where = "ordinal > ?"
+                return self._collection_page([], after, 0, 0, False, 0)
+            pinned = self._pin_collection_snapshot(
+                connection,
+                table="decisions",
+                after=after,
+                requested=snapshot_high_water,
+            )
+            params: list[Any] = [after, pinned]
+            where = "ordinal > ? AND ordinal <= ?"
             if state:
                 where += " AND state = ?"
                 params.append(state)
@@ -1650,9 +2021,9 @@ class ExecutionContractStore:
                 rows,
                 after=after,
                 limit=limit,
-                table="decisions",
                 decoder=self._decision_from_row,
                 connection=connection,
+                snapshot_high_water=pinned,
             )
 
     def get_decision(self, decision_id: str) -> dict[str, Any]:
@@ -1666,7 +2037,7 @@ class ExecutionContractStore:
             ).fetchone()
             if row is None:
                 raise ContractNotFoundError("decision not found")
-            return self._decision_from_row(row)
+            return self._decision_from_row(row, connection=connection)
 
     def list_receipts(
         self,
@@ -1674,18 +2045,26 @@ class ExecutionContractStore:
         after: int = 0,
         limit: int = DEFAULT_PAGE_SIZE,
         outcome: Optional[str] = None,
+        snapshot_high_water: Optional[int] = None,
     ) -> dict[str, Any]:
         after = _validated_cursor(after)
         limit = _validated_limit(limit)
+        snapshot_high_water = _validated_snapshot(snapshot_high_water)
         if outcome is not None and outcome not in RECEIPT_OUTCOMES:
             raise ContractValidationError("unknown receipt outcome")
         with self._read_connection() as connection:
             if connection is None:
-                if after > 0:
+                if after > 0 or snapshot_high_water not in (None, 0):
                     raise ContractConflictError("receipt cursor is ahead of high-water")
-                return self._collection_page([], after, 0, 0, False)
-            params: list[Any] = [after]
-            where = "ordinal > ?"
+                return self._collection_page([], after, 0, 0, False, 0)
+            pinned = self._pin_collection_snapshot(
+                connection,
+                table="receipts",
+                after=after,
+                requested=snapshot_high_water,
+            )
+            params: list[Any] = [after, pinned]
+            where = "ordinal > ? AND ordinal <= ?"
             if outcome:
                 where += " AND outcome = ?"
                 params.append(outcome)
@@ -1698,9 +2077,9 @@ class ExecutionContractStore:
                 rows,
                 after=after,
                 limit=limit,
-                table="receipts",
                 decoder=self._receipt_from_row,
                 connection=connection,
+                snapshot_high_water=pinned,
             )
 
     def get_receipt(self, receipt_id: str) -> dict[str, Any]:
@@ -1714,7 +2093,7 @@ class ExecutionContractStore:
             ).fetchone()
             if row is None:
                 raise ContractNotFoundError("receipt not found")
-            return self._receipt_from_row(row)
+            return self._receipt_from_row(row, connection=connection)
 
     def list_events(
         self,
@@ -1722,18 +2101,20 @@ class ExecutionContractStore:
         after: int = 0,
         limit: int = DEFAULT_PAGE_SIZE,
         execution_id: Optional[str] = None,
+        snapshot_high_water: Optional[int] = None,
     ) -> dict[str, Any]:
         after = _validated_cursor(after)
         limit = _validated_limit(limit)
+        snapshot_high_water = _validated_snapshot(snapshot_high_water)
         if execution_id:
             self._assert_identifier_scope(execution_id, "exe")
         with self._read_connection() as connection:
             if connection is None:
-                if after > 0:
+                if after > 0 or snapshot_high_water not in (None, 0):
                     raise ContractConflictError(
                         "event cursor is ahead of high-water"
                     )
-                return self._event_page([], after, 0, 1, False, 0)
+                return self._event_page([], after, 0, 1, False, 0, 0)
             current_high_water = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM execution_events"
@@ -1745,7 +2126,16 @@ class ExecutionContractStore:
                     "WHERE key='events_pruned_through'"
                 ).fetchone()[0]
             )
-            high_water = max(current_high_water, pruned_through)
+            available_high_water = max(current_high_water, pruned_through)
+            high_water = (
+                available_high_water
+                if snapshot_high_water is None
+                else snapshot_high_water
+            )
+            if high_water > available_high_water:
+                raise ContractConflictError("event snapshot is ahead of high-water")
+            if after > high_water:
+                raise ContractConflictError("event cursor is ahead of snapshot")
             minimum_available_row = connection.execute(
                 "SELECT MIN(sequence) FROM execution_events"
             ).fetchone()
@@ -1756,10 +2146,9 @@ class ExecutionContractStore:
             )
             if after < pruned_through:
                 raise ContractCursorGoneError(minimum_available, high_water)
-            if after > high_water:
-                raise ContractConflictError("event cursor is ahead of high-water")
-            params: list[Any] = [after]
-            where = "sequence > ?"
+            self._after_snapshot_pinned("events", high_water)
+            params: list[Any] = [after, high_water]
+            where = "sequence > ? AND sequence <= ?"
             if execution_id:
                 where += " AND execution_id = ?"
                 params.append(execution_id)
@@ -1777,12 +2166,13 @@ class ExecutionContractStore:
                 else high_water
             )
             return self._event_page(
-                [self._event_from_row(row) for row in visible],
+                [self._event_from_row(row, connection=connection) for row in visible],
                 cursor,
                 high_water,
                 minimum_available,
                 has_more,
                 pruned_through,
+                high_water,
             )
 
     # ------------------------------------------------------------------
@@ -1935,17 +2325,165 @@ class ExecutionContractStore:
                 "persisted row authority does not match the active profile"
             )
 
-    def _execution_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _persisted_identifier(
+        self,
+        value: Any,
+        kind: str,
+        *,
+        nullable: bool = False,
+    ) -> Optional[str]:
+        if value is None and nullable:
+            return None
+        try:
+            self._assert_identifier_scope(str(value or ""), kind)
+        except (ContractValidationError, ContractForbiddenError) as exc:
+            raise ContractDataError(f"persisted {kind} identifier is invalid") from exc
+        return str(value)
+
+    @staticmethod
+    def _persisted_ref(
+        value: Any,
+        *,
+        field: str,
+        required: bool = False,
+        max_length: int = 512,
+    ) -> Optional[str]:
+        try:
+            return _validated_ref(
+                value,
+                field=field,
+                required=required,
+                max_length=max_length,
+            )
+        except ContractValidationError as exc:
+            raise ContractDataError(f"persisted {field} is invalid") from exc
+
+    @staticmethod
+    def _persisted_digest(
+        value: Any,
+        *,
+        field: str,
+        required: bool,
+    ) -> Optional[str]:
+        try:
+            return _validated_digest(value, field=field, required=required)
+        except ContractValidationError as exc:
+            raise ContractDataError(f"persisted {field} is invalid") from exc
+
+    @staticmethod
+    def _persisted_revision(value: Any, *, field: str = "revision") -> int:
+        if isinstance(value, bool):
+            raise ContractDataError(f"persisted {field} is invalid")
+        try:
+            revision = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ContractDataError(f"persisted {field} is invalid") from exc
+        if revision < 1:
+            raise ContractDataError(f"persisted {field} is invalid")
+        return revision
+
+    @staticmethod
+    def _ordered_timestamps(
+        *,
+        created: datetime,
+        updated: datetime,
+        started: Optional[datetime] = None,
+        terminal: Optional[datetime] = None,
+    ) -> None:
+        if updated < created:
+            raise ContractDataError("persisted timestamp ordering is invalid")
+        if started is not None and (started < created or started > updated):
+            raise ContractDataError("persisted timestamp ordering is invalid")
+        if terminal is not None and (terminal < created or terminal > updated):
+            raise ContractDataError("persisted timestamp ordering is invalid")
+
+    def _execution_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, Any]:
         self._assert_row_authority(row, require_executor=True)
+        execution_id = cast(str, self._persisted_identifier(row["execution_id"], "exe"))
         lifecycle = str(row["lifecycle"])
         receipt_state = str(row["receipt_state"])
         if lifecycle not in EXECUTION_STATES or receipt_state not in RECEIPT_STATES:
             raise ContractDataError("execution row contains an unknown state")
-        for field in ("created_at", "updated_at"):
-            _parse_timestamp(row[field], field=field)
-        for field in ("started_at", "terminal_at"):
-            if row[field] is not None:
-                _parse_timestamp(row[field], field=field)
+        source_run_id = self._persisted_ref(row["source_run_id"], field="source_run_id")
+        work_ref = self._persisted_ref(row["work_ref"], field="work_ref")
+        proposal_ref = self._persisted_ref(row["proposal_ref"], field="proposal_ref")
+        effect_id = self._persisted_ref(row["effect_id"], field="effect_id")
+        recovery_ref = self._persisted_ref(row["recovery_ref"], field="recovery_ref")
+        self._persisted_ref(
+            row["runtime_instance_id"],
+            field="runtime_instance_id",
+            required=True,
+        )
+        revision = self._persisted_revision(row["revision"])
+        created = _parse_timestamp(row["created_at"], field="created_at")
+        updated = _parse_timestamp(row["updated_at"], field="updated_at")
+        started = (
+            _parse_timestamp(row["started_at"], field="started_at")
+            if row["started_at"] is not None
+            else None
+        )
+        terminal = (
+            _parse_timestamp(row["terminal_at"], field="terminal_at")
+            if row["terminal_at"] is not None
+            else None
+        )
+        self._ordered_timestamps(
+            created=created,
+            updated=updated,
+            started=started,
+            terminal=terminal,
+        )
+        is_terminal = lifecycle in TERMINAL_EXECUTION_STATES
+        if is_terminal != (terminal is not None):
+            raise ContractDataError("execution terminal timestamp invariant failed")
+        if effect_id and not (work_ref and proposal_ref):
+            raise ContractDataError("execution effect binding is incomplete")
+        receipt_id = self._persisted_identifier(
+            row["receipt_id"],
+            "rcp",
+            nullable=True,
+        )
+        if effect_id is None:
+            if receipt_state != "not_applicable" or receipt_id is not None:
+                raise ContractDataError("effect-free execution has receipt state")
+        elif receipt_state == "not_applicable":
+            raise ContractDataError("effect execution has non-applicable receipt state")
+        elif receipt_state == "pending_evidence":
+            if is_terminal or receipt_id is not None:
+                raise ContractDataError("pending evidence execution is terminal")
+        elif receipt_state == "unproven":
+            if lifecycle != "terminal_ambiguous" or receipt_id is not None:
+                raise ContractDataError("unproven execution is not terminal ambiguous")
+        elif receipt_state == "published":
+            if not is_terminal or receipt_id is None:
+                raise ContractDataError("published execution is missing its receipt")
+        if effect_id and is_terminal and lifecycle != "terminal_ambiguous" and (
+            receipt_state != "published"
+        ):
+            raise ContractDataError("proven terminal execution is missing its receipt")
+        if connection is not None and receipt_id is not None:
+            receipt = connection.execute(
+                "SELECT * FROM receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if receipt is None or (
+                receipt["execution_id"] != execution_id
+                or receipt["effect_id"] != effect_id
+            ):
+                raise ContractDataError("execution receipt binding is invalid")
+            self._receipt_from_row(receipt, connection=connection)
+        if connection is not None and effect_id is not None:
+            evidence = connection.execute(
+                "SELECT * FROM effect_evidence WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if evidence is not None:
+                self._evidence_from_row(evidence, connection=connection)
         freshness = "terminal" if lifecycle in TERMINAL_EXECUTION_STATES else (
             "live"
             if row["runtime_instance_id"] == self.runtime_instance_id
@@ -1953,28 +2491,35 @@ class ExecutionContractStore:
         )
         return {
             "contract_version": CONTRACT_VERSION,
-            "execution_id": row["execution_id"],
+            "execution_id": execution_id,
             "profile_id": row["profile_id"],
             "authority_id": row["authority_id"],
             "executor_id": row["executor_id"],
-            "source_run_id": row["source_run_id"],
-            "work_ref": row["work_ref"],
-            "proposal_ref": row["proposal_ref"],
-            "effect_id": row["effect_id"],
+            "source_run_id": source_run_id,
+            "work_ref": work_ref,
+            "proposal_ref": proposal_ref,
+            "effect_id": effect_id,
             "lifecycle": lifecycle,
             "freshness": freshness,
             "receipt_state": receipt_state,
-            "receipt_id": row["receipt_id"],
+            "receipt_id": receipt_id,
             "created_at": row["created_at"],
             "started_at": row["started_at"],
             "updated_at": row["updated_at"],
             "terminal_at": row["terminal_at"],
-            "recovery_ref": row["recovery_ref"],
-            "revision": int(row["revision"]),
+            "recovery_ref": recovery_ref,
+            "revision": revision,
         }
 
-    def _decision_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _decision_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, Any]:
         self._assert_row_authority(row, require_executor=False)
+        decision_id = cast(str, self._persisted_identifier(row["decision_id"], "dec"))
+        execution_id = cast(str, self._persisted_identifier(row["execution_id"], "exe"))
         state = str(row["state"])
         if state not in DECISION_STATES:
             raise ContractDataError("decision row contains an unknown state")
@@ -1982,97 +2527,372 @@ class ExecutionContractStore:
             choices = json.loads(row["allowed_choices_json"])
         except (TypeError, json.JSONDecodeError) as exc:
             raise ContractDataError("decision choices are malformed") from exc
-        if not isinstance(choices, list) or not choices or not all(
-            isinstance(choice, str) for choice in choices
-        ):
-            raise ContractDataError("decision choices are malformed")
-        for field in ("created_at", "updated_at", "expires_at"):
-            _parse_timestamp(row[field], field=field)
-        if row["resolved_at"] is not None:
+        try:
+            choices = _validated_choices(choices)
+        except ContractValidationError as exc:
+            raise ContractDataError("decision choices are malformed") from exc
+        effect_id = cast(
+            str,
+            self._persisted_ref(row["effect_id"], field="effect_id", required=True),
+        )
+        proposal_ref = cast(
+            str,
+            self._persisted_ref(
+                row["proposal_ref"],
+                field="proposal_ref",
+                required=True,
+            ),
+        )
+        request_digest = cast(
+            str,
+            self._persisted_digest(
+                row["request_digest"],
+                field="request_digest",
+                required=True,
+            ),
+        )
+        candidate_digest = self._persisted_digest(
+            row["candidate_digest"],
+            field="candidate_digest",
+            required=False,
+        )
+        policy_digest = self._persisted_digest(
+            row["policy_digest"],
+            field="policy_digest",
+            required=False,
+        )
+        resolution_digest = self._persisted_digest(
+            row["resolution_evidence_digest"],
+            field="resolution_evidence_digest",
+            required=state == "resolved",
+        )
+        revision = self._persisted_revision(row["revision"])
+        created = _parse_timestamp(row["created_at"], field="created_at")
+        updated = _parse_timestamp(row["updated_at"], field="updated_at")
+        expires = _parse_timestamp(row["expires_at"], field="expires_at")
+        resolved = (
             _parse_timestamp(row["resolved_at"], field="resolved_at")
+            if row["resolved_at"] is not None
+            else None
+        )
+        if updated < created or expires <= created:
+            raise ContractDataError("decision timestamp ordering is invalid")
+        if resolved is not None and (resolved < created or resolved > updated):
+            raise ContractDataError("decision timestamp ordering is invalid")
+        choice = row["choice"]
+        if state == "resolved":
+            if choice not in choices or resolution_digest is None or resolved is None:
+                raise ContractDataError("resolved decision evidence is incomplete")
+            if revision < 2:
+                raise ContractDataError("resolved decision revision is invalid")
+        elif choice is not None or resolution_digest is not None or resolved is not None:
+            raise ContractDataError("unresolved decision contains resolution evidence")
+        elif state != "pending" and revision < 2:
+            raise ContractDataError("closed decision revision is invalid")
+        if connection is not None:
+            execution = self._execution_row(connection, execution_id)
+            if execution is None:
+                raise ContractDataError("decision execution is missing")
+            self._assert_row_authority(execution, require_executor=True)
+            self._execution_from_row(execution)
+            if (
+                execution["effect_id"] != effect_id
+                or execution["proposal_ref"] != proposal_ref
+            ):
+                raise ContractDataError("decision execution binding is invalid")
+            if state == "pending" and execution["lifecycle"] != "awaiting_decision":
+                raise ContractDataError("pending decision execution state is invalid")
         return {
             "contract_version": CONTRACT_VERSION,
-            "decision_id": row["decision_id"],
-            "execution_id": row["execution_id"],
+            "decision_id": decision_id,
+            "execution_id": execution_id,
             "profile_id": row["profile_id"],
             "authority_id": row["authority_id"],
-            "effect_id": row["effect_id"],
-            "proposal_ref": row["proposal_ref"],
-            "request_digest": row["request_digest"],
-            "candidate_digest": row["candidate_digest"],
-            "policy_digest": row["policy_digest"],
+            "effect_id": effect_id,
+            "proposal_ref": proposal_ref,
+            "request_digest": request_digest,
+            "candidate_digest": candidate_digest,
+            "policy_digest": policy_digest,
             "allowed_choices": choices,
             "expires_at": row["expires_at"],
             "state": state,
-            "choice": row["choice"],
-            "resolution_evidence_digest": row["resolution_evidence_digest"],
+            "choice": choice,
+            "resolution_evidence_digest": resolution_digest,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "resolved_at": row["resolved_at"],
-            "revision": int(row["revision"]),
+            "revision": revision,
         }
 
-    def _receipt_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _receipt_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, Any]:
         self._assert_row_authority(row, require_executor=True)
+        receipt_id = cast(str, self._persisted_identifier(row["receipt_id"], "rcp"))
+        execution_id = cast(str, self._persisted_identifier(row["execution_id"], "exe"))
         outcome = str(row["outcome"])
         if outcome not in RECEIPT_OUTCOMES:
             raise ContractDataError("receipt row contains an unknown outcome")
-        _parse_timestamp(row["terminal_at"], field="terminal_at")
+        effect_id = cast(
+            str,
+            self._persisted_ref(row["effect_id"], field="effect_id", required=True),
+        )
+        subject_digest = cast(
+            str,
+            self._persisted_digest(
+                row["subject_digest"],
+                field="subject_digest",
+                required=True,
+            ),
+        )
+        evidence_digest = cast(
+            str,
+            self._persisted_digest(
+                row["evidence_digest"],
+                field="evidence_digest",
+                required=True,
+            ),
+        )
+        result_digest = cast(
+            str,
+            self._persisted_digest(
+                row["result_digest"],
+                field="result_digest",
+                required=True,
+            ),
+        )
+        decision_id = self._persisted_identifier(
+            row["decision_id"],
+            "dec",
+            nullable=True,
+        )
+        recovery_ref = self._persisted_ref(row["recovery_ref"], field="recovery_ref")
+        reconciliation_ref = self._persisted_ref(
+            row["reconciliation_ref"],
+            field="reconciliation_ref",
+        )
+        terminal = _parse_timestamp(row["terminal_at"], field="terminal_at")
+        revision = self._persisted_revision(row["revision"])
+        if revision != 1:
+            raise ContractDataError("receipt revision must be immutable at one")
+        if connection is not None:
+            execution = self._execution_row(connection, execution_id)
+            if execution is None:
+                raise ContractDataError("receipt execution is missing")
+            self._assert_row_authority(execution, require_executor=True)
+            self._execution_from_row(execution)
+            expected_lifecycle = f"terminal_{outcome}"
+            if (
+                execution["effect_id"] != effect_id
+                or execution["receipt_id"] != receipt_id
+                or execution["receipt_state"] != "published"
+                or execution["lifecycle"] != expected_lifecycle
+            ):
+                raise ContractDataError("receipt execution invariant failed")
+            execution_terminal = _parse_timestamp(
+                execution["terminal_at"],
+                field="execution_terminal_at",
+            )
+            if terminal < execution_terminal:
+                raise ContractDataError("receipt terminal timestamp precedes execution")
+            evidence = connection.execute(
+                "SELECT * FROM effect_evidence WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if evidence is None:
+                raise ContractDataError("receipt effect evidence is missing")
+            self._evidence_from_row(evidence, connection=connection)
+            for field, expected in (
+                ("effect_id", effect_id),
+                ("outcome", outcome),
+                ("subject_digest", subject_digest),
+                ("evidence_digest", evidence_digest),
+                ("result_digest", result_digest),
+                ("decision_id", decision_id),
+            ):
+                if evidence[field] != expected:
+                    raise ContractDataError("receipt evidence binding is invalid")
+            if decision_id is not None:
+                decision = connection.execute(
+                    "SELECT * FROM decisions WHERE decision_id=?",
+                    (decision_id,),
+                ).fetchone()
+                if decision is None or (
+                    decision["execution_id"] != execution_id
+                    or decision["effect_id"] != effect_id
+                    or decision["state"] != "resolved"
+                ):
+                    raise ContractDataError("receipt decision binding is invalid")
         return {
             "contract_version": CONTRACT_VERSION,
-            "receipt_id": row["receipt_id"],
-            "execution_id": row["execution_id"],
-            "effect_id": row["effect_id"],
+            "receipt_id": receipt_id,
+            "execution_id": execution_id,
+            "effect_id": effect_id,
             "profile_id": row["profile_id"],
             "authority_id": row["authority_id"],
             "executor_id": row["executor_id"],
             "outcome": outcome,
-            "subject_digest": row["subject_digest"],
-            "evidence_digest": row["evidence_digest"],
-            "result_digest": row["result_digest"],
+            "subject_digest": subject_digest,
+            "evidence_digest": evidence_digest,
+            "result_digest": result_digest,
             "terminal_at": row["terminal_at"],
-            "decision_id": row["decision_id"],
-            "recovery_ref": row["recovery_ref"],
-            "reconciliation_ref": row["reconciliation_ref"],
-            "revision": int(row["revision"]),
+            "decision_id": decision_id,
+            "recovery_ref": recovery_ref,
+            "reconciliation_ref": reconciliation_ref,
+            "revision": revision,
         }
 
-    def _event_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _event_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, Any]:
         self._assert_row_authority(row, require_executor=False)
+        event_id = cast(str, self._persisted_identifier(row["event_id"], "evt"))
+        execution_id = cast(str, self._persisted_identifier(row["execution_id"], "exe"))
         event_type = str(row["event_type"])
         if event_type not in EVENT_TYPES:
             raise ContractDataError("event row contains an unknown type")
+        try:
+            sequence = int(row["sequence"])
+        except (TypeError, ValueError) as exc:
+            raise ContractDataError("event sequence is invalid") from exc
+        if sequence < 1:
+            raise ContractDataError("event sequence is invalid")
+        from_lifecycle = row["from_lifecycle"]
+        to_lifecycle = row["to_lifecycle"]
+        if from_lifecycle is not None and from_lifecycle not in EXECUTION_STATES:
+            raise ContractDataError("event from lifecycle is invalid")
+        if to_lifecycle is not None and to_lifecycle not in EXECUTION_STATES:
+            raise ContractDataError("event to lifecycle is invalid")
+        decision_id = self._persisted_identifier(
+            row["decision_id"],
+            "dec",
+            nullable=True,
+        )
+        receipt_id = self._persisted_identifier(
+            row["receipt_id"],
+            "rcp",
+            nullable=True,
+        )
+        reason_code = self._persisted_ref(
+            row["reason_code"],
+            field="reason_code",
+            max_length=128,
+        )
         _parse_timestamp(row["occurred_at"], field="occurred_at")
+        revision = self._persisted_revision(row["revision"])
+        if connection is not None:
+            execution = self._execution_row(connection, execution_id)
+            if execution is None:
+                raise ContractDataError("event execution is missing")
+            self._assert_row_authority(execution, require_executor=True)
+            self._execution_from_row(execution)
+            if decision_id is not None:
+                decision = connection.execute(
+                    "SELECT * FROM decisions WHERE decision_id=?",
+                    (decision_id,),
+                ).fetchone()
+                if decision is None or decision["execution_id"] != execution_id:
+                    raise ContractDataError("event decision binding is invalid")
+                self._decision_from_row(decision)
+            if receipt_id is not None:
+                receipt = connection.execute(
+                    "SELECT * FROM receipts WHERE receipt_id=?",
+                    (receipt_id,),
+                ).fetchone()
+                if receipt is None or receipt["execution_id"] != execution_id:
+                    raise ContractDataError("event receipt binding is invalid")
+                self._receipt_from_row(receipt, connection=connection)
         return {
             "contract_version": CONTRACT_VERSION,
-            "sequence": int(row["sequence"]),
-            "event_id": row["event_id"],
-            "execution_id": row["execution_id"],
+            "sequence": sequence,
+            "event_id": event_id,
+            "execution_id": execution_id,
             "profile_id": row["profile_id"],
             "authority_id": row["authority_id"],
             "event_type": event_type,
-            "from_lifecycle": row["from_lifecycle"],
-            "to_lifecycle": row["to_lifecycle"],
-            "decision_id": row["decision_id"],
-            "receipt_id": row["receipt_id"],
-            "reason_code": row["reason_code"],
+            "from_lifecycle": from_lifecycle,
+            "to_lifecycle": to_lifecycle,
+            "decision_id": decision_id,
+            "receipt_id": receipt_id,
+            "reason_code": reason_code,
             "occurred_at": row["occurred_at"],
-            "revision": int(row["revision"]),
+            "revision": revision,
         }
 
-    def _evidence_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _evidence_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        connection: Optional[sqlite3.Connection] = None,
+    ) -> dict[str, Any]:
         self._assert_row_authority(row, require_executor=True)
+        evidence_match = _EVIDENCE_ID_RE.fullmatch(str(row["evidence_id"] or ""))
+        if (
+            evidence_match is None
+            or evidence_match.group(1) != self.authority.profile_key
+        ):
+            raise ContractDataError("persisted evidence identifier is invalid")
+        execution_id = cast(str, self._persisted_identifier(row["execution_id"], "exe"))
+        effect_id = cast(
+            str,
+            self._persisted_ref(row["effect_id"], field="effect_id", required=True),
+        )
+        outcome = str(row["outcome"])
+        if outcome not in RECEIPT_OUTCOMES:
+            raise ContractDataError("effect evidence outcome is invalid")
+        digests = {
+            field: cast(
+                str,
+                self._persisted_digest(row[field], field=field, required=True),
+            )
+            for field in ("subject_digest", "evidence_digest", "result_digest")
+        }
+        decision_id = self._persisted_identifier(
+            row["decision_id"],
+            "dec",
+            nullable=True,
+        )
+        recovery_ref = self._persisted_ref(row["recovery_ref"], field="recovery_ref")
+        reconciliation_ref = self._persisted_ref(
+            row["reconciliation_ref"],
+            field="reconciliation_ref",
+        )
+        _parse_timestamp(row["recorded_at"], field="recorded_at")
+        if connection is not None:
+            execution = self._execution_row(connection, execution_id)
+            if execution is None or execution["effect_id"] != effect_id:
+                raise ContractDataError("effect evidence execution binding is invalid")
+            latest_decision = connection.execute(
+                "SELECT * FROM decisions WHERE execution_id=? "
+                "ORDER BY ordinal DESC LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+            if latest_decision is None:
+                if decision_id is not None:
+                    raise ContractDataError("effect evidence decision is unbound")
+            elif (
+                latest_decision["decision_id"] != decision_id
+                or latest_decision["state"] != "resolved"
+                or latest_decision["effect_id"] != effect_id
+            ):
+                raise ContractDataError("effect evidence decision binding is invalid")
         return {
             "evidence_id": row["evidence_id"],
-            "execution_id": row["execution_id"],
-            "effect_id": row["effect_id"],
-            "outcome": row["outcome"],
-            "subject_digest": row["subject_digest"],
-            "evidence_digest": row["evidence_digest"],
-            "result_digest": row["result_digest"],
-            "decision_id": row["decision_id"],
-            "recovery_ref": row["recovery_ref"],
-            "reconciliation_ref": row["reconciliation_ref"],
+            "execution_id": execution_id,
+            "effect_id": effect_id,
+            "outcome": outcome,
+            "subject_digest": digests["subject_digest"],
+            "evidence_digest": digests["evidence_digest"],
+            "result_digest": digests["result_digest"],
+            "decision_id": decision_id,
+            "recovery_ref": recovery_ref,
+            "reconciliation_ref": reconciliation_ref,
             "recorded_at": row["recorded_at"],
         }
 
@@ -2082,29 +2902,49 @@ class ExecutionContractStore:
         *,
         after: int,
         limit: int,
-        table: str,
         decoder,
         connection: sqlite3.Connection,
+        snapshot_high_water: int,
     ) -> dict[str, Any]:
         visible = rows[:limit]
-        high_water = int(
-            connection.execute(f"SELECT COALESCE(MAX(ordinal), 0) FROM {table}").fetchone()[0]
-        )
-        if after > high_water:
-            raise ContractConflictError(f"{table} cursor is ahead of high-water")
         has_more = len(rows) > limit
         cursor = (
             int(visible[-1]["ordinal"])
             if has_more and visible
-            else high_water
+            else snapshot_high_water
         )
         return self._collection_page(
-            [decoder(row) for row in visible],
+            [decoder(row, connection=connection) for row in visible],
             cursor,
-            high_water,
-            1 if high_water else 0,
+            snapshot_high_water,
+            1 if snapshot_high_water else 0,
             has_more,
+            snapshot_high_water,
         )
+
+    def _pin_collection_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        after: int,
+        requested: Optional[int],
+    ) -> int:
+        available = int(
+            connection.execute(
+                f"SELECT COALESCE(MAX(ordinal), 0) FROM {table}"
+            ).fetchone()[0]
+        )
+        pinned = available if requested is None else requested
+        if pinned > available:
+            raise ContractConflictError(f"{table} snapshot is ahead of high-water")
+        if after > pinned:
+            raise ContractConflictError(f"{table} cursor is ahead of snapshot")
+        self._after_snapshot_pinned(table, pinned)
+        return pinned
+
+    def _after_snapshot_pinned(self, _collection: str, _high_water: int) -> None:
+        """Test seam called inside the pinned SQLite read transaction."""
 
     @staticmethod
     def _collection_page(
@@ -2113,12 +2953,14 @@ class ExecutionContractStore:
         high_water: int,
         minimum_available: int,
         has_more: bool,
+        snapshot_high_water: int,
     ) -> dict[str, Any]:
         return {
             "items": items,
             "page": {
                 "cursor": cursor,
                 "high_water": high_water,
+                "snapshot_high_water": snapshot_high_water,
                 "minimum_available": minimum_available,
                 "has_more": has_more,
                 "completeness": "complete",
@@ -2133,12 +2975,14 @@ class ExecutionContractStore:
         minimum_available: int,
         has_more: bool,
         pruned_through: int,
+        snapshot_high_water: int,
     ) -> dict[str, Any]:
         return {
             "items": events,
             "page": {
                 "cursor": cursor,
                 "high_water": high_water,
+                "snapshot_high_water": snapshot_high_water,
                 "minimum_available": minimum_available,
                 "has_more": has_more,
                 "completeness": "complete",
@@ -2148,8 +2992,11 @@ class ExecutionContractStore:
         }
 
 
-def contract_capabilities(profile_name: str) -> dict[str, Any]:
-    authority = authority_identity(profile_name)
+def contract_capabilities(
+    profile_home: Path,
+    profile_name: Optional[str] = None,
+) -> dict[str, Any]:
+    authority = authority_identity(profile_home, profile_name)
     return {
         "contract_version": CONTRACT_VERSION,
         "api_version": API_VERSION,

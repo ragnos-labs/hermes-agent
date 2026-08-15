@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from jsonschema import Draft202012Validator
 
 from gateway.config import (
     GatewayConfig,
@@ -22,6 +24,7 @@ from hermes_cli.execution_contract import (
     ContractRateLimitedError,
     ContractUnavailableError,
     canonical_digest,
+    contract_schema,
 )
 
 
@@ -32,6 +35,10 @@ NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 
 def _auth(key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"}
+
+
+def _assert_closed_error(payload: dict) -> None:
+    Draft202012Validator(contract_schema()["$defs"]["errorDetail"]).validate(payload)
 
 
 @pytest.fixture
@@ -92,12 +99,11 @@ async def test_read_key_is_side_effect_free_and_returns_asserted_authority(
         assert capabilities_response.status == 200
         capabilities = await capabilities_response.json()
         assert capabilities["contract_version"] == CONTRACT_VERSION
-        assert capabilities["authority"] == {
-            "profile_id": "hermes-profile:default",
-            "profile_name": "default",
-            "authority_id": "hermes-execution-authority:default",
-            "executor_id": "hermes-agent:default",
-        }
+        assert capabilities["authority"] == store.authority.public()
+        assert capabilities["authority"]["profile_id"].startswith(
+            "hermes-profile-instance:"
+        )
+        assert not capabilities["authority"]["profile_id"].endswith(":default")
         assert capabilities["features"]["action_dispatch"] is False
 
         list_response = await client.get(
@@ -156,6 +162,8 @@ async def test_read_scope_is_accepted_only_for_contract_gets(contract_adapter):
             headers=_auth("wrong-token-0123456789abcdef"),
         )
         assert missing.status == invalid.status == 401
+        _assert_closed_error(await missing.json())
+        _assert_closed_error(await invalid.json())
 
 
 @pytest.mark.asyncio
@@ -184,6 +192,7 @@ async def test_http_contract_validation_not_found_conflict_and_profile_denial(
             headers=_auth(READ_KEY),
         )
         assert malformed.status == 400
+        _assert_closed_error(await malformed.json())
 
         unknown_version = await client.get(
             "/v1/execution-contract/executions",
@@ -193,6 +202,7 @@ async def test_http_contract_validation_not_found_conflict_and_profile_denial(
             },
         )
         assert unknown_version.status == 409
+        _assert_closed_error(await unknown_version.json())
 
         unknown_id = (
             f"exe_{store.authority.profile_key}_" + "f" * 32
@@ -202,6 +212,7 @@ async def test_http_contract_validation_not_found_conflict_and_profile_denial(
             headers=_auth(READ_KEY),
         )
         assert missing.status == 404
+        _assert_closed_error(await missing.json())
 
         foreign_id = "exe_abcdefabcdef_" + "0" * 32
         forbidden = await client.get(
@@ -209,6 +220,7 @@ async def test_http_contract_validation_not_found_conflict_and_profile_denial(
             headers=_auth(READ_KEY),
         )
         assert forbidden.status == 403
+        _assert_closed_error(await forbidden.json())
 
 
 @pytest.mark.asyncio
@@ -234,6 +246,7 @@ async def test_cursor_gone_rate_limit_corruption_and_unavailable_statuses(
         )
         assert gone.status == 410
         gone_payload = await gone.json()
+        _assert_closed_error(gone_payload)
         assert gone_payload["error"]["minimum_available"] == 3
 
         class FailingStore:
@@ -261,6 +274,7 @@ async def test_cursor_gone_rate_limit_corruption_and_unavailable_statuses(
             )
             assert response.status == status
             payload = await response.json()
+            _assert_closed_error(payload)
             if status >= 500:
                 assert payload["error"]["message"] == "Execution contract unavailable"
             if status == 429:
@@ -363,6 +377,92 @@ def test_read_key_configuration_and_profile_scope_are_explicit(monkeypatch):
             _api_request_profile.reset(token)
     finally:
         adapter._response_store.close()
+
+
+def test_equal_full_and_read_keys_fail_startup_default_and_named(monkeypatch):
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"key": FULL_KEY, "read_key": FULL_KEY},
+        )
+    )
+    try:
+        assert adapter._read_api_key_passes_startup_guard() is False
+
+        adapter._read_api_key = READ_KEY
+        monkeypatch.setattr(
+            adapter,
+            "_execution_contract_profiles",
+            lambda: [None, "worker"],
+        )
+        monkeypatch.setattr(adapter, "_profile_scope", lambda _profile: nullcontext())
+        monkeypatch.setattr(
+            "agent.secret_scope.get_secret",
+            lambda name, default="": FULL_KEY
+            if name in {"API_SERVER_KEY", "API_SERVER_READ_KEY"}
+            else default,
+        )
+        assert adapter._read_api_key_passes_startup_guard() is False
+    finally:
+        adapter._response_store.close()
+
+
+def test_profile_authority_comes_from_active_home_not_request_name(
+    contract_adapter,
+    tmp_path,
+):
+    from gateway.run import _profile_runtime_scope
+
+    named_home = tmp_path / "named-single-profile"
+    alpha_home = tmp_path / "multiplex-alpha"
+    beta_home = tmp_path / "multiplex-beta"
+    for home in (named_home, alpha_home, beta_home):
+        home.mkdir()
+
+    with _profile_runtime_scope(named_home):
+        first = contract_adapter._execution_contract_store()
+        token = _api_request_profile.set("url-name-must-not-control-authority")
+        try:
+            same_home = contract_adapter._execution_contract_store()
+        finally:
+            _api_request_profile.reset(token)
+    assert first.authority == same_home.authority
+    assert first.authority.profile_name == named_home.name
+
+    with _profile_runtime_scope(alpha_home):
+        alpha = contract_adapter._execution_contract_store()
+    with _profile_runtime_scope(beta_home):
+        beta = contract_adapter._execution_contract_store()
+    assert alpha.authority.profile_id != beta.authority.profile_id
+    assert alpha.authority.profile_key != beta.authority.profile_key
+
+
+@pytest.mark.asyncio
+async def test_unknown_profile_route_uses_closed_contract_error(
+    contract_adapter,
+    monkeypatch,
+):
+    from gateway.platforms.api_server import _PROFILE_REJECTED
+
+    monkeypatch.setattr(
+        contract_adapter,
+        "_resolve_request_profile",
+        lambda _request: _PROFILE_REJECTED,
+    )
+    app = web.Application(
+        middlewares=[contract_adapter._make_profile_prefix_middleware()]
+    )
+    app.router.add_get(
+        "/p/{profile}/v1/execution-contract/executions",
+        contract_adapter._handle_execution_contract_executions,
+    )
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/p/unknown/v1/execution-contract/executions",
+            headers=_auth(READ_KEY),
+        )
+        assert response.status == 404
+        _assert_closed_error(await response.json())
 
 
 def test_fixture_payloads_contain_no_runtime_or_secret_material():
