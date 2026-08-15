@@ -237,6 +237,39 @@ jobs:
           print("audited_workflow_dispatch_fence=passed")
           PY
 
+      - name: Test external environment authorization policy
+        run: |
+          python3 - <<'PY'
+          def accepted(*, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
+              independent_review = bool(reviewers) and prevent_self_review is True
+              no_admin_bypass = can_admins_bypass is False
+              main_only = (
+                  policy == "protected_branches"
+                  or (policy == "custom_branch_policies" and "main" in custom_names)
+              )
+              return independent_review and no_admin_bypass and main_only
+
+
+          protected = dict(
+              reviewers=["independent-maintainer"],
+              prevent_self_review=True,
+              can_admins_bypass=False,
+              policy="protected_branches",
+          )
+          custom_main = protected | {
+              "policy": "custom_branch_policies",
+              "custom_names": ["main"],
+          }
+          assert accepted(**protected)
+          assert accepted(**custom_main)
+          assert not accepted(**(protected | {"can_admins_bypass": True}))
+          assert not accepted(**(protected | {"reviewers": []}))
+          assert not accepted(**(protected | {"prevent_self_review": False}))
+          assert not accepted(**(protected | {"policy": None}))
+          assert not accepted(**(custom_main | {"custom_names": ["release-copy"]}))
+          print("external_environment_authorization_policy=passed")
+          PY
+
       - name: Test fail-closed tag and recovery transitions
         run: |
           python3 - <<'PY'
@@ -521,6 +554,9 @@ jobs:
           ]
           policy = environment.get("deployment_branch_policy") or {}
           assert reviewers, "gh-image must have a required reviewer and prevent self-review"
+          assert environment.get("can_admins_bypass") is False, (
+              "gh-image must disable administrator protection-rule bypass"
+          )
           assert policy.get("protected_branches") or policy.get("custom_branch_policies"), (
               "gh-image must restrict deployments to protected branches or custom main policy"
           )
