@@ -1,0 +1,521 @@
+name: GHCR Execution Read Release
+
+# Fork-owned publication for the dependency-owned execution-read contract.
+# Pull requests only validate: they have read-only permissions and never log in
+# to a registry. Publishing is limited to a published CalVer release or an
+# exact, confirmed workflow_dispatch. Both publication paths must name a tag
+# that resolves to the exact source SHA and pass through the gh-image
+# environment. This workflow never creates main or latest tags.
+on:
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character source commit to package.
+        required: true
+        type: string
+      source_ref:
+        description: Exact release tag ref (refs/tags/vYYYY.M.D[.N]) that resolves to source_sha.
+        required: true
+        type: string
+      release_tag:
+        description: Approved CalVer image tag (vYYYY.M.D[.N]).
+        required: true
+        type: string
+      confirm_publish:
+        description: Type publish ghcr.io/ragnos-labs/hermes-agent:<release_tag>.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghcr-execution-read-${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/ragnos-labs/hermes-agent
+  CONTRACT_VERSION: hermes.execution.read.v1
+  SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.read.v1.schema.json
+  SCHEMA_SHA256: 7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
+
+jobs:
+  resolve:
+    name: Resolve exact source and publication intent
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.source.outputs.publish }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_ref: ${{ steps.source.outputs.source_ref }}
+      release_tag: ${{ steps.source.outputs.release_tag }}
+    steps:
+      - name: Validate event inputs
+        id: source
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_REF: ${{ github.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_CONFIRM: ${{ inputs.confirm_publish }}
+        run: |
+          set -euo pipefail
+
+          publish=false
+          release_tag=""
+          case "$EVENT_NAME" in
+            pull_request)
+              source_sha="$PR_HEAD_SHA"
+              source_ref="refs/pull/${PR_NUMBER}/head"
+              ;;
+            release)
+              [ "$REPOSITORY" = "ragnos-labs/hermes-agent" ] || {
+                echo "::error::Publication is fork-owned and may run only in ragnos-labs/hermes-agent."
+                exit 1
+              }
+              publish=true
+              source_sha="$EVENT_SHA"
+              source_ref="$EVENT_REF"
+              release_tag="$EVENT_RELEASE_TAG"
+              ;;
+            workflow_dispatch)
+              [ "$REPOSITORY" = "ragnos-labs/hermes-agent" ] || {
+                echo "::error::Publication is fork-owned and may run only in ragnos-labs/hermes-agent."
+                exit 1
+              }
+              publish=true
+              source_sha="$INPUT_SOURCE_SHA"
+              source_ref="$INPUT_SOURCE_REF"
+              release_tag="$INPUT_RELEASE_TAG"
+              expected_confirmation="publish ghcr.io/ragnos-labs/hermes-agent:${release_tag}"
+              [ "$INPUT_CONFIRM" = "$expected_confirmation" ] || {
+                echo "::error::confirm_publish must exactly match: $expected_confirmation"
+                exit 1
+              }
+              ;;
+            *)
+              echo "::error::Unsupported event: $EVENT_NAME"
+              exit 1
+              ;;
+          esac
+
+          [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_sha must be an exact lowercase 40-character commit SHA."
+            exit 1
+          }
+
+          if [ "$publish" = true ]; then
+            [[ "$release_tag" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
+              echo "::error::release_tag must preserve the vYYYY.M.D[.N] CalVer convention."
+              exit 1
+            }
+            [ "$source_ref" = "refs/tags/${release_tag}" ] || {
+              echo "::error::source_ref must be the exact tag ref refs/tags/${release_tag}."
+              exit 1
+            }
+          fi
+
+          {
+            echo "publish=$publish"
+            echo "source_sha=$source_sha"
+            echo "source_ref=$source_ref"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  conformance:
+    name: Execution-read conformance and package proof
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove source ref, commit, tree, contract, and schema
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin "$SOURCE_REF"
+          resolved_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          checked_out_sha="$(git rev-parse 'HEAD^{commit}')"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          [ "$resolved_sha" = "$SOURCE_SHA" ] || {
+            echo "::error::Source ref moved: $SOURCE_REF resolves to $resolved_sha, expected $SOURCE_SHA."
+            exit 1
+          }
+          [ "$checked_out_sha" = "$SOURCE_SHA" ] || {
+            echo "::error::Checkout mismatch: got $checked_out_sha, expected $SOURCE_SHA."
+            exit 1
+          }
+          printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
+          python3 - <<'PY'
+          from hermes_cli.execution_contract import CONTRACT_VERSION
+          assert CONTRACT_VERSION == "hermes.execution.read.v1", CONTRACT_VERSION
+          PY
+          {
+            echo "### Exact source proof"
+            echo "- ref: \`$SOURCE_REF\`"
+            echo "- commit: \`$SOURCE_SHA\`"
+            echo "- tree: \`$source_tree\`"
+            echo "- contract: \`$CONTRACT_VERSION\`"
+            echo "- schema SHA-256: \`$SCHEMA_SHA256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install conformance dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev --extra messaging
+
+      - name: Run execution contract and API conformance
+        run: |
+          scripts/run_tests.sh \
+            tests/hermes_cli/test_execution_contract.py \
+            tests/gateway/test_api_server_execution_contract.py
+
+  build:
+    name: Container proof (${{ matrix.arch }})
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            cache-from: type=gha,scope=ghcr-execution-read-amd64
+            cache-to: type=gha,mode=max,scope=ghcr-execution-read-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache-from: type=gha,scope=ghcr-execution-read-arm64
+            cache-to: type=gha,mode=max,scope=ghcr-execution-read-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove source and schema before build
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin "$SOURCE_REF"
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
+          [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ]
+          printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build native image without publishing
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          push: false
+          provenance: false
+          platforms: ${{ matrix.platform }}
+          tags: local/hermes-execution-read:${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ragnos-labs/hermes-agent
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
+            io.ragnos.hermes.execution.contract=${{ env.CONTRACT_VERSION }}
+            io.ragnos.hermes.execution.schema-sha256=${{ env.SCHEMA_SHA256 }}
+          build-args: |
+            HERMES_GIT_SHA=${{ needs.resolve.outputs.source_sha }}
+          cache-from: ${{ matrix.cache-from }}
+          cache-to: ${{ github.event_name != 'pull_request' && matrix.cache-to || '' }}
+
+      - name: Prove native image revision and packaged contract
+        env:
+          ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          image="local/hermes-execution-read:${ARCH}"
+          revision="$(docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          contract="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.contract" }}')"
+          schema_digest="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.schema-sha256" }}')"
+          [ "$revision" = "$SOURCE_SHA" ]
+          [ "$contract" = "$CONTRACT_VERSION" ]
+          [ "$schema_digest" = "$SCHEMA_SHA256" ]
+          docker run --rm -i \
+            -e EXPECTED_SOURCE_SHA="$SOURCE_SHA" \
+            --entrypoint /opt/hermes/.venv/bin/python "$image" - <<'PY'
+          import hashlib
+          import os
+          from importlib.resources import files
+          from pathlib import Path
+
+          from hermes_cli.execution_contract import CONTRACT_VERSION, contract_schema
+
+          expected_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          expected_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
+          schema_path = files("hermes_cli").joinpath(
+              "execution_contract_schemas/hermes.execution.read.v1.schema.json"
+          )
+          actual_sha = hashlib.sha256(schema_path.read_bytes()).hexdigest()
+          assert expected_source == os.environ["EXPECTED_SOURCE_SHA"], expected_source
+          assert CONTRACT_VERSION == "hermes.execution.read.v1", CONTRACT_VERSION
+          assert contract_schema()["$id"].endswith("hermes.execution.read.v1.schema.json")
+          assert actual_sha == expected_sha, actual_sha
+          print(f"source_sha={expected_source}")
+          print(f"contract={CONTRACT_VERSION}")
+          print(f"packaged_schema_sha256={actual_sha}")
+          PY
+
+  publish:
+    name: Publish untagged digest (${{ matrix.arch }})
+    if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, conformance, build]
+    environment: gh-image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+            cache-from: type=gha,scope=ghcr-execution-read-amd64
+            cache-to: type=gha,mode=max,scope=ghcr-execution-read-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache-from: type=gha,scope=ghcr-execution-read-arm64
+            cache-to: type=gha,mode=max,scope=ghcr-execution-read-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out exact approved source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-prove approved source and schema
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
+          git fetch --force --no-tags origin "$SOURCE_REF"
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
+          [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ]
+          printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to fork-owned GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Rebuild exact source and push by digest only
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ragnos-labs/hermes-agent
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
+            io.ragnos.hermes.execution.contract=${{ env.CONTRACT_VERSION }}
+            io.ragnos.hermes.execution.schema-sha256=${{ env.SCHEMA_SHA256 }}
+          build-args: |
+            HERMES_GIT_SHA=${{ needs.resolve.outputs.source_sha }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: ${{ matrix.cache-from }}
+          cache-to: ${{ matrix.cache-to }}
+
+      - name: Export architecture digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+
+      - name: Upload architecture digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-execution-read-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Publish immutable SHA and approved release tag
+    if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, publish]
+    environment: gh-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download architecture digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: ghcr-execution-read-digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to fork-owned GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create immutable multi-architecture tags
+        id: manifest
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          DIGEST_DIR: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
+          [ "$SOURCE_REF" = "refs/tags/${RELEASE_TAG}" ]
+
+          amd64_digest="$(cat "$DIGEST_DIR/amd64")"
+          arm64_digest="$(cat "$DIGEST_DIR/arm64")"
+          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [ "$amd64_digest" != "$arm64_digest" ]
+          sources=(
+            "${IMAGE_NAME}@${amd64_digest}"
+            "${IMAGE_NAME}@${arm64_digest}"
+          )
+
+          sha_ref="${IMAGE_NAME}:sha-${SOURCE_SHA}"
+          release_ref="${IMAGE_NAME}:${RELEASE_TAG}"
+          existing_sha="$RUNNER_TEMP/existing-sha.json"
+          if docker buildx imagetools inspect "$sha_ref" --raw > "$existing_sha" 2>/dev/null; then
+            SOURCE_SHA="$SOURCE_SHA" \
+            AMD64_DIGEST="$amd64_digest" \
+            ARM64_DIGEST="$arm64_digest" \
+            MANIFEST_JSON="$existing_sha" \
+            python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.load(open(os.environ["MANIFEST_JSON"], encoding="utf-8"))
+          expected = {os.environ["AMD64_DIGEST"], os.environ["ARM64_DIGEST"]}
+          actual = {item["digest"] for item in payload.get("manifests", [])}
+          revision = payload.get("annotations", {}).get("org.opencontainers.image.revision")
+          assert actual == expected, (actual, expected)
+          assert revision == os.environ["SOURCE_SHA"], revision
+          PY
+            echo "Immutable SHA tag already exists with the exact approved manifests; preserving it."
+          else
+            docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
+              --annotation "index:io.ragnos.hermes.execution.contract=${CONTRACT_VERSION}" \
+              --annotation "index:io.ragnos.hermes.execution.schema-sha256=${SCHEMA_SHA256}" \
+              --tag "$sha_ref" \
+              "${sources[@]}"
+          fi
+
+          sha_digest="$(docker buildx imagetools inspect "$sha_ref" | awk '/^Digest:/ {print $2; exit}')"
+          [[ "$sha_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          if release_digest="$(docker buildx imagetools inspect "$release_ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')"; then
+            [ "$release_digest" = "$sha_digest" ] || {
+              echo "::error::Release tag $release_ref already points to $release_digest, not $sha_digest."
+              exit 1
+            }
+            echo "Approved release tag already points to the immutable SHA manifest; preserving it."
+          else
+            docker buildx imagetools create --tag "$release_ref" "$sha_ref"
+          fi
+
+          final_release_digest="$(docker buildx imagetools inspect "$release_ref" | awk '/^Digest:/ {print $2; exit}')"
+          [ "$final_release_digest" = "$sha_digest" ]
+          docker buildx imagetools inspect "$sha_ref" --raw > "$RUNNER_TEMP/final-manifest.json"
+
+          SOURCE_SHA="$SOURCE_SHA" \
+          AMD64_DIGEST="$amd64_digest" \
+          ARM64_DIGEST="$arm64_digest" \
+          MANIFEST_JSON="$RUNNER_TEMP/final-manifest.json" \
+          python3 - <<'PY'
+          import json
+          import os
+
+          payload = json.load(open(os.environ["MANIFEST_JSON"], encoding="utf-8"))
+          manifests = payload.get("manifests", [])
+          expected_digests = {os.environ["AMD64_DIGEST"], os.environ["ARM64_DIGEST"]}
+          actual_digests = {item["digest"] for item in manifests}
+          platforms = {(item["platform"]["os"], item["platform"]["architecture"]) for item in manifests}
+          annotations = payload.get("annotations", {})
+          assert actual_digests == expected_digests, (actual_digests, expected_digests)
+          assert platforms == {("linux", "amd64"), ("linux", "arm64")}, platforms
+          assert annotations["org.opencontainers.image.revision"] == os.environ["SOURCE_SHA"]
+          assert annotations["io.ragnos.hermes.execution.contract"] == "hermes.execution.read.v1"
+          assert annotations["io.ragnos.hermes.execution.schema-sha256"] == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          PY
+
+          echo "digest=$sha_digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Fork-owned GHCR publication"
+            echo "- source ref: \`$SOURCE_REF\`"
+            echo "- source revision: \`$SOURCE_SHA\`"
+            echo "- contract: \`$CONTRACT_VERSION\`"
+            echo "- schema SHA-256: \`$SCHEMA_SHA256\`"
+            echo "- manifest digest: \`$sha_digest\`"
+            echo "- immutable tag: \`$sha_ref\`"
+            echo "- approved release tag: \`$release_ref\`"
+            echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
