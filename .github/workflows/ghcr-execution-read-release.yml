@@ -1975,7 +1975,7 @@ jobs:
             echo "- immutable tag: \`$sha_ref\`"
             echo "- approved release tag: \`$release_ref\`"
             echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
-            echo "- workflow revision: \`${{ needs.resolve.outputs.workflow_sha }}\`"
+            echo "- workflow revision: \`$WORKFLOW_SHA\`"
             echo "- receipt artifact: \`ghcr-execution-read-receipt-${RELEASE_TAG}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
