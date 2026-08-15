@@ -1,0 +1,36 @@
+{
+  "contract_version": "hermes.execution.read.v1",
+  "authority": {
+    "profile_id": "hermes-profile:synthetic",
+    "profile_name": "synthetic",
+    "authority_id": "hermes-execution-authority:synthetic",
+    "executor_id": "hermes-agent:synthetic"
+  },
+  "events": [
+    {
+      "contract_version": "hermes.execution.read.v1",
+      "sequence": 2,
+      "event_id": "evt_0123456789ab_00000000000000000000000000000003",
+      "execution_id": "exe_0123456789ab_00000000000000000000000000000001",
+      "profile_id": "hermes-profile:synthetic",
+      "authority_id": "hermes-execution-authority:synthetic",
+      "event_type": "decision.requested",
+      "from_lifecycle": "running",
+      "to_lifecycle": "awaiting_decision",
+      "decision_id": "dec_0123456789ab_00000000000000000000000000000002",
+      "receipt_id": null,
+      "reason_code": null,
+      "occurred_at": "2026-08-15T12:01:00.000000Z",
+      "revision": 3
+    }
+  ],
+  "page": {
+    "cursor": 2,
+    "high_water": 2,
+    "minimum_available": 1,
+    "has_more": false,
+    "completeness": "complete",
+    "pruned_through": 0,
+    "retention_seconds": 2592000
+  }
+}

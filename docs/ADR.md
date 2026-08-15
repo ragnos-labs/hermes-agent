@@ -1,5 +1,59 @@
 # Architecture Decision Records
 
+## 2026-08-15: Durable, profile-scoped public execution read contract
+
+Status: Accepted for the Release 1 source candidate. This status records the
+architecture decision; it does not claim merge, package release, deployment,
+or runtime enablement.
+
+Context:
+Hermes exposes useful process-local run, approval, session, Kanban, and UI
+state, but none of those surfaces is a stable durable authority contract for
+an external controller. Process dictionaries disappear on restart, chat and
+session history do not prove an external effect, and operator projections may
+lag or omit lifecycle transitions. A downstream reader needs versioned,
+profile-scoped objects, detectable replay gaps, and terminal receipts that
+cannot diverge from terminal state across a crash.
+
+Decision:
+- Add the provider-neutral `hermes.execution.read.v1` contract and closed
+  packaged JSON Schema for executions, decisions, ordered events, receipts,
+  capability negotiation, and errors.
+- Store each profile's ledger at
+  `{get_hermes_home()}/execution_contract.sqlite3`. Use explicit schema
+  migration and startup recovery; use read-only SQLite connections for every
+  public GET.
+- Treat the ordered event table as a transactional outbox. Terminal state,
+  evidence-backed receipt, and publication events commit in one transaction.
+- Assert profile, authority, and executor identity in responses. Embed a
+  profile fingerprint in public IDs so a cross-profile identifier fails with
+  `403` instead of becoming an ambiguous `404`. Bind store metadata and every
+  persisted public row to that same authority so a misplaced database cannot
+  be projected under a different profile.
+- Require an explicit executor evidence hook before publishing an external
+  effect receipt. Generic chat, session, Kanban, tool-progress, or process-run
+  completion terminates an effect-bearing execution as ambiguous and
+  unproven.
+- Add an optional profile-scoped `API_SERVER_READ_KEY` with only
+  `execution:read`. Keep run submission, decision resolution, steering,
+  stopping, and all other API authority behind the full `API_SERVER_KEY`.
+- Retain ordered events for 30 days by default. Prune only a contiguous global
+  prefix and return `410` with an explicit minimum cursor when replay history
+  is gone.
+
+Consequences:
+- External controllers can read durable state across restart without using
+  Hermes internals or mutation credentials.
+- Existing `/v1/runs` remains a convenience projection and may carry a durable
+  `execution_id`, but it is not the authority store.
+- The API server refuses startup when the ledger cannot migrate or recover;
+  a failed durable write degrades the profile's read contract instead of
+  serving a healthy projection.
+- Release 2 proposal/action dispatch, WebAuthn step-up, and public decision
+  mutation remain separately gated. This decision does not authorize them.
+
+Detailed contract: [execution-read-contract-v1.md](execution-read-contract-v1.md)
+
 ## 2026-07-13: Scope plugin manager state by Hermes home/profile (keyed cache)
 
 Status: Accepted
