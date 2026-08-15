@@ -822,6 +822,27 @@ def test_concurrent_profile_initialization_creates_one_stable_anchor(tmp_path):
     assert set(payload) == {"version", "instance_id"}
 
 
+def test_initialize_retries_transient_journal_mode_lock(monkeypatch, tmp_path):
+    import hermes_state
+
+    original = hermes_state.apply_wal_with_fallback
+    attempts = []
+
+    def transient_lock(connection, **kwargs):
+        attempts.append(connection)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original(connection, **kwargs)
+
+    monkeypatch.setattr(hermes_state, "apply_wal_with_fallback", transient_lock)
+    store = ExecutionContractStore(profile_home=tmp_path / "retry-profile")
+
+    store.initialize()
+
+    assert len(attempts) == 2
+    assert store.list_executions()["items"] == []
+
+
 def test_full_profile_home_move_and_restore_preserve_authority(tmp_path):
     original_home = tmp_path / "profile-original"
     moved_home = tmp_path / "profile-moved"

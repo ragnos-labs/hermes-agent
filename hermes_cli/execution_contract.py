@@ -46,6 +46,9 @@ _PROFILE_ANCHOR_LOCK_FILENAME = ".execution-contract-profile-instance.lock"
 _PROFILE_ANCHOR_MAX_BYTES = 4096
 _PROFILE_ANCHOR_WAIT_ATTEMPTS = 200
 _PROFILE_ANCHOR_WAIT_SECONDS = 0.01
+_WRITE_CONNECT_RETRY_SECONDS = 5.0
+_WRITE_CONNECT_RETRY_INITIAL_SECONDS = 0.01
+_WRITE_CONNECT_RETRY_MAX_SECONDS = 0.1
 
 EXECUTION_STATES = frozenset(
     {
@@ -608,26 +611,47 @@ class ExecutionContractStore:
         self._tighten_permissions()
 
     def _connect_write(self) -> sqlite3.Connection:
-        try:
-            connection = connect_tracked(self.database_path, timeout=5.0)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys=ON")
-            connection.execute("PRAGMA busy_timeout=5000")
-            from hermes_state import apply_wal_with_fallback
+        deadline = time.monotonic() + _WRITE_CONNECT_RETRY_SECONDS
+        retry_delay = _WRITE_CONNECT_RETRY_INITIAL_SECONDS
+        while True:
+            connection: Optional[sqlite3.Connection] = None
+            try:
+                connection = connect_tracked(self.database_path, timeout=5.0)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA busy_timeout=5000")
+                from hermes_state import apply_wal_with_fallback
 
-            apply_wal_with_fallback(
-                connection,
-                db_label="execution_contract.sqlite3",
-            )
-            return connection
-        except sqlite3.OperationalError as exc:
-            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
-                raise ContractRateLimitedError("execution ledger is busy") from exc
-            raise ContractUnavailableError("execution ledger is unavailable") from exc
-        except ExecutionContractError:
-            raise
-        except Exception as exc:
-            raise ContractUnavailableError("execution ledger is unavailable") from exc
+                apply_wal_with_fallback(
+                    connection,
+                    db_label="execution_contract.sqlite3",
+                )
+                return connection
+            except sqlite3.OperationalError as exc:
+                if connection is not None:
+                    with suppress(sqlite3.Error):
+                        connection.close()
+                is_busy = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                if is_busy and time.monotonic() < deadline:
+                    time.sleep(retry_delay)
+                    retry_delay = min(
+                        retry_delay * 2,
+                        _WRITE_CONNECT_RETRY_MAX_SECONDS,
+                    )
+                    continue
+                if is_busy:
+                    raise ContractRateLimitedError("execution ledger is busy") from exc
+                raise ContractUnavailableError("execution ledger is unavailable") from exc
+            except ExecutionContractError:
+                if connection is not None:
+                    with suppress(sqlite3.Error):
+                        connection.close()
+                raise
+            except Exception as exc:
+                if connection is not None:
+                    with suppress(sqlite3.Error):
+                        connection.close()
+                raise ContractUnavailableError("execution ledger is unavailable") from exc
 
     @contextmanager
     def _read_connection(self) -> Iterator[Optional[sqlite3.Connection]]:
