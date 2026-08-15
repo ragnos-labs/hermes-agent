@@ -17,8 +17,12 @@ from __future__ import annotations
 import hashlib
 import importlib.resources
 import json
+import os
 import re
+import secrets
 import sqlite3
+import stat
+import time
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -36,6 +40,12 @@ STORE_SCHEMA_VERSION = 1
 EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
+PROFILE_ANCHOR_VERSION = 1
+PROFILE_ANCHOR_FILENAME = ".execution-contract-profile-instance.json"
+_PROFILE_ANCHOR_LOCK_FILENAME = ".execution-contract-profile-instance.lock"
+_PROFILE_ANCHOR_MAX_BYTES = 4096
+_PROFILE_ANCHOR_WAIT_ATTEMPTS = 200
+_PROFILE_ANCHOR_WAIT_SECONDS = 0.01
 
 EXECUTION_STATES = frozenset(
     {
@@ -123,6 +133,7 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 _ID_RE = re.compile(r"^(exe|dec|rcp|evt)_([0-9a-f]{12})_([0-9a-f]{32})$")
 _EVIDENCE_ID_RE = re.compile(r"^evd_([0-9a-f]{12})_([0-9a-f]{32})$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROFILE_INSTANCE_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -144,6 +155,10 @@ class ContractForbiddenError(ExecutionContractError):
 
 class ContractUnauthorizedError(ExecutionContractError):
     """The request did not present valid credentials for this contract."""
+
+
+class ContractMethodNotAllowedError(ExecutionContractError):
+    """The contract namespace does not support the requested HTTP method."""
 
 
 class ContractConflictError(ExecutionContractError):
@@ -224,26 +239,206 @@ def _normalize_profile_name(profile_name: str) -> str:
     return clean
 
 
+def _profile_anchor_path(profile_home: Path) -> Path:
+    return Path(profile_home) / PROFILE_ANCHOR_FILENAME
+
+
+def _profile_anchor_exists(profile_home: Path) -> bool:
+    return os.path.lexists(_profile_anchor_path(profile_home))
+
+
+def _read_profile_anchor(profile_home: Path) -> str:
+    """Read and validate the durable profile-instance anchor without mutation."""
+
+    path = _profile_anchor_path(profile_home)
+    descriptor: Optional[int] = None
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise ContractDataError("profile instance anchor is missing") from exc
+    except OSError as exc:
+        raise ContractDataError("profile instance anchor is unavailable") from exc
+    if not stat.S_ISREG(path_metadata.st_mode) or stat.S_ISLNK(path_metadata.st_mode):
+        raise ContractDataError("profile instance anchor is not a regular file")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ContractDataError("profile instance anchor is unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or (path_metadata.st_dev, path_metadata.st_ino)
+        != (metadata.st_dev, metadata.st_ino)
+    ):
+        os.close(descriptor)
+        raise ContractDataError("profile instance anchor changed while opening")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        os.close(descriptor)
+        raise ContractDataError("profile instance anchor permissions are unsafe")
+    if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+        os.close(descriptor)
+        raise ContractDataError("profile instance anchor owner is unsafe")
+    if metadata.st_size <= 0 or metadata.st_size > _PROFILE_ANCHOR_MAX_BYTES:
+        os.close(descriptor)
+        raise ContractDataError("profile instance anchor is corrupt")
+    try:
+        raw = os.read(descriptor, _PROFILE_ANCHOR_MAX_BYTES + 1)
+        os.close(descriptor)
+        descriptor = None
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ContractDataError("profile instance anchor is corrupt") from exc
+    if not isinstance(payload, dict) or set(payload) != {"version", "instance_id"}:
+        raise ContractDataError("profile instance anchor is corrupt")
+    version = payload.get("version")
+    instance_id = payload.get("instance_id")
+    if (
+        isinstance(version, bool)
+        or version != PROFILE_ANCHOR_VERSION
+        or not isinstance(instance_id, str)
+        or _PROFILE_INSTANCE_RE.fullmatch(instance_id) is None
+    ):
+        raise ContractDataError("profile instance anchor is corrupt")
+    return instance_id
+
+
+def _fsync_profile_home(profile_home: Path) -> None:
+    """Durably publish profile metadata on platforms supporting directory fsync."""
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(profile_home, flags)
+    except OSError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("profile instance anchor write made no progress")
+        offset += written
+
+
+def _restrict_open_file(descriptor: int, path: Path) -> None:
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, 0o600)
+    else:
+        os.chmod(path, 0o600)
+
+
+def _create_profile_anchor(profile_home: Path) -> str:
+    """Create the anchor once through an owner-only lock and atomic rename."""
+
+    anchor_path = _profile_anchor_path(profile_home)
+    if _profile_anchor_exists(profile_home):
+        return _read_profile_anchor(profile_home)
+    lock_path = Path(profile_home) / _PROFILE_ANCHOR_LOCK_FILENAME
+    open_flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    lock_descriptor: Optional[int] = None
+    try:
+        lock_descriptor = os.open(lock_path, open_flags, 0o600)
+        _restrict_open_file(lock_descriptor, lock_path)
+        os.fsync(lock_descriptor)
+    except FileExistsError:
+        for _attempt in range(_PROFILE_ANCHOR_WAIT_ATTEMPTS):
+            if _profile_anchor_exists(profile_home):
+                return _read_profile_anchor(profile_home)
+            if not os.path.lexists(lock_path):
+                return _create_profile_anchor(profile_home)
+            time.sleep(_PROFILE_ANCHOR_WAIT_SECONDS)
+        raise ContractUnavailableError("profile instance anchor initialization is busy")
+    except OSError as exc:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        with suppress(OSError):
+            lock_path.unlink()
+        raise ContractUnavailableError(
+            "profile instance anchor cannot be initialized"
+        ) from exc
+
+    temp_path = Path(profile_home) / (
+        f".{PROFILE_ANCHOR_FILENAME}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    temp_descriptor: Optional[int] = None
+    try:
+        if _profile_anchor_exists(profile_home):
+            return _read_profile_anchor(profile_home)
+        instance_id = secrets.token_hex(32)
+        encoded = (
+            json.dumps(
+                {"version": PROFILE_ANCHOR_VERSION, "instance_id": instance_id},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        temp_descriptor = os.open(temp_path, open_flags, 0o600)
+        _restrict_open_file(temp_descriptor, temp_path)
+        _write_all(temp_descriptor, encoded)
+        os.fsync(temp_descriptor)
+        os.close(temp_descriptor)
+        temp_descriptor = None
+        if _profile_anchor_exists(profile_home):
+            return _read_profile_anchor(profile_home)
+        os.replace(temp_path, anchor_path)
+        _fsync_profile_home(profile_home)
+        return _read_profile_anchor(profile_home)
+    except ExecutionContractError:
+        raise
+    except OSError as exc:
+        raise ContractUnavailableError(
+            "profile instance anchor cannot be initialized"
+        ) from exc
+    finally:
+        if temp_descriptor is not None:
+            os.close(temp_descriptor)
+        with suppress(OSError):
+            temp_path.unlink()
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        with suppress(OSError):
+            lock_path.unlink()
+        with suppress(OSError):
+            _fsync_profile_home(profile_home)
+
+
 def authority_identity(
     profile_home: Path,
     profile_name: Optional[str] = None,
 ) -> AuthorityIdentity:
-    """Derive authority from the active profile home, never request routing.
-
-    The canonical home path is hashed rather than exposed. The resulting
-    profile-instance identity is deterministic for that durable home and is
-    persisted in ledger metadata, so moving a database to another profile
-    home fails closed.
-    """
+    """Derive authority from the durable anchor, never routing or a home path."""
 
     canonical_home = Path(profile_home).expanduser().resolve(strict=False)
-    home_fingerprint = hashlib.sha256(
-        b"hermes-execution-profile-home-v1\x00"
-        + str(canonical_home).encode("utf-8")
+    anchor_id = _read_profile_anchor(canonical_home)
+    fingerprint = hashlib.sha256(
+        b"hermes-execution-profile-anchor-v1\x00" + bytes.fromhex(anchor_id)
     ).hexdigest()
-    profile_key = home_fingerprint[:12]
+    profile_key = fingerprint[:12]
     clean = _normalize_profile_name(profile_name or canonical_home.name or "profile")
-    instance = home_fingerprint[:24]
+    instance = fingerprint[:24]
     return AuthorityIdentity(
         profile_id=f"hermes-profile-instance:{instance}",
         profile_name=clean,
@@ -356,19 +551,48 @@ class ExecutionContractStore:
         ).expanduser().resolve(strict=False)
         self.profile_home = active_home
         self.database_path = database_path or (active_home / "execution_contract.sqlite3")
-        self.authority = authority_identity(active_home, profile_name)
+        self.profile_name = _normalize_profile_name(
+            profile_name or active_home.name or "profile"
+        )
+        self._authority: Optional[AuthorityIdentity] = None
         self.runtime_instance_id = runtime_instance_id or uuid.uuid4().hex
+
+    @property
+    def authority(self) -> AuthorityIdentity:
+        if self._authority is None:
+            self._authority = authority_identity(
+                self.profile_home,
+                self.profile_name,
+            )
+        return self._authority
+
+    @property
+    def profile_anchor_path(self) -> Path:
+        return _profile_anchor_path(self.profile_home)
 
     # ------------------------------------------------------------------
     # Connection and schema lifecycle
     # ------------------------------------------------------------------
 
     def initialize(self) -> None:
+        self.profile_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.profile_home.chmod(0o700)
+        except OSError:
+            pass
         self.database_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.database_path.parent.chmod(0o700)
         except OSError:
             pass
+        ledger_exists = self.database_path.exists()
+        if ledger_exists and not _profile_anchor_exists(self.profile_home):
+            raise ContractDataError(
+                "existing execution ledger is missing its profile instance anchor"
+            )
+        if not _profile_anchor_exists(self.profile_home):
+            _create_profile_anchor(self.profile_home)
+        self._authority = authority_identity(self.profile_home, self.profile_name)
         connection = self._connect_write()
         try:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -1069,26 +1293,11 @@ class ExecutionContractStore:
         connection = self._connect_write()
         try:
             with write_txn(connection):
+                self._after_write_lock_acquired("decision", execution_id)
                 execution = self._execution_row(connection, execution_id)
                 if execution is None:
                     raise ContractNotFoundError("execution not found")
                 current_lifecycle = str(execution["lifecycle"])
-                pending = connection.execute(
-                    "SELECT decision_id FROM decisions "
-                    "WHERE execution_id=? AND state='pending' LIMIT 1",
-                    (execution_id,),
-                ).fetchone()
-                if pending is not None:
-                    raise ContractConflictError(
-                        "execution already has a pending decision"
-                    )
-                if "awaiting_decision" not in _ALLOWED_TRANSITIONS.get(
-                    current_lifecycle,
-                    frozenset(),
-                ):
-                    raise ContractConflictError(
-                        f"execution cannot request a decision from {current_lifecycle}"
-                    )
                 if execution["effect_id"] != effect_id:
                     raise ContractConflictError("decision effect binding mismatch")
                 if execution["proposal_ref"] != proposal_ref:
@@ -1119,6 +1328,31 @@ class ExecutionContractStore:
                             "decision request digest has conflicting bindings"
                         )
                     return self._decision_from_row(existing)
+                published_effect = connection.execute(
+                    "SELECT 1 FROM effect_evidence WHERE execution_id=? "
+                    "UNION ALL SELECT 1 FROM receipts WHERE execution_id=? LIMIT 1",
+                    (execution_id, execution_id),
+                ).fetchone()
+                if published_effect is not None:
+                    raise ContractConflictError(
+                        "execution effect evidence already exists; no new decision is allowed"
+                    )
+                pending = connection.execute(
+                    "SELECT decision_id FROM decisions "
+                    "WHERE execution_id=? AND state='pending' LIMIT 1",
+                    (execution_id,),
+                ).fetchone()
+                if pending is not None:
+                    raise ContractConflictError(
+                        "execution already has a pending decision"
+                    )
+                if "awaiting_decision" not in _ALLOWED_TRANSITIONS.get(
+                    current_lifecycle,
+                    frozenset(),
+                ):
+                    raise ContractConflictError(
+                        f"execution cannot request a decision from {current_lifecycle}"
+                    )
                 connection.execute(
                     """
                     INSERT INTO decisions(
@@ -1502,6 +1736,7 @@ class ExecutionContractStore:
         connection = self._connect_write()
         try:
             with write_txn(connection):
+                self._after_write_lock_acquired("evidence", execution_id)
                 execution = self._execution_row(connection, execution_id)
                 if execution is None:
                     raise ContractNotFoundError("execution not found")
@@ -1691,6 +1926,7 @@ class ExecutionContractStore:
                     raise ContractNotFoundError("execution not found")
                 if execution["effect_id"] != effect_id:
                     raise ContractConflictError("effect evidence binding mismatch")
+                actual_recovery_ref = recovery_ref or execution["recovery_ref"]
                 if (
                     execution["lifecycle"] != "terminal_ambiguous"
                     or execution["receipt_state"] != "unproven"
@@ -1708,6 +1944,7 @@ class ExecutionContractStore:
                             evidence_digest,
                             result_digest,
                             decision_id,
+                            actual_recovery_ref,
                             reconciliation_ref,
                         )
                         actual = (
@@ -1717,6 +1954,7 @@ class ExecutionContractStore:
                             existing_receipt["evidence_digest"],
                             existing_receipt["result_digest"],
                             existing_receipt["decision_id"],
+                            existing_receipt["recovery_ref"],
                             existing_receipt["reconciliation_ref"],
                         )
                         if immutable == actual:
@@ -1762,7 +2000,6 @@ class ExecutionContractStore:
                         "late effect evidence exists without its transactional receipt"
                     )
 
-                actual_recovery_ref = recovery_ref or execution["recovery_ref"]
                 connection.execute(
                     """
                     INSERT INTO effect_evidence(
@@ -2115,18 +2352,33 @@ class ExecutionContractStore:
                         "event cursor is ahead of high-water"
                     )
                 return self._event_page([], after, 0, 1, False, 0, 0)
+            sequence_row = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='execution_events'"
+            ).fetchone()
+            allocated_high_water = int(sequence_row[0]) if sequence_row else 0
             current_high_water = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM execution_events"
                 ).fetchone()[0]
             )
-            pruned_through = int(
-                connection.execute(
-                    "SELECT value FROM execution_contract_metadata "
-                    "WHERE key='events_pruned_through'"
-                ).fetchone()[0]
-            )
-            available_high_water = max(current_high_water, pruned_through)
+            try:
+                pruned_through = int(
+                    connection.execute(
+                        "SELECT value FROM execution_contract_metadata "
+                        "WHERE key='events_pruned_through'"
+                    ).fetchone()[0]
+                )
+            except (TypeError, ValueError, sqlite3.Error) as exc:
+                raise ContractDataError("event retention watermark is corrupt") from exc
+            if (
+                allocated_high_water < 0
+                or current_high_water < 0
+                or current_high_water > allocated_high_water
+                or pruned_through < 0
+                or pruned_through > allocated_high_water
+            ):
+                raise ContractDataError("event high-water metadata is corrupt")
+            available_high_water = allocated_high_water
             high_water = (
                 available_high_water
                 if snapshot_high_water is None
@@ -2147,6 +2399,11 @@ class ExecutionContractStore:
             if after < pruned_through:
                 raise ContractCursorGoneError(minimum_available, high_water)
             self._after_snapshot_pinned("events", high_water)
+            self._validate_global_event_continuity(
+                connection,
+                pruned_through=pruned_through,
+                snapshot_high_water=high_water,
+            )
             params: list[Any] = [after, high_water]
             where = "sequence > ? AND sequence <= ?"
             if execution_id:
@@ -2263,6 +2520,8 @@ class ExecutionContractStore:
                 evidence["evidence_digest"],
                 evidence["result_digest"],
                 evidence["decision_id"],
+                evidence["recovery_ref"],
+                evidence["reconciliation_ref"],
             )
             actual = tuple(
                 existing[key]
@@ -2273,6 +2532,8 @@ class ExecutionContractStore:
                     "evidence_digest",
                     "result_digest",
                     "decision_id",
+                    "recovery_ref",
+                    "reconciliation_ref",
                 )
             )
             if immutable != actual:
@@ -2712,6 +2973,8 @@ class ExecutionContractStore:
                 ("evidence_digest", evidence_digest),
                 ("result_digest", result_digest),
                 ("decision_id", decision_id),
+                ("recovery_ref", recovery_ref),
+                ("reconciliation_ref", reconciliation_ref),
             ):
                 if evidence[field] != expected:
                     raise ContractDataError("receipt evidence binding is invalid")
@@ -2945,6 +3208,40 @@ class ExecutionContractStore:
 
     def _after_snapshot_pinned(self, _collection: str, _high_water: int) -> None:
         """Test seam called inside the pinned SQLite read transaction."""
+
+    def _after_write_lock_acquired(self, _operation: str, _execution_id: str) -> None:
+        """Test seam called only after BEGIN IMMEDIATE owns the writer lock."""
+
+    @staticmethod
+    def _validate_global_event_continuity(
+        connection: sqlite3.Connection,
+        *,
+        pruned_through: int,
+        snapshot_high_water: int,
+    ) -> None:
+        """Prove the complete unfiltered global interval for this snapshot."""
+
+        if snapshot_high_water < pruned_through:
+            raise ContractDataError("event snapshot predates the retention watermark")
+        expected_count = snapshot_high_water - pruned_through
+        row = connection.execute(
+            "SELECT COUNT(*), MIN(sequence), MAX(sequence) "
+            "FROM execution_events WHERE sequence > ? AND sequence <= ?",
+            (pruned_through, snapshot_high_water),
+        ).fetchone()
+        count = int(row[0])
+        minimum = int(row[1]) if row[1] is not None else None
+        maximum = int(row[2]) if row[2] is not None else None
+        if expected_count == 0:
+            if count != 0 or minimum is not None or maximum is not None:
+                raise ContractDataError("global event sequence continuity failed")
+            return
+        if (
+            count != expected_count
+            or minimum != pruned_through + 1
+            or maximum != snapshot_high_water
+        ):
+            raise ContractDataError("global event sequence gap detected")
 
     @staticmethod
     def _collection_page(

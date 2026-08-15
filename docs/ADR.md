@@ -25,12 +25,13 @@ Decision:
   public GET.
 - Treat the ordered event table as a transactional outbox. Terminal state,
   evidence-backed receipt, and publication events commit in one transaction.
-- Derive profile-instance, authority, and executor identity from the active
-  scoped Hermes home, never a URL label or literal default. Embed that home
-  fingerprint in public IDs so a cross-profile identifier fails with
+- Derive profile-instance, authority, and executor identity from an atomically
+  created, owner-only, versioned random anchor inside the active scoped Hermes
+  home, never from the home path, a URL label, or a literal default. Embed an
+  anchor-derived key in public IDs so a cross-profile identifier fails with
   `403` instead of becoming an ambiguous `404`. Bind store metadata and every
-  persisted public row to that same authority so a misplaced database cannot
-  be projected under a different profile.
+  persisted public row to that same authority so a database copied without
+  its complete profile home cannot be projected under a different profile.
 - Require an explicit executor evidence hook before publishing an external
   effect receipt. Generic chat, session, Kanban, tool-progress, or process-run
   completion terminates an effect-bearing execution as ambiguous and
@@ -42,17 +43,24 @@ Decision:
 - Enforce the execution transition graph for decision creation and closure;
   cancellation and restart recovery close pending decisions transactionally.
   Bind effect evidence to the latest resolved decision so an older resolution
-  cannot authorize work after a newer decision exists.
+  cannot authorize work after a newer decision exists. Serialize decision and
+  evidence creation under the same immediate transaction, and reject every new
+  decision after evidence or a receipt exists.
 - Pin an explicit snapshot high-water in the same read transaction as every
-  collection query and require clients to carry it across pages.
+  collection query and require clients to carry it across pages. Prove the
+  unfiltered global event interval is contiguous before declaring any event
+  page complete, including filtered feeds.
 - Allow late evidence only through a dedicated atomic reconciliation hook
   that can publish an authoritative ambiguous receipt without upgrading the
-  execution to success.
+  execution to success. Include the effective recovery reference in immutable
+  retry comparison.
 - Deep-validate persisted identifiers, references, digests, bindings, states,
   revisions, and timestamp ordering before projecting any stored object.
 - Retain ordered events for 30 days by default. Prune only a contiguous global
   prefix and return `410` with an explicit minimum cursor when replay history
   is gone.
+- Normalize authenticated router-level `404` and `405` failures in the default
+  and multiplex contract namespaces into the same closed error envelope.
 
 Consequences:
 - External controllers can read durable state across restart without using

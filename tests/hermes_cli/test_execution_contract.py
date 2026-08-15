@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -99,6 +102,7 @@ def _record_evidence(
 def test_absent_read_is_side_effect_free_then_create_reopen_and_migrate(tmp_path):
     store = _store(tmp_path)
     assert not store.database_path.exists()
+    assert not store.profile_anchor_path.exists()
 
     empty = store.list_executions()
 
@@ -112,6 +116,7 @@ def test_absent_read_is_side_effect_free_then_create_reopen_and_migrate(tmp_path
         "completeness": "complete",
     }
     assert not store.database_path.exists()
+    assert not store.profile_anchor_path.exists()
 
     execution = store.create_execution(
         lifecycle="accepted",
@@ -122,7 +127,16 @@ def test_absent_read_is_side_effect_free_then_create_reopen_and_migrate(tmp_path
     )
 
     assert store.database_path.exists()
+    assert store.profile_anchor_path.exists()
     assert os.stat(store.database_path).st_mode & 0o077 == 0
+    assert os.stat(store.profile_anchor_path).st_mode & 0o777 == 0o600
+    anchor_payload = json.loads(store.profile_anchor_path.read_text(encoding="utf-8"))
+    assert anchor_payload["version"] == 1
+    assert len(anchor_payload["instance_id"]) == 64
+    assert str(store.profile_home) not in json.dumps(store.authority.public())
+    assert hashlib.sha256(str(store.profile_home).encode()).hexdigest() not in json.dumps(
+        store.authority.public()
+    )
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
     reopened = _store(tmp_path)
@@ -130,7 +144,7 @@ def test_absent_read_is_side_effect_free_then_create_reopen_and_migrate(tmp_path
     assert reopened.get_execution(execution["execution_id"])["freshness"] == "live"
 
 
-def test_packaged_schema_and_synthetic_fixtures_are_closed():
+def test_packaged_schema_and_synthetic_fixtures_are_closed(tmp_path):
     schema = contract_schema()
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
     fixture_defs = {
@@ -151,7 +165,13 @@ def test_packaged_schema_and_synthetic_fixtures_are_closed():
             assert item_definition["additionalProperties"] is False
             assert set(payload[collection][0]) == set(item_definition["required"])
 
-    capabilities = contract_capabilities(Path("/synthetic/profile"), "synthetic")
+    synthetic_home = tmp_path / "synthetic-profile"
+    synthetic_store = ExecutionContractStore(
+        profile_home=synthetic_home,
+        profile_name="synthetic",
+    )
+    synthetic_store.initialize()
+    capabilities = contract_capabilities(synthetic_home, "synthetic")
     fixture_capabilities = json.loads(
         (FIXTURES / "capabilities.json").read_text(encoding="utf-8")
     )
@@ -169,7 +189,7 @@ def test_packaged_schema_and_synthetic_fixtures_are_closed():
 
 def test_unknown_store_version_fails_closed(tmp_path):
     store = _store(tmp_path)
-    store.database_path.parent.mkdir(parents=True)
+    store.initialize()
     with sqlite3.connect(store.database_path) as connection:
         connection.execute("PRAGMA user_version=99")
 
@@ -594,6 +614,7 @@ def test_profile_crossing_and_malformed_identifiers_are_distinct(tmp_path):
     first = _store(tmp_path, profile="first")
     second = _store(tmp_path, profile="second")
     execution = first.create_execution(lifecycle="queued", now=NOW)
+    second.initialize()
 
     with pytest.raises(ContractForbiddenError):
         second.get_execution(execution["execution_id"])
@@ -601,24 +622,116 @@ def test_profile_crossing_and_malformed_identifiers_are_distinct(tmp_path):
         first.get_execution("run_not-an-execution-id")
 
 
-def test_store_file_is_bound_to_exact_profile_authority(tmp_path):
-    path = tmp_path / "shared" / "execution_contract.sqlite3"
-    first = ExecutionContractStore(
-        database_path=path,
-        profile_home=tmp_path / "first-home",
+def test_concurrent_profile_initialization_creates_one_stable_anchor(tmp_path):
+    profile_home = tmp_path / "concurrent-profile"
+
+    def initialize(_index: int):
+        store = ExecutionContractStore(
+            profile_home=profile_home,
+            runtime_instance_id="runtime-a",
+        )
+        store.initialize()
+        return store.authority
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        authorities = list(pool.map(initialize, range(16)))
+
+    assert len(set(authorities)) == 1
+    anchor = profile_home / ".execution-contract-profile-instance.json"
+    assert anchor.exists()
+    assert stat.S_IMODE(anchor.stat().st_mode) == 0o600
+    payload = json.loads(anchor.read_text(encoding="utf-8"))
+    assert set(payload) == {"version", "instance_id"}
+
+
+def test_full_profile_home_move_and_restore_preserve_authority(tmp_path):
+    original_home = tmp_path / "profile-original"
+    moved_home = tmp_path / "profile-moved"
+    restored_home = tmp_path / "profile-restored"
+    backup_home = tmp_path / "profile-backup"
+    original = ExecutionContractStore(
+        profile_home=original_home,
         runtime_instance_id="runtime-a",
     )
-    first.create_execution(lifecycle="queued", now=NOW)
-    misplaced = ExecutionContractStore(
-        database_path=path,
-        profile_home=tmp_path / "second-home",
+    execution = original.create_execution(lifecycle="queued", now=NOW)
+    original_authority = original.authority
+
+    original_home.rename(moved_home)
+    moved = ExecutionContractStore(
+        profile_home=moved_home,
         runtime_instance_id="runtime-a",
+    )
+    assert moved.get_execution(execution["execution_id"])["execution_id"] == (
+        execution["execution_id"]
+    )
+    assert moved.authority.profile_id == original_authority.profile_id
+    assert moved.authority.authority_id == original_authority.authority_id
+
+    moved_home.rename(restored_home)
+    restored = ExecutionContractStore(
+        profile_home=restored_home,
+        runtime_instance_id="runtime-a",
+    )
+    assert restored.authority.profile_id == original_authority.profile_id
+    assert restored.get_execution(execution["execution_id"])["execution_id"] == (
+        execution["execution_id"]
+    )
+    with sqlite3.connect(restored.database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    shutil.copytree(restored_home, backup_home)
+    backup = ExecutionContractStore(
+        profile_home=backup_home,
+        runtime_instance_id="runtime-a",
+    )
+    assert backup.authority.profile_id == original_authority.profile_id
+    assert backup.get_execution(execution["execution_id"])["execution_id"] == (
+        execution["execution_id"]
     )
 
+
+def test_database_only_copy_fails_against_destination_anchor(tmp_path):
+    source_home = tmp_path / "source-profile"
+    destination_home = tmp_path / "destination-profile"
+    source = ExecutionContractStore(profile_home=source_home)
+    source.create_execution(lifecycle="queued", now=NOW)
+    with sqlite3.connect(source.database_path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    destination_identity = ExecutionContractStore(
+        profile_home=destination_home,
+        database_path=destination_home / "identity-seed.sqlite3",
+    )
+    destination_identity.initialize()
+    shutil.copy2(source.database_path, destination_home / "execution_contract.sqlite3")
+    copied = ExecutionContractStore(profile_home=destination_home)
+
     with pytest.raises(ContractDataError, match="authority metadata"):
-        misplaced.list_executions()
+        copied.list_executions()
     with pytest.raises(ContractDataError, match="authority metadata"):
-        misplaced.initialize()
+        copied.initialize()
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "unsafe-mode", "symlink"])
+def test_missing_corrupt_or_unsafe_profile_anchor_fails_closed(tmp_path, damage):
+    store = _store(tmp_path)
+    store.create_execution(lifecycle="queued", now=NOW)
+    anchor = store.profile_anchor_path
+    if damage == "missing":
+        anchor.unlink()
+    elif damage == "corrupt":
+        anchor.write_text('{"version":1,"instance_id":"bad"}\n', encoding="utf-8")
+        anchor.chmod(0o600)
+    elif damage == "unsafe-mode":
+        anchor.chmod(0o644)
+    else:
+        anchor.unlink()
+        anchor.symlink_to(store.database_path)
+
+    reopened = _store(tmp_path)
+    with pytest.raises(ContractDataError, match="profile instance anchor"):
+        reopened.list_executions()
+    with pytest.raises(ContractDataError, match="profile instance anchor"):
+        reopened.initialize()
 
 
 def test_malformed_persisted_state_and_cursor_ahead_fail_closed(tmp_path):
@@ -813,6 +926,159 @@ def test_old_resolution_cannot_authorize_newer_pending_decision(tmp_path):
     assert store.get_decision(newer["decision_id"])["state"] == "pending"
 
 
+def test_evidence_blocks_new_decisions_but_preserves_idempotent_resolved_retry(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix="evidence-decision-gate")
+    resolved = _resolved_decision(store, execution, suffix="evidence-decision-gate")
+    evidence = _record_evidence(
+        store,
+        execution,
+        decision_id=resolved["decision_id"],
+        suffix="evidence-decision-gate",
+    )
+    duplicate = store.create_decision(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        proposal_ref=execution["proposal_ref"],
+        request_digest=_digest("request-evidence-decision-gate"),
+        candidate_digest=_digest("candidate-evidence-decision-gate"),
+        policy_digest=_digest("policy-evidence-decision-gate"),
+        allowed_choices=["once", "deny"],
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW + timedelta(seconds=3),
+    )
+    assert duplicate["decision_id"] == resolved["decision_id"]
+    assert duplicate["state"] == "resolved"
+    assert store.record_effect_evidence(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        outcome="succeeded",
+        subject_digest=_digest("subject-evidence-decision-gate"),
+        evidence_digest=_digest("evidence-evidence-decision-gate"),
+        result_digest=_digest("result-evidence-decision-gate"),
+        decision_id=resolved["decision_id"],
+        now=NOW + timedelta(seconds=4),
+    )["evidence_id"] == evidence["evidence_id"]
+
+    with pytest.raises(ContractConflictError, match="no new decision"):
+        store.create_decision(
+            execution_id=execution["execution_id"],
+            effect_id=execution["effect_id"],
+            proposal_ref=execution["proposal_ref"],
+            request_digest=_digest("request-after-evidence"),
+            allowed_choices=["once", "deny"],
+            expires_at=NOW + timedelta(minutes=6),
+            now=NOW + timedelta(seconds=3),
+        )
+    with pytest.raises(ContractConflictError, match="conflicting bindings"):
+        store.create_decision(
+            execution_id=execution["execution_id"],
+            effect_id=execution["effect_id"],
+            proposal_ref=execution["proposal_ref"],
+            request_digest=_digest("request-evidence-decision-gate"),
+            candidate_digest=_digest("candidate-conflict"),
+            policy_digest=_digest("policy-evidence-decision-gate"),
+            allowed_choices=["once", "deny"],
+            expires_at=NOW + timedelta(minutes=5),
+            now=NOW + timedelta(seconds=3),
+        )
+
+
+@pytest.mark.parametrize("first_operation", ["decision", "evidence"])
+def test_decision_and_evidence_race_is_serialized_by_write_transaction(
+    tmp_path,
+    first_operation,
+):
+    seed = _store(tmp_path, runtime="race-runtime")
+    execution = _bound_execution(seed, suffix=f"race-{first_operation}")
+    decision_store = _store(tmp_path, runtime="race-runtime")
+    evidence_store = _store(tmp_path, runtime="race-runtime")
+    first_locked = threading.Event()
+    release_first = threading.Event()
+    second_attempted = threading.Event()
+
+    def hold_first(operation, _execution_id):
+        if operation == first_operation:
+            first_locked.set()
+            assert release_first.wait(timeout=5)
+
+    if first_operation == "decision":
+        decision_store._after_write_lock_acquired = hold_first
+    else:
+        evidence_store._after_write_lock_acquired = hold_first
+
+    def request_decision():
+        if first_operation != "decision":
+            second_attempted.set()
+        return decision_store.create_decision(
+            execution_id=execution["execution_id"],
+            effect_id=execution["effect_id"],
+            proposal_ref=execution["proposal_ref"],
+            request_digest=_digest(f"race-request-{first_operation}"),
+            allowed_choices=["once", "deny"],
+            expires_at=NOW + timedelta(minutes=5),
+            now=NOW,
+        )
+
+    def record_evidence():
+        if first_operation != "evidence":
+            second_attempted.set()
+        return _record_evidence(
+            evidence_store,
+            execution,
+            suffix=f"race-{first_operation}",
+        )
+
+    first_call = request_decision if first_operation == "decision" else record_evidence
+    second_call = record_evidence if first_operation == "decision" else request_decision
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_call)
+        assert first_locked.wait(timeout=5)
+        second_future = pool.submit(second_call)
+        assert second_attempted.wait(timeout=5)
+        release_first.set()
+        first_result = first_future.result(timeout=10)
+        with pytest.raises(ContractConflictError):
+            second_future.result(timeout=10)
+
+    if first_operation == "decision":
+        assert first_result["state"] == "pending"
+        assert seed.list_decisions(state="pending")["items"] == [first_result]
+        assert seed.list_events(execution_id=execution["execution_id"])["page"][
+            "completeness"
+        ] == "complete"
+    else:
+        assert first_result["outcome"] == "succeeded"
+        assert seed.list_decisions()["items"] == []
+        assert seed.get_execution(execution["execution_id"])["receipt_state"] == (
+            "pending_evidence"
+        )
+
+
+def test_receipt_also_blocks_new_decisions(tmp_path):
+    store = _store(tmp_path)
+    execution = _bound_execution(store, suffix="receipt-decision-gate")
+    store.transition_execution(execution["execution_id"], "running", now=NOW)
+    _record_evidence(store, execution, suffix="receipt-decision-gate")
+    store.transition_execution(
+        execution["execution_id"],
+        "terminal_succeeded",
+        now=NOW + timedelta(seconds=3),
+    )
+    with pytest.raises(ContractConflictError, match="no new decision"):
+        store.create_decision(
+            execution_id=execution["execution_id"],
+            effect_id=execution["effect_id"],
+            proposal_ref=execution["proposal_ref"],
+            request_digest=_digest("receipt-new-decision"),
+            allowed_choices=["once", "deny"],
+            expires_at=NOW + timedelta(minutes=5),
+            now=NOW + timedelta(seconds=4),
+        )
+
+
 def test_collection_snapshot_excludes_concurrent_insert(monkeypatch, tmp_path):
     import hermes_state
 
@@ -887,12 +1153,115 @@ def test_event_snapshot_excludes_append_after_high_water(monkeypatch, tmp_path):
     ]
 
 
+@pytest.mark.parametrize("gap", ["start", "interior", "end"])
+def test_global_event_sequence_gaps_fail_closed_before_complete(tmp_path, gap):
+    store = _store(tmp_path)
+    for index in range(4):
+        store.create_execution(
+            lifecycle="queued",
+            source_run_id=f"gap-{gap}-{index}",
+            now=NOW + timedelta(microseconds=index),
+        )
+    sequence = {"start": 1, "interior": 2, "end": 4}[gap]
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "DELETE FROM execution_events WHERE sequence=?",
+            (sequence,),
+        )
+        connection.commit()
+
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.list_events()
+
+
+def test_filtered_event_feed_still_validates_unfiltered_global_continuity(tmp_path):
+    store = _store(tmp_path)
+    first = store.create_execution(lifecycle="queued", now=NOW)
+    store.create_execution(
+        lifecycle="queued",
+        now=NOW + timedelta(microseconds=1),
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DELETE FROM execution_events WHERE sequence=2")
+        connection.commit()
+
+    with pytest.raises(ContractDataError, match="event sequence gap"):
+        store.list_events(execution_id=first["execution_id"])
+
+
+def test_empty_and_fully_pruned_event_windows_are_legitimately_complete(tmp_path):
+    empty = _store(tmp_path, profile="empty")
+    assert empty.list_events()["page"] == {
+        "cursor": 0,
+        "high_water": 0,
+        "snapshot_high_water": 0,
+        "minimum_available": 1,
+        "has_more": False,
+        "completeness": "complete",
+        "pruned_through": 0,
+        "retention_seconds": 2592000,
+    }
+
+    store = _store(tmp_path, profile="pruned")
+    old = NOW - timedelta(days=40)
+    execution = store.create_execution(lifecycle="running", now=old)
+    store.transition_execution(
+        execution["execution_id"],
+        "terminal_failed",
+        now=old + timedelta(seconds=1),
+    )
+    assert store.prune_events(now=NOW) == 2
+    page = store.list_events(after=2, snapshot_high_water=2)
+    assert page["items"] == []
+    assert page["page"]["completeness"] == "complete"
+    assert page["page"]["pruned_through"] == 2
+    assert page["page"]["snapshot_high_water"] == 2
+
+
+def test_pruning_after_snapshot_pin_does_not_create_false_gap(
+    monkeypatch,
+    tmp_path,
+):
+    import hermes_state
+
+    monkeypatch.setattr(
+        hermes_state,
+        "apply_wal_with_fallback",
+        lambda connection, **_kwargs: connection.execute("PRAGMA journal_mode=WAL"),
+    )
+    reader = _store(tmp_path)
+    writer = _store(tmp_path)
+    old = NOW - timedelta(days=40)
+    execution = reader.create_execution(lifecycle="running", now=old)
+    reader.transition_execution(
+        execution["execution_id"],
+        "terminal_failed",
+        now=old + timedelta(seconds=1),
+    )
+    writer.initialize()
+    pruned = []
+
+    def prune_after_pin(collection, _high_water):
+        if collection == "events" and not pruned:
+            pruned.append(writer.prune_events(now=NOW))
+
+    reader._after_snapshot_pinned = prune_after_pin
+    page = reader.list_events(after=0)
+    assert pruned == [2]
+    assert len(page["items"]) == 2
+    assert page["page"]["completeness"] == "complete"
+    reader._after_snapshot_pinned = lambda *_args: None
+    with pytest.raises(ContractCursorGoneError):
+        reader.list_events(after=0)
+
+
 def test_late_ambiguous_evidence_publishes_receipt_transactionally(tmp_path):
     store = _store(tmp_path)
     execution = _bound_execution(store, suffix="late-ambiguous")
     terminal = store.transition_execution(
         execution["execution_id"],
         "terminal_failed",
+        recovery_ref="recovery:late-ambiguous",
         now=NOW + timedelta(seconds=1),
     )
     assert terminal["lifecycle"] == "terminal_ambiguous"
@@ -919,6 +1288,30 @@ def test_late_ambiguous_evidence_publishes_receipt_transactionally(tmp_path):
     assert store.get_receipt(receipt["receipt_id"])["reconciliation_ref"] == (
         "reconcile:late-ambiguous"
     )
+    assert receipt["recovery_ref"] == "recovery:late-ambiguous"
+    identical = store.reconcile_ambiguous_evidence(
+        execution_id=execution["execution_id"],
+        effect_id=execution["effect_id"],
+        outcome="ambiguous",
+        subject_digest=_digest("late-subject"),
+        evidence_digest=_digest("late-evidence"),
+        result_digest=_digest("late-result"),
+        reconciliation_ref="reconcile:late-ambiguous",
+        now=NOW + timedelta(seconds=3),
+    )
+    assert identical["receipt_id"] == receipt["receipt_id"]
+    with pytest.raises(ContractConflictError, match="not eligible"):
+        store.reconcile_ambiguous_evidence(
+            execution_id=execution["execution_id"],
+            effect_id=execution["effect_id"],
+            outcome="ambiguous",
+            subject_digest=_digest("late-subject"),
+            evidence_digest=_digest("late-evidence"),
+            result_digest=_digest("late-result"),
+            recovery_ref="recovery:conflicting-retry",
+            reconciliation_ref="reconcile:late-ambiguous",
+            now=NOW + timedelta(seconds=4),
+        )
 
 
 @pytest.mark.parametrize(

@@ -364,6 +364,7 @@
                 "execution_contract_invalid_request",
                 "execution_contract_profile_forbidden",
                 "execution_contract_not_found",
+                "execution_contract_method_not_allowed",
                 "execution_contract_conflict",
                 "execution_contract_cursor_gone",
                 "execution_contract_rate_limited",

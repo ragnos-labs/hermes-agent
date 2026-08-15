@@ -1,8 +1,11 @@
 """Behavioral regression coverage for the wheel/sdist distribution guard."""
 
+import json
 import os
 import subprocess
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -69,4 +72,33 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     result = _build_artifact(kind, tmp_path, nix_build=True)
 
     assert result.returncode == 0, result.stderr
-    assert list(tmp_path.glob(artifact_glob))
+    artifacts = list(tmp_path.glob(artifact_glob))
+    assert artifacts
+
+    contract_schema_path = (
+        "hermes_cli/execution_contract_schemas/"
+        "hermes.execution.read.v1.schema.json"
+    )
+
+    if kind == "wheel":
+        with zipfile.ZipFile(artifacts[0]) as wheel:
+            shipped = set(wheel.namelist())
+            packaged_contract = json.loads(wheel.read(contract_schema_path))
+    else:
+        with tarfile.open(artifacts[0]) as sdist:
+            root = sdist.getnames()[0].split("/", 1)[0]
+            shipped = {
+                name.split("/", 1)[1]
+                for name in sdist.getnames()
+                if "/" in name
+            }
+            member = sdist.extractfile(f"{root}/{contract_schema_path}")
+            assert member is not None
+            packaged_contract = json.loads(member.read())
+
+    assert contract_schema_path in shipped
+    assert packaged_contract["$id"] == (
+        "https://hermes-agent.nousresearch.com/contracts/"
+        "hermes.execution.read.v1.schema.json"
+    )
+    assert packaged_contract["$defs"]["errorDetail"]["additionalProperties"] is False

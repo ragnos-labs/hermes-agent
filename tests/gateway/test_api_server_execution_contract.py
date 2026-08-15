@@ -58,7 +58,12 @@ def contract_adapter(monkeypatch):
 
 
 def _contract_app(adapter: APIServerAdapter) -> web.Application:
-    app = web.Application()
+    app = web.Application(
+        middlewares=[
+            adapter._make_profile_prefix_middleware(),
+            adapter._make_execution_contract_router_error_middleware(),
+        ]
+    )
     wanted = {
         ("GET", "/v1/capabilities"),
         ("GET", "/v1/models"),
@@ -80,6 +85,7 @@ def _contract_app(adapter: APIServerAdapter) -> web.Application:
     for method, path, handler in adapter._http_route_table():
         if (method, path) in wanted:
             app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
     return app
 
 
@@ -89,6 +95,8 @@ async def test_read_key_is_side_effect_free_and_returns_asserted_authority(
 ):
     store = contract_adapter._execution_contract_store()
     assert not store.database_path.exists()
+    store.initialize()
+    ledger_mtime = store.database_path.stat().st_mtime_ns
     app = _contract_app(contract_adapter)
 
     async with TestClient(TestServer(app)) as client:
@@ -127,7 +135,7 @@ async def test_read_key_is_side_effect_free_and_returns_asserted_authority(
         schema = await schema_response.json()
         assert schema["$defs"]["receipt"]["additionalProperties"] is False
 
-    assert not store.database_path.exists()
+    assert store.database_path.stat().st_mtime_ns == ledger_mtime
 
 
 @pytest.mark.asyncio
@@ -421,6 +429,7 @@ def test_profile_authority_comes_from_active_home_not_request_name(
 
     with _profile_runtime_scope(named_home):
         first = contract_adapter._execution_contract_store()
+        first.initialize()
         token = _api_request_profile.set("url-name-must-not-control-authority")
         try:
             same_home = contract_adapter._execution_contract_store()
@@ -431,10 +440,15 @@ def test_profile_authority_comes_from_active_home_not_request_name(
 
     with _profile_runtime_scope(alpha_home):
         alpha = contract_adapter._execution_contract_store()
+        alpha.initialize()
     with _profile_runtime_scope(beta_home):
         beta = contract_adapter._execution_contract_store()
+        beta.initialize()
     assert alpha.authority.profile_id != beta.authority.profile_id
     assert alpha.authority.profile_key != beta.authority.profile_key
+    assert alpha.profile_anchor_path.exists()
+    assert beta.profile_anchor_path.exists()
+    assert alpha.profile_anchor_path.read_bytes() != beta.profile_anchor_path.read_bytes()
 
 
 @pytest.mark.asyncio
@@ -450,19 +464,163 @@ async def test_unknown_profile_route_uses_closed_contract_error(
         lambda _request: _PROFILE_REJECTED,
     )
     app = web.Application(
-        middlewares=[contract_adapter._make_profile_prefix_middleware()]
+        middlewares=[
+            contract_adapter._make_profile_prefix_middleware(),
+            contract_adapter._make_execution_contract_router_error_middleware(),
+        ]
     )
     app.router.add_get(
         "/p/{profile}/v1/execution-contract/executions",
         contract_adapter._handle_execution_contract_executions,
     )
     async with TestClient(TestServer(app)) as client:
+        unauthenticated = await client.get(
+            "/p/unknown/v1/execution-contract/executions"
+        )
+        assert unauthenticated.status == 401
+        _assert_closed_error(await unauthenticated.json())
         response = await client.get(
             "/p/unknown/v1/execution-contract/executions",
             headers=_auth(READ_KEY),
         )
         assert response.status == 404
         _assert_closed_error(await response.json())
+
+
+@pytest.mark.asyncio
+async def test_router_404_and_405_use_closed_contract_errors_with_auth_precedence(
+    contract_adapter,
+):
+    contract_adapter._execution_contract_store().initialize()
+    app = _contract_app(contract_adapter)
+    async with TestClient(TestServer(app)) as client:
+        unknown_without_auth = await client.get(
+            "/v1/execution-contract/not-a-route"
+        )
+        assert unknown_without_auth.status == 401
+        _assert_closed_error(await unknown_without_auth.json())
+
+        unknown = await client.get(
+            "/v1/execution-contract/not-a-route",
+            headers=_auth(READ_KEY),
+        )
+        assert unknown.status == 404
+        unknown_payload = await unknown.json()
+        _assert_closed_error(unknown_payload)
+        assert unknown_payload["error"]["code"] == "execution_contract_not_found"
+
+        wrong_method_without_auth = await client.post(
+            "/v1/execution-contract/executions"
+        )
+        assert wrong_method_without_auth.status == 401
+        _assert_closed_error(await wrong_method_without_auth.json())
+
+        read_scope_denial = await client.post(
+            "/v1/execution-contract/executions",
+            headers=_auth(READ_KEY),
+        )
+        assert read_scope_denial.status == 403
+        _assert_closed_error(await read_scope_denial.json())
+
+        wrong_method = await client.post(
+            "/v1/execution-contract/executions",
+            headers=_auth(FULL_KEY),
+        )
+        assert wrong_method.status == 405
+        wrong_method_payload = await wrong_method.json()
+        _assert_closed_error(wrong_method_payload)
+        assert wrong_method_payload["error"]["code"] == (
+            "execution_contract_method_not_allowed"
+        )
+
+        prefixed_wrong_method = await client.post(
+            "/p/default/v1/execution-contract/executions",
+            headers=_auth(FULL_KEY),
+        )
+        assert prefixed_wrong_method.status == 405
+        _assert_closed_error(await prefixed_wrong_method.json())
+
+        malformed_without_auth = await client.get(
+            "/p//v1/execution-contract/executions"
+        )
+        assert malformed_without_auth.status == 401
+        _assert_closed_error(await malformed_without_auth.json())
+        malformed = await client.get(
+            "/p//v1/execution-contract/executions",
+            headers=_auth(READ_KEY),
+        )
+        assert malformed.status == 404
+        _assert_closed_error(await malformed.json())
+
+        non_contract = await client.get(
+            "/not-an-api-route",
+            headers=_auth(FULL_KEY),
+        )
+        assert non_contract.status == 404
+        assert non_contract.content_type != "application/json"
+
+
+@pytest.mark.asyncio
+async def test_named_multiplex_router_errors_use_named_profile_auth(
+    contract_adapter,
+    monkeypatch,
+    tmp_path,
+):
+    from agent import secret_scope
+    from gateway.run import _profile_runtime_scope
+
+    worker_home = tmp_path / "profiles" / "worker"
+    worker_home.mkdir(parents=True)
+    worker_full_key = "worker-full-key-0123456789abcdef"
+    worker_read_key = "worker-read-key-0123456789abcdef"
+    (worker_home / ".env").write_text(
+        f"API_SERVER_KEY={worker_full_key}\nAPI_SERVER_READ_KEY={worker_read_key}\n",
+        encoding="utf-8",
+    )
+    contract_adapter.gateway_runner = type(
+        "_Runner",
+        (),
+        {"config": GatewayConfig(multiplex_profiles=True)},
+    )()
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: [
+            ("default", tmp_path),
+            ("worker", worker_home),
+        ],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: tmp_path if name == "default" else worker_home,
+    )
+    with _profile_runtime_scope(worker_home):
+        contract_adapter._execution_contract_store().initialize()
+    secret_scope.set_multiplex_active(True)
+    try:
+        app = _contract_app(contract_adapter)
+        async with TestClient(TestServer(app)) as client:
+            rejected = await client.get(
+                "/p/worker/v1/execution-contract/not-a-route",
+                headers=_auth(READ_KEY),
+            )
+            assert rejected.status == 401
+            _assert_closed_error(await rejected.json())
+
+            unknown = await client.get(
+                "/p/worker/v1/execution-contract/not-a-route",
+                headers=_auth(worker_read_key),
+            )
+            assert unknown.status == 404
+            _assert_closed_error(await unknown.json())
+
+            wrong_method = await client.post(
+                "/p/worker/v1/execution-contract/executions",
+                headers=_auth(worker_full_key),
+            )
+            assert wrong_method.status == 405
+            _assert_closed_error(await wrong_method.json())
+    finally:
+        secret_scope.set_multiplex_active(False)
 
 
 def test_fixture_payloads_contain_no_runtime_or_secret_material():

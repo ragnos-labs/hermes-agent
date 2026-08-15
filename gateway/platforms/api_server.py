@@ -1831,20 +1831,26 @@ class APIServerAdapter(BasePlatformAdapter):
         return path
 
     @staticmethod
+    def _is_execution_contract_namespace_path(path: str) -> bool:
+        return path == "/v1/execution-contract" or path.startswith(
+            "/v1/execution-contract/"
+        )
+
+    @staticmethod
     def _read_key_path_allowed(request: "web.Request") -> bool:
         """True only for Release 1 contract reads and capability negotiation."""
         if request.method != "GET":
             return False
         path = APIServerAdapter._request_path(request)
-        return path == "/v1/capabilities" or path.startswith(
-            "/v1/execution-contract/"
+        return path == "/v1/capabilities" or (
+            APIServerAdapter._is_execution_contract_namespace_path(path)
         )
 
     @staticmethod
     def _is_execution_contract_public_request(request: "web.Request") -> bool:
         path = APIServerAdapter._request_path(request)
-        return path == "/v1/capabilities" or path.startswith(
-            "/v1/execution-contract/"
+        return path == "/v1/capabilities" or (
+            APIServerAdapter._is_execution_contract_namespace_path(path)
         )
 
     def _execution_contract_auth_response(
@@ -2122,6 +2128,14 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         profile = (request.match_info.get("profile") or "").strip()
         if not profile:
+            raw_path = getattr(request, "path", "")
+            if isinstance(raw_path, str) and raw_path.startswith("/p/"):
+                parts = raw_path.split("/", 3)
+                if len(parts) == 4:
+                    profile = parts[2].strip()
+                if not profile and self._is_execution_contract_public_request(request):
+                    return _PROFILE_REJECTED
+        if not profile:
             return None
         runner = getattr(self, "gateway_runner", None)
         cfg = getattr(runner, "config", None)
@@ -2186,6 +2200,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if self._is_execution_contract_public_request(request):
                     from hermes_cli.execution_contract import ContractNotFoundError
 
+                    auth_err = self._check_auth(request)
+                    if auth_err:
+                        return auth_err
                     return self._execution_contract_error_response(
                         ContractNotFoundError("profile is unknown or unconfigured")
                     )
@@ -2201,6 +2218,42 @@ class APIServerAdapter(BasePlatformAdapter):
                 _api_request_profile.reset(token)
 
         return profile_prefix_middleware
+
+    def _make_execution_contract_router_error_middleware(self):
+        """Close authenticated 404/405 responses inside the contract namespace."""
+
+        @web.middleware
+        async def execution_contract_router_error_middleware(
+            request: "web.Request",
+            handler,
+        ):
+            try:
+                return await handler(request)
+            except (web.HTTPNotFound, web.HTTPMethodNotAllowed) as exc:
+                if not self._is_execution_contract_namespace_path(
+                    self._request_path(request)
+                ):
+                    raise
+                auth_err = self._check_auth(request)
+                if auth_err:
+                    return auth_err
+                if isinstance(exc, web.HTTPMethodNotAllowed):
+                    from hermes_cli.execution_contract import (
+                        ContractMethodNotAllowedError,
+                    )
+
+                    return self._execution_contract_error_response(
+                        ContractMethodNotAllowedError(
+                            "method is not allowed in the execution contract namespace"
+                        )
+                    )
+                from hermes_cli.execution_contract import ContractNotFoundError
+
+                return self._execution_contract_error_response(
+                    ContractNotFoundError("execution contract route not found")
+                )
+
+        return execution_contract_router_error_middleware
 
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
@@ -3337,6 +3390,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ContractCursorGoneError,
             ContractDataError,
             ContractForbiddenError,
+            ContractMethodNotAllowedError,
             ContractNotFoundError,
             ContractRateLimitedError,
             ContractUnauthorizedError,
@@ -3358,6 +3412,8 @@ class APIServerAdapter(BasePlatformAdapter):
             status, code = 403, "execution_contract_profile_forbidden"
         elif isinstance(exc, ContractNotFoundError):
             status, code = 404, "execution_contract_not_found"
+        elif isinstance(exc, ContractMethodNotAllowedError):
+            status, code = 405, "execution_contract_method_not_allowed"
         elif isinstance(exc, (ContractConflictError, UnsupportedContractVersionError)):
             status, code = 409, "execution_contract_conflict"
         elif isinstance(exc, ContractCursorGoneError):
@@ -8434,6 +8490,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 mw
                 for mw in (
                     self._make_profile_prefix_middleware(),
+                    self._make_execution_contract_router_error_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,

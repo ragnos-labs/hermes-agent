@@ -18,10 +18,14 @@ effect receipts. It is profile scoped. The server returns the profile,
 execution authority, and executor identities in every response; clients do
 not infer authority from a URL, model name, provider, process, or config file.
 
-Authority IDs are derived from a fingerprint of the active scoped
-`get_hermes_home()` profile instance and bound into ledger metadata. A URL
-profile label is routing context only; it cannot assert authority. Moving a
-ledger to another profile home fails closed.
+Authority IDs are derived from a versioned random profile-instance anchor,
+created atomically with owner-only permissions inside the active scoped
+`get_hermes_home()`, and bound into ledger metadata. They never encode or hash
+the filesystem path. A URL profile label is routing context only; it cannot
+assert authority. Moving or restoring the complete profile home preserves the
+anchor and authority; copying only the ledger into another home fails closed
+against that home's different anchor. An existing ledger with a missing,
+corrupt, mismatched, or permission-unsafe anchor is unavailable.
 
 The following are projections, not authoritative effect evidence:
 
@@ -90,6 +94,10 @@ for 30 days by default. Pruning advances only across a contiguous global
 prefix, so no retained event can be hidden behind the watermark. A cursor
 older than retained history returns `410` with the new minimum and high-water;
 a cursor ahead of high-water returns `409`.
+Before returning `completeness=complete`, every event request proves the
+unfiltered global sequence interval from `pruned_through + 1` through its
+pinned snapshot. Start, interior, and trailing gaps fail closed, including
+when the requested feed is filtered to one execution.
 
 ## Execution lifecycle
 
@@ -123,6 +131,10 @@ same transaction. Create, resolve, and supersede operations enforce the
 execution transition graph and cannot revive a cancelling or terminal
 execution. Effect evidence is accepted only against the latest resolved
 decision; a newer pending or closed decision invalidates older authorization.
+No new decision may be created after effect evidence or a receipt exists.
+Decision requests and evidence publication share the same immediate write
+transaction boundary, so either ordering is deterministic; an exact retry of
+an already-created decision remains idempotent.
 
 ## Terminal receipts
 
@@ -142,6 +154,9 @@ separate late-reconciliation hook. It accepts only explicit authoritative
 `ambiguous` evidence with a reconciliation reference and atomically records
 evidence, publishes the receipt, updates the execution, and appends both
 events. It cannot upgrade ambiguity to success.
+The effective recovery reference is part of the immutable retry identity:
+identical reconciliation retries return the existing receipt and a changed
+recovery reference conflicts.
 
 ## Authentication and errors
 
@@ -162,21 +177,26 @@ Contract errors use a closed JSON shape and these statuses:
 | `401` | missing or invalid bearer token |
 | `403` | scope denial or cross-profile identifier |
 | `404` | scoped object does not exist |
+| `405` | authenticated contract route does not support the method |
 | `409` | version, revision, binding, lifecycle, or cursor conflict |
 | `410` | cursor points into pruned history |
 | `429` | ledger is busy; response includes `Retry-After` |
 | `500` | persisted contract data is corrupt or an internal invariant failed |
 | `503` | ledger is unavailable or the profile is degraded after a failed write |
 
-Server error details are not returned to clients.
+Server error details are not returned to clients. Router-level `404` and `405`
+responses inside both the default and `/p/<profile>/` contract namespaces use
+this same closed envelope after authentication. Non-contract aiohttp routing
+behavior is unchanged.
 
 ## Persistence and migration
 
 Each profile owns `{get_hermes_home()}/execution_contract.sqlite3`. Schema
 creation is an explicit, atomic migration performed before the HTTP listener
-starts. Store metadata and every public row are bound to the exact asserted
-profile, authority, and executor where applicable; a misplaced ledger fails
-closed. Public reads open the existing file with SQLite `mode=ro` and
+starts. Profile-anchor initialization is separate from the ledger and is also
+completed before reads are accepted. Store metadata and every public row are
+bound to the exact asserted profile, authority, and executor where applicable;
+a misplaced ledger fails closed. Public reads open the existing file with SQLite `mode=ro` and
 `query_only=ON`; a missing ledger returns an empty complete collection without
 creating a file. Startup rejects an unknown store or contract version, recovers
 orphaned nonterminal executions, expires decisions, and applies event
