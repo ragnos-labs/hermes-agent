@@ -2,14 +2,14 @@ name: GHCR Execution Read Release
 
 # Fork-owned publication for the dependency-owned execution-read contract.
 # Pull requests only validate: they have read-only permissions and never log in
-# to a registry. Publishing is limited to a published CalVer release or an
-# exact, confirmed workflow_dispatch. Both publication paths must name a tag
-# that resolves to the exact source SHA and pass through the gh-image
-# environment. This workflow never creates main or latest tags.
+# to a registry. Publishing is limited to an exact workflow_dispatch of this
+# audited workflow on protected main. A dispatch confirmation records intent;
+# it is not approval. Publication also fails closed unless gh-image has required
+# reviewers and a main-only deployment policy. Protected CalVer tags and GHCR
+# package-writer restrictions remain external release gates owned by the pilot.
+# This workflow never creates main or latest tags.
 on:
   pull_request:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       source_sha:
@@ -25,7 +25,7 @@ on:
         required: true
         type: string
       confirm_publish:
-        description: Type publish ghcr.io/ragnos-labs/hermes-agent:<release_tag>.
+        description: Intent only, not approval. Type publish ghcr.io/ragnos-labs/hermes-agent:<release_tag>.
         required: true
         type: string
 
@@ -33,7 +33,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ghcr-execution-read-${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+  group: ghcr-execution-read-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.event.pull_request.number }}
   cancel-in-progress: false
 
 env:
@@ -52,6 +52,10 @@ jobs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       source_ref: ${{ steps.source.outputs.source_ref }}
       release_tag: ${{ steps.source.outputs.release_tag }}
+      event_ref: ${{ steps.source.outputs.event_ref }}
+      workflow_ref: ${{ steps.source.outputs.workflow_ref }}
+      workflow_sha: ${{ steps.source.outputs.workflow_sha }}
+      workflow_run_id: ${{ steps.source.outputs.workflow_run_id }}
     steps:
       - name: Validate event inputs
         id: source
@@ -60,9 +64,13 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           EVENT_SHA: ${{ github.sha }}
           EVENT_REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
           INPUT_SOURCE_REF: ${{ inputs.source_ref }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
@@ -77,16 +85,6 @@ jobs:
               source_sha="$PR_HEAD_SHA"
               source_ref="refs/pull/${PR_NUMBER}/head"
               ;;
-            release)
-              [ "$REPOSITORY" = "ragnos-labs/hermes-agent" ] || {
-                echo "::error::Publication is fork-owned and may run only in ragnos-labs/hermes-agent."
-                exit 1
-              }
-              publish=true
-              source_sha="$EVENT_SHA"
-              source_ref="$EVENT_REF"
-              release_tag="$EVENT_RELEASE_TAG"
-              ;;
             workflow_dispatch)
               [ "$REPOSITORY" = "ragnos-labs/hermes-agent" ] || {
                 echo "::error::Publication is fork-owned and may run only in ragnos-labs/hermes-agent."
@@ -96,9 +94,34 @@ jobs:
               source_sha="$INPUT_SOURCE_SHA"
               source_ref="$INPUT_SOURCE_REF"
               release_tag="$INPUT_RELEASE_TAG"
+              expected_workflow_ref="ragnos-labs/hermes-agent/.github/workflows/ghcr-execution-read-release.yml@refs/heads/main"
+              [ "$EVENT_REF" = "refs/heads/main" ] || {
+                echo "::error::Publication dispatch must run on refs/heads/main, not $EVENT_REF."
+                exit 1
+              }
+              [ "$WORKFLOW_REF" = "$expected_workflow_ref" ] || {
+                echo "::error::Dispatch used an unaudited workflow ref: $WORKFLOW_REF"
+                exit 1
+              }
+              [ "$WORKFLOW_NAME" = "GHCR Execution Read Release" ] || {
+                echo "::error::Unexpected workflow identity: $WORKFLOW_NAME"
+                exit 1
+              }
+              [[ "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+                echo "::error::github.workflow_sha is not an exact lowercase commit SHA."
+                exit 1
+              }
+              [ "$EVENT_SHA" = "$WORKFLOW_SHA" ] || {
+                echo "::error::Dispatch event SHA does not match the audited workflow SHA."
+                exit 1
+              }
+              [ "$REF_PROTECTED" = "true" ] || {
+                echo "::error::refs/heads/main is not protected by repository controls."
+                exit 1
+              }
               expected_confirmation="publish ghcr.io/ragnos-labs/hermes-agent:${release_tag}"
               [ "$INPUT_CONFIRM" = "$expected_confirmation" ] || {
-                echo "::error::confirm_publish must exactly match: $expected_confirmation"
+                echo "::error::Intent confirmation must exactly match: $expected_confirmation"
                 exit 1
               }
               ;;
@@ -129,7 +152,167 @@ jobs:
             echo "source_sha=$source_sha"
             echo "source_ref=$source_ref"
             echo "release_tag=$release_tag"
+            echo "event_ref=$EVENT_REF"
+            echo "workflow_ref=$WORKFLOW_REF"
+            echo "workflow_sha=$WORKFLOW_SHA"
+            echo "workflow_run_id=$WORKFLOW_RUN_ID"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Check out audited workflow revision
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fence audited workflow revision to current main
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin refs/heads/main
+          [ "$(git rev-parse 'HEAD^{commit}')" = "$WORKFLOW_SHA" ]
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA" ] || {
+            echo "::error::main moved after dispatch; audited workflow revision is stale."
+            exit 1
+          }
+          [ "$WORKFLOW_REF" = "ragnos-labs/hermes-agent/.github/workflows/ghcr-execution-read-release.yml@refs/heads/main" ]
+          git ls-tree -r --name-only "$WORKFLOW_SHA" -- \
+            .github/workflows/ghcr-execution-read-release.yml \
+            | grep -Fxq .github/workflows/ghcr-execution-read-release.yml
+
+  publication-policy:
+    name: Publication state-transition guards
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Test audited workflow dispatch fence
+        run: |
+          python3 - <<'PY'
+          EXPECTED_WORKFLOW_REF = (
+              "ragnos-labs/hermes-agent/.github/workflows/"
+              "ghcr-execution-read-release.yml@refs/heads/main"
+          )
+          SHA = "a" * 40
+
+
+          def accepted(*, repository, event_ref, workflow_ref, event_sha, workflow_sha, protected):
+              return (
+                  repository == "ragnos-labs/hermes-agent"
+                  and event_ref == "refs/heads/main"
+                  and workflow_ref == EXPECTED_WORKFLOW_REF
+                  and event_sha == workflow_sha
+                  and len(workflow_sha) == 40
+                  and all(character in "0123456789abcdef" for character in workflow_sha)
+                  and protected
+              )
+
+
+          valid = dict(
+              repository="ragnos-labs/hermes-agent",
+              event_ref="refs/heads/main",
+              workflow_ref=EXPECTED_WORKFLOW_REF,
+              event_sha=SHA,
+              workflow_sha=SHA,
+              protected=True,
+          )
+          assert accepted(**valid)
+          for field, unsafe in (
+              ("repository", "NousResearch/hermes-agent"),
+              ("event_ref", "refs/heads/copied-workflow"),
+              ("event_ref", "refs/tags/v2026.8.15"),
+              ("workflow_ref", EXPECTED_WORKFLOW_REF.replace("main", "copied-workflow")),
+              ("event_sha", "b" * 40),
+              ("workflow_sha", "not-an-exact-sha"),
+              ("protected", False),
+          ):
+              candidate = valid | {field: unsafe}
+              assert not accepted(**candidate), (field, unsafe)
+          print("audited_workflow_dispatch_fence=passed")
+          PY
+
+      - name: Test fail-closed tag and recovery transitions
+        run: |
+          python3 - <<'PY'
+          import json
+
+
+          class Rejected(Exception):
+              pass
+
+
+          def plan(*, children, tag_still_exact, sha_state, release_state, same_digest=True):
+              actions = []
+              if set(children) != {"amd64", "arm64"}:
+                  raise Rejected("both architecture proofs are required before any tag mutation")
+              if not tag_still_exact:
+                  raise Rejected("the CalVer source tag moved")
+              if release_state == "conflict":
+                  raise Rejected("release tag conflicts; reject before creating the SHA tag")
+              if sha_state == "conflict":
+                  raise Rejected("immutable SHA tag conflicts")
+              if sha_state == release_state == "matching" and not same_digest:
+                  raise Rejected("matching-content tags must resolve to the same index digest")
+              if release_state == "matching" and sha_state == "absent":
+                  actions.append("create_sha_from_release")
+              elif sha_state == "absent":
+                  actions.append("create_sha_from_children")
+              if release_state == "absent":
+                  actions.append("create_release_from_sha")
+              return actions
+
+
+          cases = {
+              "one_arch_failure": lambda: plan(
+                  children={"amd64"}, tag_still_exact=True,
+                  sha_state="absent", release_state="absent"
+              ),
+              "duplicate_rerun": lambda: plan(
+                  children={"amd64", "arm64"}, tag_still_exact=True,
+                  sha_state="matching", release_state="matching"
+              ),
+              "moved_tag": lambda: plan(
+                  children={"amd64", "arm64"}, tag_still_exact=False,
+                  sha_state="absent", release_state="absent"
+              ),
+              "existing_matching_tags": lambda: plan(
+                  children={"amd64", "arm64"}, tag_still_exact=True,
+                  sha_state="matching", release_state="matching", same_digest=True
+              ),
+              "conflicting_release_tag": lambda: plan(
+                  children={"amd64", "arm64"}, tag_still_exact=True,
+                  sha_state="absent", release_state="conflict"
+              ),
+              "recovery_from_sha_tag": lambda: plan(
+                  children={"amd64", "arm64"}, tag_still_exact=True,
+                  sha_state="matching", release_state="absent"
+              ),
+              "recovery_from_release_tag": lambda: plan(
+                  children={"amd64", "arm64"}, tag_still_exact=True,
+                  sha_state="absent", release_state="matching"
+              ),
+          }
+          rejected = {"one_arch_failure", "moved_tag", "conflicting_release_tag"}
+          results = {}
+          for name, case in cases.items():
+              try:
+                  results[name] = {"outcome": "accepted", "actions": case()}
+              except Rejected as exc:
+                  results[name] = {"outcome": "rejected", "reason": str(exc)}
+
+          assert all(results[name]["outcome"] == "rejected" for name in rejected), results
+          assert results["duplicate_rerun"]["actions"] == [], results
+          assert results["existing_matching_tags"]["actions"] == [], results
+          assert results["recovery_from_sha_tag"]["actions"] == ["create_release_from_sha"], results
+          assert results["recovery_from_release_tag"]["actions"] == ["create_sha_from_release"], results
+          print(json.dumps(results, indent=2, sort_keys=True))
+          PY
 
   conformance:
     name: Execution-read conformance and package proof
@@ -300,11 +483,68 @@ jobs:
           print(f"packaged_schema_sha256={actual_sha}")
           PY
 
+  authorize:
+    name: Verify external release gates
+    if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, publication-policy, conformance, build]
+    environment: gh-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require protected gh-image approval and main-only deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          current_main="$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          [ "$current_main" = "$WORKFLOW_SHA" ] || {
+            echo "::error::main moved after the audited workflow revision; dispatch is stale."
+            exit 1
+          }
+          environment_json="$RUNNER_TEMP/gh-image.json"
+          gh api "repos/${REPOSITORY}/environments/gh-image" > "$environment_json"
+          python3 - "$environment_json" <<'PY'
+          import json
+          import sys
+
+          environment = json.load(open(sys.argv[1], encoding="utf-8"))
+          reviewers = [
+              rule for rule in environment.get("protection_rules", [])
+              if rule.get("type") == "required_reviewers"
+              and rule.get("reviewers")
+              and rule.get("prevent_self_review") is True
+          ]
+          policy = environment.get("deployment_branch_policy") or {}
+          assert reviewers, "gh-image must have a required reviewer and prevent self-review"
+          assert policy.get("protected_branches") or policy.get("custom_branch_policies"), (
+              "gh-image must restrict deployments to protected branches or custom main policy"
+          )
+          print(json.dumps({"required_reviewer_rules": len(reviewers), "deployment_branch_policy": policy}))
+          PY
+
+          custom_policies="$(jq -r '.deployment_branch_policy.custom_branch_policies // false' "$environment_json")"
+          if [ "$custom_policies" = "true" ]; then
+            gh api --paginate \
+              "repos/${REPOSITORY}/environments/gh-image/deployment-branch-policies" \
+              --jq '.branch_policies[]?.name' \
+              | grep -Fxq main || {
+              echo "::error::gh-image custom deployment policies do not include exact branch main."
+              exit 1
+            }
+          fi
+
+          echo "External hold passed: gh-image required review and main deployment restriction are present."
+          echo "CalVer tag protection and GHCR package-writer restriction remain pilot-owned external gates."
+
   publish:
     name: Publish untagged digest (${{ matrix.arch }})
     if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
-    needs: [resolve, conformance, build]
-    environment: gh-image
+    needs: [resolve, authorize]
     strategy:
       fail-fast: false
       matrix:
@@ -336,9 +576,15 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
           [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
+          git fetch --force --no-tags origin refs/heads/main
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA" ] || {
+            echo "::error::main moved after the audited workflow revision; no digest may be pushed."
+            exit 1
+          }
           git fetch --force --no-tags origin "$SOURCE_REF"
           [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
           [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ]
@@ -369,116 +615,620 @@ jobs:
           build-args: |
             HERMES_GIT_SHA=${{ needs.resolve.outputs.source_sha }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          provenance: false
+          provenance: mode=max
+          sbom: true
           cache-from: ${{ matrix.cache-from }}
           cache-to: ${{ matrix.cache-to }}
 
-      - name: Export architecture digest
+      - name: Initialize pushed-digest recovery evidence
         env:
+          ARCH: ${{ matrix.arch }}
           DIGEST: ${{ steps.push.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          mkdir -p "$RUNNER_TEMP/digests"
-          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+          evidence_dir="$RUNNER_TEMP/publication-evidence/${ARCH}"
+          mkdir -p "$evidence_dir"
+          ARCH="$ARCH" \
+          DIGEST="$DIGEST" \
+          PLATFORM="$PLATFORM" \
+          RECEIPT_JSON="$evidence_dir/architecture.json" \
+          SOURCE_REF="$SOURCE_REF" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          WORKFLOW_REF="$WORKFLOW_REF" \
+          WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" \
+          WORKFLOW_SHA="$WORKFLOW_SHA" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-      - name: Upload architecture digest
+          receipt = {
+              "architecture": os.environ["ARCH"],
+              "platform": os.environ["PLATFORM"],
+              "build_index_digest": os.environ["DIGEST"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "source_ref": os.environ["SOURCE_REF"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "workflow_ref": os.environ["WORKFLOW_REF"],
+              "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
+              "contract": "hermes.execution.read.v1",
+              "schema_sha256": "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3",
+              "status": "pushed_unverified",
+              "pushed_digest_verified": False,
+              "provenance_present": False,
+              "sbom_present": False,
+          }
+          Path(os.environ["RECEIPT_JSON"]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Re-prove the actual pushed digest and attestations
+        env:
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          published_ref="${IMAGE_NAME}@${DIGEST}"
+          evidence_dir="$RUNNER_TEMP/publication-evidence/${ARCH}"
+          mkdir -p "$evidence_dir"
+
+          docker pull "$published_ref"
+          revision="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          contract="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.contract" }}')"
+          schema_digest="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.schema-sha256" }}')"
+          [ "$revision" = "$SOURCE_SHA" ]
+          [ "$contract" = "$CONTRACT_VERSION" ]
+          [ "$schema_digest" = "$SCHEMA_SHA256" ]
+
+          docker run --rm -i \
+            -e EXPECTED_SOURCE_SHA="$SOURCE_SHA" \
+            --entrypoint /opt/hermes/.venv/bin/python "$published_ref" - <<'PY'
+          import hashlib
+          import os
+          from importlib.resources import files
+          from pathlib import Path
+
+          from jsonschema.validators import Draft202012Validator
+
+          from hermes_cli.execution_contract import CONTRACT_VERSION, contract_schema
+
+          expected_schema_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          embedded_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
+          packaged_schema = files("hermes_cli").joinpath(
+              "execution_contract_schemas/hermes.execution.read.v1.schema.json"
+          )
+          schema = contract_schema()
+          Draft202012Validator.check_schema(schema)
+          actual_schema_sha = hashlib.sha256(packaged_schema.read_bytes()).hexdigest()
+          assert embedded_source == os.environ["EXPECTED_SOURCE_SHA"], embedded_source
+          assert CONTRACT_VERSION == "hermes.execution.read.v1", CONTRACT_VERSION
+          assert schema["$id"].endswith("hermes.execution.read.v1.schema.json")
+          assert actual_schema_sha == expected_schema_sha, actual_schema_sha
+          print("pushed_digest_contract_closure=passed")
+          PY
+
+          docker buildx imagetools inspect "$published_ref" --raw > "$evidence_dir/index.json"
+          docker buildx imagetools inspect "$published_ref" \
+            --format '{{ json .Provenance }}' > "$evidence_dir/provenance.json"
+          docker buildx imagetools inspect "$published_ref" \
+            --format '{{ json .SBOM }}' > "$evidence_dir/sbom.json"
+
+          ARCH="$ARCH" \
+          BUILD_INDEX_DIGEST="$DIGEST" \
+          CONTRACT_VERSION="$CONTRACT_VERSION" \
+          INDEX_JSON="$evidence_dir/index.json" \
+          PLATFORM="$PLATFORM" \
+          RECEIPT_JSON="$evidence_dir/architecture.json" \
+          SCHEMA_SHA256="$SCHEMA_SHA256" \
+          SOURCE_REF="$SOURCE_REF" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          WORKFLOW_REF="$WORKFLOW_REF" \
+          WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" \
+          WORKFLOW_SHA="$WORKFLOW_SHA" \
+          python3 - <<'PY'
+          import json
+          import os
+
+          def load_nonempty(path):
+              value = json.load(open(path, encoding="utf-8"))
+              assert value not in (None, {}, []), f"missing attestation: {path}"
+              return value
+
+          payload = json.load(open(os.environ["INDEX_JSON"], encoding="utf-8"))
+          manifests = payload.get("manifests", [])
+          runtime = [
+              item for item in manifests
+              if item.get("platform", {}).get("architecture") == os.environ["ARCH"]
+              and item.get("platform", {}).get("os") == "linux"
+          ]
+          attestations = [
+              item for item in manifests
+              if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+          ]
+          assert len(runtime) == 1, runtime
+          assert attestations, "published digest is missing provenance/SBOM attestation descriptors"
+          load_nonempty(os.path.join(os.path.dirname(os.environ["INDEX_JSON"]), "provenance.json"))
+          load_nonempty(os.path.join(os.path.dirname(os.environ["INDEX_JSON"]), "sbom.json"))
+          receipt = json.load(open(os.environ["RECEIPT_JSON"], encoding="utf-8"))
+          receipt.update({
+              "runtime_digest": runtime[0]["digest"],
+              "attestation_digests": [item["digest"] for item in attestations],
+              "status": "verified",
+              "pushed_digest_verified": True,
+              "provenance_present": True,
+              "sbom_present": True,
+          })
+          assert receipt["architecture"] == os.environ["ARCH"]
+          assert receipt["platform"] == os.environ["PLATFORM"]
+          assert receipt["build_index_digest"] == os.environ["BUILD_INDEX_DIGEST"]
+          assert receipt["source_sha"] == os.environ["SOURCE_SHA"]
+          assert receipt["source_ref"] == os.environ["SOURCE_REF"]
+          assert receipt["workflow_sha"] == os.environ["WORKFLOW_SHA"]
+          assert receipt["workflow_ref"] == os.environ["WORKFLOW_REF"]
+          assert receipt["workflow_run_id"] == os.environ["WORKFLOW_RUN_ID"]
+          assert receipt["contract"] == os.environ["CONTRACT_VERSION"]
+          assert receipt["schema_sha256"] == os.environ["SCHEMA_SHA256"]
+          with open(os.environ["RECEIPT_JSON"], "w", encoding="utf-8") as handle:
+              json.dump(receipt, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps(receipt, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload durable architecture proof
+        if: always() && steps.push.outputs.digest != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ghcr-execution-read-digest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          name: ghcr-execution-read-proof-${{ matrix.arch }}
+          path: ${{ runner.temp }}/publication-evidence/${{ matrix.arch }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
 
   manifest:
     name: Publish immutable SHA and approved release tag
-    if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
-    needs: [resolve, publish]
-    environment: gh-image
+    if: always() && needs.resolve.outputs.publish == 'true' && needs.authorize.result == 'success' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, authorize, publish]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Download architecture digests
+      - name: Download architecture proofs
+        id: download
+        continue-on-error: true
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: ${{ runner.temp }}/digests
-          pattern: ghcr-execution-read-digest-*
-          merge-multiple: true
+          path: ${{ runner.temp }}/publication-proofs
+          pattern: ghcr-execution-read-proof-*
+
+      - name: Initialize recoverable publication receipt
+        id: children
+        env:
+          PROOF_DIR: ${{ runner.temp }}/publication-proofs
+          RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-receipt.json
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          WORKFLOW_REF: ${{ needs.resolve.outputs.workflow_ref }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          proof_root = Path(os.environ["PROOF_DIR"])
+          children = {}
+          orphan_children = {}
+          missing = []
+          for arch in ("amd64", "arm64"):
+              path = proof_root / f"ghcr-execution-read-proof-{arch}" / "architecture.json"
+              if not path.is_file():
+                  missing.append(arch)
+                  continue
+              proof = json.loads(path.read_text(encoding="utf-8"))
+              errors = []
+              expected = {
+                  "architecture": arch,
+                  "source_sha": os.environ["SOURCE_SHA"],
+                  "source_ref": os.environ["SOURCE_REF"],
+                  "workflow_sha": os.environ["WORKFLOW_SHA"],
+                  "workflow_ref": os.environ["WORKFLOW_REF"],
+              }
+              for key, value in expected.items():
+                  if proof.get(key) != value:
+                      errors.append(f"{key} mismatch")
+              for key in ("pushed_digest_verified", "provenance_present", "sbom_present"):
+                  if proof.get(key) is not True:
+                      errors.append(f"{key} is not true")
+              if errors:
+                  missing.append(arch)
+                  orphan_children[arch] = {"proof": proof, "errors": errors}
+                  continue
+              children[arch] = proof
+
+          ready = not missing
+          receipt = {
+              "receipt_version": "hermes.execution.read.release-receipt.v1",
+              "status": "children_ready" if ready else "partial_children",
+              "destination": "ghcr.io/ragnos-labs/hermes-agent",
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source": {"sha": os.environ["SOURCE_SHA"], "ref": os.environ["SOURCE_REF"]},
+              "workflow": {
+                  "sha": os.environ["WORKFLOW_SHA"],
+                  "ref": os.environ["WORKFLOW_REF"],
+                  "run_id": os.environ["WORKFLOW_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              },
+              "contract": "hermes.execution.read.v1",
+              "schema_sha256": "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3",
+              "children": children,
+              "orphan_children": orphan_children,
+              "missing_architectures": missing,
+              "tag_states": {"preflight": {}, "final": {}},
+              "index_digest": None,
+              "recovery": {
+                  "state": "ready_for_preflight" if ready else "orphan_children",
+                  "instruction": (
+                      "Re-run the same destination release_tag after repairing the failed architecture. "
+                      "No SHA or release tag is permitted while a child proof is missing; reconcile any "
+                      "available untagged child index by this receipt before registry retention cleanup."
+                      if missing else
+                      "If tagging stops after the SHA tag, rerun the same destination release_tag. A matching "
+                      "SHA tag resumes release-tag creation; any conflict fails before mutation."
+                  ),
+              },
+          }
+          Path(os.environ["RECEIPT_PATH"]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"ready={'true' if ready else 'false'}\n")
+          print(json.dumps(receipt, indent=2, sort_keys=True))
+          PY
+
+      - name: Check out exact source for final tag proof
+        if: steps.children.outputs.ready == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Docker Buildx
+        if: steps.children.outputs.ready == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to fork-owned GHCR
+        if: steps.children.outputs.ready == 'true'
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Create immutable multi-architecture tags
+      - name: Preflight and create recoverable multi-architecture tags
+        if: steps.children.outputs.ready == 'true'
         id: manifest
         env:
+          RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-receipt.json
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
-          DIGEST_DIR: ${{ runner.temp }}/digests
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
           [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
           [ "$SOURCE_REF" = "refs/tags/${RELEASE_TAG}" ]
 
-          amd64_digest="$(cat "$DIGEST_DIR/amd64")"
-          arm64_digest="$(cat "$DIGEST_DIR/arm64")"
-          [[ "$amd64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$arm64_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [ "$amd64_digest" != "$arm64_digest" ]
+          record_failure() {
+            local status="$1"
+            local state="$2"
+            local instruction="$3"
+            RECEIPT_PATH="$RECEIPT_PATH" \
+            RECEIPT_STATUS="$status" \
+            RECOVERY_INSTRUCTION="$instruction" \
+            RECOVERY_STATE="$state" \
+            python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["RECEIPT_PATH"])
+          receipt = json.loads(path.read_text(encoding="utf-8"))
+          receipt["status"] = os.environ["RECEIPT_STATUS"]
+          receipt["recovery"] = {
+              "state": os.environ["RECOVERY_STATE"],
+              "instruction": os.environ["RECOVERY_INSTRUCTION"],
+          }
+          path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+          }
+
+          prove_source_tag() {
+            git fetch --force --no-tags origin refs/heads/main
+            current_main="$(git rev-parse 'FETCH_HEAD^{commit}')"
+            [ "$current_main" = "$WORKFLOW_SHA" ] || {
+              record_failure \
+                "workflow_revision_stale" \
+                "main_moved" \
+                "No further image tag mutation is allowed. Re-dispatch the audited workflow revision from current protected main."
+              echo "::error::main moved to $current_main; audited workflow revision is $WORKFLOW_SHA."
+              exit 1
+            }
+            if ! git fetch --force --no-tags origin "$SOURCE_REF"; then
+              record_failure \
+                "source_tag_unavailable" \
+                "moved_or_missing_tag" \
+                "No image tag was created. Restore or re-authorize the exact protected CalVer source tag before rerun."
+              echo "::error::CalVer source tag is unavailable: $SOURCE_REF"
+              exit 1
+            fi
+            resolved_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+            [ "$resolved_sha" = "$SOURCE_SHA" ] || {
+              record_failure \
+                "source_tag_moved" \
+                "moved_tag" \
+                "No further image tag mutation is allowed. Reconcile the moved CalVer source tag with the pilot."
+              echo "::error::CalVer source tag moved to $resolved_sha; expected $SOURCE_SHA."
+              exit 1
+            }
+          }
+
+          inspect_ref() {
+            local ref="$1"
+            local raw_path="$2"
+            local digest_path="$3"
+            if docker buildx imagetools inspect "$ref" --raw > "$raw_path" 2>/dev/null; then
+              docker buildx imagetools inspect "$ref" \
+                | awk '/^Digest:/ {print $2; exit}' > "$digest_path"
+            else
+              rm -f "$raw_path" "$digest_path"
+            fi
+          }
+
+          assert_ref_unchanged() {
+            local ref="$1"
+            local expected_state="$2"
+            local expected_digest="$3"
+            local current_digest
+            if current_digest="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')"; then
+              [ "$expected_state" = "matching" ] && [ "$current_digest" = "$expected_digest" ] || {
+                record_failure \
+                  "registry_state_changed" \
+                  "tag_race" \
+                  "Stop publication and reconcile the changed GHCR tag against the preflight receipt."
+                echo "::error::Registry tag state changed after preflight: $ref"
+                exit 1
+              }
+            else
+              [ "$expected_state" = "absent" ] || {
+                record_failure \
+                  "registry_state_changed" \
+                  "tag_race" \
+                  "Stop publication and reconcile the missing GHCR tag against the preflight receipt."
+                echo "::error::Registry tag disappeared after preflight: $ref"
+                exit 1
+              }
+            fi
+          }
+
+          prove_source_tag
+          amd64_index="$(jq -r '.children.amd64.build_index_digest' "$RECEIPT_PATH")"
+          arm64_index="$(jq -r '.children.arm64.build_index_digest' "$RECEIPT_PATH")"
+          amd64_runtime="$(jq -r '.children.amd64.runtime_digest' "$RECEIPT_PATH")"
+          arm64_runtime="$(jq -r '.children.arm64.runtime_digest' "$RECEIPT_PATH")"
+          for digest in "$amd64_index" "$arm64_index" "$amd64_runtime" "$arm64_runtime"; do
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+          [ "$amd64_runtime" != "$arm64_runtime" ]
           sources=(
-            "${IMAGE_NAME}@${amd64_digest}"
-            "${IMAGE_NAME}@${arm64_digest}"
+            "${IMAGE_NAME}@${amd64_index}"
+            "${IMAGE_NAME}@${arm64_index}"
           )
 
           sha_ref="${IMAGE_NAME}:sha-${SOURCE_SHA}"
           release_ref="${IMAGE_NAME}:${RELEASE_TAG}"
-          existing_sha="$RUNNER_TEMP/existing-sha.json"
-          if docker buildx imagetools inspect "$sha_ref" --raw > "$existing_sha" 2>/dev/null; then
-            SOURCE_SHA="$SOURCE_SHA" \
-            AMD64_DIGEST="$amd64_digest" \
-            ARM64_DIGEST="$arm64_digest" \
-            MANIFEST_JSON="$existing_sha" \
-            python3 - <<'PY'
+          sha_raw="$RUNNER_TEMP/preflight-sha.json"
+          sha_digest_path="$RUNNER_TEMP/preflight-sha.digest"
+          release_raw="$RUNNER_TEMP/preflight-release.json"
+          release_digest_path="$RUNNER_TEMP/preflight-release.digest"
+          plan_path="$RUNNER_TEMP/publication-plan.json"
+          inspect_ref "$sha_ref" "$sha_raw" "$sha_digest_path"
+          inspect_ref "$release_ref" "$release_raw" "$release_digest_path"
+
+          AMD64_RUNTIME="$amd64_runtime" \
+          ARM64_RUNTIME="$arm64_runtime" \
+          PLAN_PATH="$plan_path" \
+          RECEIPT_PATH="$RECEIPT_PATH" \
+          RELEASE_DIGEST_PATH="$release_digest_path" \
+          RELEASE_RAW="$release_raw" \
+          SHA_DIGEST_PATH="$sha_digest_path" \
+          SHA_RAW="$sha_raw" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          python3 - <<'PY'
           import json
           import os
+          from pathlib import Path
 
-          payload = json.load(open(os.environ["MANIFEST_JSON"], encoding="utf-8"))
-          expected = {os.environ["AMD64_DIGEST"], os.environ["ARM64_DIGEST"]}
-          actual = {item["digest"] for item in payload.get("manifests", [])}
-          revision = payload.get("annotations", {}).get("org.opencontainers.image.revision")
-          assert actual == expected, (actual, expected)
-          assert revision == os.environ["SOURCE_SHA"], revision
+          expected_runtime = {
+              ("linux", "amd64"): os.environ["AMD64_RUNTIME"],
+              ("linux", "arm64"): os.environ["ARM64_RUNTIME"],
+          }
+
+          def classify(raw_name, digest_name):
+              raw_path = Path(os.environ[raw_name])
+              if not raw_path.is_file():
+                  return {"state": "absent", "digest": None}
+              payload = json.loads(raw_path.read_text(encoding="utf-8"))
+              manifests = payload.get("manifests", [])
+              runtime = {
+                  (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture")): item["digest"]
+                  for item in manifests
+                  if item.get("platform", {}).get("os") == "linux"
+              }
+              attested = {
+                  item.get("annotations", {}).get("vnd.docker.reference.digest")
+                  for item in manifests
+                  if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+              }
+              annotations = payload.get("annotations", {})
+              matches = (
+                  runtime == expected_runtime
+                  and set(expected_runtime.values()).issubset(attested)
+                  and annotations.get("org.opencontainers.image.revision") == os.environ["SOURCE_SHA"]
+                  and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
+                  and annotations.get("io.ragnos.hermes.execution.schema-sha256")
+                  == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+              )
+              digest = Path(os.environ[digest_name]).read_text(encoding="utf-8").strip()
+              return {"state": "matching" if matches else "conflict", "digest": digest}
+
+          sha = classify("SHA_RAW", "SHA_DIGEST_PATH")
+          release = classify("RELEASE_RAW", "RELEASE_DIGEST_PATH")
+          actions = []
+          errors = []
+          if release["state"] == "conflict":
+              errors.append("release tag conflicts")
+          if sha["state"] == "conflict":
+              errors.append("SHA tag conflicts")
+          if sha["state"] == release["state"] == "matching" and sha["digest"] != release["digest"]:
+              errors.append("matching-content tags resolve to different index digests")
+          if not errors:
+              if release["state"] == "matching" and sha["state"] == "absent":
+                  actions.append("create_sha_from_release")
+              elif sha["state"] == "absent":
+                  actions.append("create_sha_from_children")
+              if release["state"] == "absent":
+                  actions.append("create_release_from_sha")
+
+          plan = {"sha": sha, "release": release, "actions": actions, "errors": errors}
+          Path(os.environ["PLAN_PATH"]).write_text(
+              json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          receipt_path = Path(os.environ["RECEIPT_PATH"])
+          receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+          receipt["tag_states"]["preflight"] = {"sha": sha, "release": release}
+          receipt["status"] = "conflict" if errors else "preflight_passed"
+          if errors:
+              receipt["recovery"] = {
+                  "state": "conflict",
+                  "instruction": "Do not mutate either tag. Reconcile the conflicting digest with this receipt and obtain a new pilot decision.",
+              }
+          receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(plan, indent=2, sort_keys=True))
+          if errors:
+              raise SystemExit("; ".join(errors))
           PY
-            echo "Immutable SHA tag already exists with the exact approved manifests; preserving it."
-          else
+
+          sha_state="$(jq -r '.sha.state' "$plan_path")"
+          sha_preflight_digest="$(jq -r '.sha.digest // ""' "$plan_path")"
+          release_state="$(jq -r '.release.state' "$plan_path")"
+          release_preflight_digest="$(jq -r '.release.digest // ""' "$plan_path")"
+
+          if jq -e '.actions | index("create_sha_from_children")' "$plan_path" >/dev/null; then
+            prove_source_tag
+            assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
+            assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
             docker buildx imagetools create \
               --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
               --annotation "index:io.ragnos.hermes.execution.contract=${CONTRACT_VERSION}" \
               --annotation "index:io.ragnos.hermes.execution.schema-sha256=${SCHEMA_SHA256}" \
               --tag "$sha_ref" \
               "${sources[@]}"
+          elif jq -e '.actions | index("create_sha_from_release")' "$plan_path" >/dev/null; then
+            prove_source_tag
+            assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
+            assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
+            docker buildx imagetools create --tag "$sha_ref" "$release_ref"
+          else
+            assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
           fi
 
           sha_digest="$(docker buildx imagetools inspect "$sha_ref" | awk '/^Digest:/ {print $2; exit}')"
           [[ "$sha_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$sha_ref" --raw > "$RUNNER_TEMP/verified-sha.json"
+          AMD64_RUNTIME="$amd64_runtime" \
+          ARM64_RUNTIME="$arm64_runtime" \
+          MANIFEST_JSON="$RUNNER_TEMP/verified-sha.json" \
+          RECEIPT_PATH="$RECEIPT_PATH" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-          if release_digest="$(docker buildx imagetools inspect "$release_ref" 2>/dev/null | awk '/^Digest:/ {print $2; exit}')"; then
-            [ "$release_digest" = "$sha_digest" ] || {
-              echo "::error::Release tag $release_ref already points to $release_digest, not $sha_digest."
-              exit 1
-            }
-            echo "Approved release tag already points to the immutable SHA manifest; preserving it."
-          else
+          payload = json.load(open(os.environ["MANIFEST_JSON"], encoding="utf-8"))
+          manifests = payload.get("manifests", [])
+          expected_runtime = {
+              ("linux", "amd64"): os.environ["AMD64_RUNTIME"],
+              ("linux", "arm64"): os.environ["ARM64_RUNTIME"],
+          }
+          actual_runtime = {
+              (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture")): item["digest"]
+              for item in manifests
+              if item.get("platform", {}).get("os") == "linux"
+          }
+          attested = {
+              item.get("annotations", {}).get("vnd.docker.reference.digest")
+              for item in manifests
+              if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+          }
+          annotations = payload.get("annotations", {})
+          valid = (
+              actual_runtime == expected_runtime
+              and set(expected_runtime.values()).issubset(attested)
+              and annotations.get("org.opencontainers.image.revision") == os.environ["SOURCE_SHA"]
+              and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
+              and annotations.get("io.ragnos.hermes.execution.schema-sha256")
+              == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          )
+          if not valid:
+              receipt_path = Path(os.environ["RECEIPT_PATH"])
+              receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+              receipt["status"] = "sha_verification_failed"
+              receipt["recovery"] = {
+                  "state": "orphan_sha_tag",
+                  "instruction": "Do not create the release tag. Reconcile the SHA tag descriptors and attestations against this receipt.",
+              }
+              receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+              raise SystemExit("SHA manifest failed runtime, attestation, or annotation verification")
+          PY
+          RECEIPT_PATH="$RECEIPT_PATH" SHA_DIGEST="$sha_digest" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["RECEIPT_PATH"])
+          receipt = json.loads(path.read_text(encoding="utf-8"))
+          receipt["status"] = "sha_ready"
+          receipt["index_digest"] = os.environ["SHA_DIGEST"]
+          receipt["recovery"] = {
+              "state": "resume_release_tag",
+              "instruction": "If the release tag is absent, rerun the same destination release_tag; the matching SHA tag is preserved and reused.",
+          }
+          path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+          if jq -e '.actions | index("create_release_from_sha")' "$plan_path" >/dev/null; then
+            prove_source_tag
+            assert_ref_unchanged "$sha_ref" "matching" "$sha_digest"
+            assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
             docker buildx imagetools create --tag "$release_ref" "$sha_ref"
           fi
 
@@ -486,25 +1236,55 @@ jobs:
           [ "$final_release_digest" = "$sha_digest" ]
           docker buildx imagetools inspect "$sha_ref" --raw > "$RUNNER_TEMP/final-manifest.json"
 
-          SOURCE_SHA="$SOURCE_SHA" \
-          AMD64_DIGEST="$amd64_digest" \
-          ARM64_DIGEST="$arm64_digest" \
+          AMD64_RUNTIME="$amd64_runtime" \
+          ARM64_RUNTIME="$arm64_runtime" \
           MANIFEST_JSON="$RUNNER_TEMP/final-manifest.json" \
+          RECEIPT_PATH="$RECEIPT_PATH" \
+          RELEASE_DIGEST="$final_release_digest" \
+          SHA_DIGEST="$sha_digest" \
+          SOURCE_SHA="$SOURCE_SHA" \
           python3 - <<'PY'
           import json
           import os
+          from pathlib import Path
 
           payload = json.load(open(os.environ["MANIFEST_JSON"], encoding="utf-8"))
           manifests = payload.get("manifests", [])
-          expected_digests = {os.environ["AMD64_DIGEST"], os.environ["ARM64_DIGEST"]}
-          actual_digests = {item["digest"] for item in manifests}
-          platforms = {(item["platform"]["os"], item["platform"]["architecture"]) for item in manifests}
+          expected_runtime = {
+              ("linux", "amd64"): os.environ["AMD64_RUNTIME"],
+              ("linux", "arm64"): os.environ["ARM64_RUNTIME"],
+          }
+          actual_runtime = {
+              (item.get("platform", {}).get("os"), item.get("platform", {}).get("architecture")): item["digest"]
+              for item in manifests
+              if item.get("platform", {}).get("os") == "linux"
+          }
+          attested = {
+              item.get("annotations", {}).get("vnd.docker.reference.digest")
+              for item in manifests
+              if item.get("annotations", {}).get("vnd.docker.reference.type") == "attestation-manifest"
+          }
           annotations = payload.get("annotations", {})
-          assert actual_digests == expected_digests, (actual_digests, expected_digests)
-          assert platforms == {("linux", "amd64"), ("linux", "arm64")}, platforms
+          assert actual_runtime == expected_runtime, (actual_runtime, expected_runtime)
+          assert set(expected_runtime.values()).issubset(attested), attested
           assert annotations["org.opencontainers.image.revision"] == os.environ["SOURCE_SHA"]
           assert annotations["io.ragnos.hermes.execution.contract"] == "hermes.execution.read.v1"
           assert annotations["io.ragnos.hermes.execution.schema-sha256"] == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+
+          receipt_path = Path(os.environ["RECEIPT_PATH"])
+          receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+          receipt["status"] = "complete"
+          receipt["index_digest"] = os.environ["SHA_DIGEST"]
+          receipt["tag_states"]["final"] = {
+              "sha": {"state": "matching", "digest": os.environ["SHA_DIGEST"]},
+              "release": {"state": "matching", "digest": os.environ["RELEASE_DIGEST"]},
+          }
+          receipt["recovery"] = {
+              "state": "complete",
+              "instruction": "No reconciliation required. Future identical dispatches are read-only idempotent reruns.",
+          }
+          receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, indent=2, sort_keys=True))
           PY
 
           echo "digest=$sha_digest" >> "$GITHUB_OUTPUT"
@@ -518,4 +1298,21 @@ jobs:
             echo "- immutable tag: \`$sha_ref\`"
             echo "- approved release tag: \`$release_ref\`"
             echo "- platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- workflow revision: \`${{ needs.resolve.outputs.workflow_sha }}\`"
+            echo "- receipt artifact: \`ghcr-execution-read-receipt-${RELEASE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload durable machine-readable receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-execution-read-receipt-${{ needs.resolve.outputs.release_tag }}
+          path: ${{ runner.temp }}/ghcr-execution-read-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Fail closed when an architecture proof is missing
+        if: always() && steps.children.outputs.ready != 'true'
+        run: |
+          echo "::error::Both verified architecture proofs are required; recovery receipt was uploaded."
+          exit 1
