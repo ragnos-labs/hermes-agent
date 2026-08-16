@@ -4,10 +4,11 @@ name: GHCR Execution Read Release
 # Pull requests only validate: they have read-only permissions and never log in
 # to a registry. Publishing is limited to an exact workflow_dispatch of this
 # audited workflow on protected main. A dispatch confirmation records intent;
-# it is not approval. Publication also fails closed unless gh-image has required
-# reviewers, prevent-self-review, disabled administrator bypass, and a main-only
-# deployment policy. Protected CalVer tags and GHCR package-writer restrictions
-# remain external release gates owned by the pilot.
+# it is not approval. Publication also fails closed unless the dedicated
+# hermes-execution-read-release environment has required reviewers,
+# prevent-self-review, disabled administrator bypass, and a main-only deployment
+# policy. Protected CalVer tags and GHCR package-writer restrictions remain
+# external release gates owned by the pilot.
 # This workflow never creates main or latest tags.
 on:
   pull_request:
@@ -255,17 +256,22 @@ jobs:
       - name: Test external environment authorization policy
         run: |
           python3 - <<'PY'
-          def accepted(*, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
+          RELEASE_ENVIRONMENT = "hermes-execution-read-release"
+
+
+          def accepted(*, environment_name, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
+              dedicated_environment = environment_name == RELEASE_ENVIRONMENT
               independent_review = bool(reviewers) and prevent_self_review is True
               no_admin_bypass = can_admins_bypass is False
               main_only = (
                   policy == "protected_branches"
                   or (policy == "custom_branch_policies" and "main" in custom_names)
               )
-              return independent_review and no_admin_bypass and main_only
+              return dedicated_environment and independent_review and no_admin_bypass and main_only
 
 
           protected = dict(
+              environment_name=RELEASE_ENVIRONMENT,
               reviewers=["independent-maintainer"],
               prevent_self_review=True,
               can_admins_bypass=False,
@@ -281,6 +287,7 @@ jobs:
           assert not accepted(**(protected | {"reviewers": []}))
           assert not accepted(**(protected | {"prevent_self_review": False}))
           assert not accepted(**(protected | {"policy": None}))
+          assert not accepted(**(protected | {"environment_name": "gh-image"}))
           assert not accepted(**(custom_main | {"custom_names": ["release-copy"]}))
           print("external_environment_authorization_policy=passed")
           PY
@@ -645,16 +652,17 @@ jobs:
     name: Verify external release gates
     if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
     needs: [resolve, publication-policy, conformance, build]
-    environment: gh-image
+    environment: hermes-execution-read-release
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: read
       contents: read
     steps:
-      - name: Require protected gh-image approval and main-only deployment
+      - name: Require protected release approval and main-only deployment
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ENVIRONMENT: hermes-execution-read-release
           REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
@@ -696,13 +704,18 @@ jobs:
             echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
             exit 1
           }
-          environment_json="$RUNNER_TEMP/gh-image.json"
-          gh api "repos/${REPOSITORY}/environments/gh-image" > "$environment_json"
+          environment_json="$RUNNER_TEMP/release-environment.json"
+          gh api "repos/${REPOSITORY}/environments/${RELEASE_ENVIRONMENT}" > "$environment_json"
           python3 - "$environment_json" <<'PY'
           import json
+          import os
           import sys
 
           environment = json.load(open(sys.argv[1], encoding="utf-8"))
+          release_environment = os.environ["RELEASE_ENVIRONMENT"]
+          assert environment.get("name") == release_environment, (
+              "GitHub returned the wrong release environment"
+          )
           reviewers = [
               rule for rule in environment.get("protection_rules", [])
               if rule.get("type") == "required_reviewers"
@@ -710,12 +723,12 @@ jobs:
               and rule.get("prevent_self_review") is True
           ]
           policy = environment.get("deployment_branch_policy") or {}
-          assert reviewers, "gh-image must have a required reviewer and prevent self-review"
+          assert reviewers, f"{release_environment} must have a required reviewer and prevent self-review"
           assert environment.get("can_admins_bypass") is False, (
-              "gh-image must disable administrator protection-rule bypass"
+              f"{release_environment} must disable administrator protection-rule bypass"
           )
           assert policy.get("protected_branches") or policy.get("custom_branch_policies"), (
-              "gh-image must restrict deployments to protected branches or custom main policy"
+              f"{release_environment} must restrict deployments to protected branches or custom main policy"
           )
           print(json.dumps({"required_reviewer_rules": len(reviewers), "deployment_branch_policy": policy}))
           PY
@@ -723,15 +736,15 @@ jobs:
           custom_policies="$(jq -r '.deployment_branch_policy.custom_branch_policies // false' "$environment_json")"
           if [ "$custom_policies" = "true" ]; then
             gh api --paginate \
-              "repos/${REPOSITORY}/environments/gh-image/deployment-branch-policies" \
+              "repos/${REPOSITORY}/environments/${RELEASE_ENVIRONMENT}/deployment-branch-policies" \
               --jq '.branch_policies[]?.name' \
               | grep -Fxq main || {
-              echo "::error::gh-image custom deployment policies do not include exact branch main."
+              echo "::error::${RELEASE_ENVIRONMENT} custom deployment policies do not include exact branch main."
               exit 1
             }
           fi
 
-          echo "External hold passed: gh-image required review and main deployment restriction are present."
+          echo "External hold passed: ${RELEASE_ENVIRONMENT} required review and main deployment restriction are present."
           echo "CalVer tag protection and GHCR package-writer restriction remain pilot-owned external gates."
 
       - name: Upload authorization failure receipt
