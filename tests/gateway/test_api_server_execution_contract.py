@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib.resources
 import json
-from contextlib import nullcontext
+import re
+import sqlite3
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, NoReturn
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 from gateway.config import (
     GatewayConfig,
@@ -34,6 +41,34 @@ FULL_KEY = "full-mutation-key-0123456789abcdef"
 READ_KEY = "execution-read-key-0123456789abcdef"
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
 SCHEMA_DIGEST_HEADER = "Hermes-Execution-Contract-Schema-Digest"
+VERSION_HEADER = "Hermes-Execution-Contract-Version"
+VERIFICATION_STEPS = (
+    "version",
+    "digest_header_and_trusted_expected",
+    "raw_body_sha256",
+    "json_parse",
+    "draft_2020_12_schema",
+)
+
+
+class SchemaWireVerificationError(ValueError):
+    def __init__(self, code: str, completed_steps: tuple[str, ...]) -> None:
+        self.code = code
+        self.completed_steps = completed_steps
+        super().__init__(code)
+
+
+class CacheControlVerificationError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class LedgerSnapshot:
+    sha256: str
+    size: int
+    mtime_ns: int
+    row_counts: tuple[tuple[str, int], ...]
+    sidecars: tuple[str, ...]
 
 
 def _auth(key: str) -> dict[str, str]:
@@ -44,20 +79,112 @@ def _assert_closed_error(payload: dict) -> None:
     Draft202012Validator(contract_schema()["$defs"]["errorDetail"]).validate(payload)
 
 
-def _assert_schema_wire_identity(
+def _verify_schema_wire_identity(
+    *,
     body: bytes,
-    headers: dict[str, str],
-    packaged_body: bytes,
-) -> None:
-    expected_digest = f"sha256:{hashlib.sha256(packaged_body).hexdigest()}"
-    assert headers["Hermes-Execution-Contract-Version"] == CONTRACT_VERSION
-    assert headers[SCHEMA_DIGEST_HEADER] == expected_digest
-    assert body == packaged_body
-    assert f"sha256:{hashlib.sha256(body).hexdigest()}" == expected_digest
+    version_header: str | None,
+    digest_header: str | None,
+    trusted_version: str,
+    trusted_digest: str,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    completed_steps: list[str] = []
 
-    schema = json.loads(body)
-    Draft202012Validator.check_schema(schema)
-    assert schema["$id"].endswith("hermes.execution.read.v1.schema.json")
+    def fail(code: str) -> NoReturn:
+        raise SchemaWireVerificationError(code, tuple(completed_steps))
+
+    if version_header is None:
+        fail("missing_version_header")
+    if version_header != trusted_version:
+        fail("malformed_or_unsupported_version_header")
+    completed_steps.append("version")
+
+    if digest_header is None:
+        fail("missing_digest_header")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest_header) is None:
+        fail("malformed_digest_header")
+    if not hmac.compare_digest(digest_header, trusted_digest):
+        fail("untrusted_expected_digest")
+    completed_steps.append("digest_header_and_trusted_expected")
+
+    if not hmac.compare_digest(_digest(body), digest_header):
+        fail("raw_body_digest_mismatch")
+    completed_steps.append("raw_body_sha256")
+
+    try:
+        parsed = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("malformed_json")
+    completed_steps.append("json_parse")
+
+    if not isinstance(parsed, dict):
+        fail("invalid_draft_2020_12_schema")
+    if parsed.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+        fail("invalid_draft_2020_12_schema")
+    try:
+        Draft202012Validator.check_schema(parsed)
+    except SchemaError:
+        fail("invalid_draft_2020_12_schema")
+    completed_steps.append("draft_2020_12_schema")
+    return parsed, tuple(completed_steps)
+
+
+def _ledger_snapshot(database_path: Path) -> LedgerSnapshot:
+    database_stat = database_path.stat()
+    database_body = database_path.read_bytes()
+    uri = f"{database_path.resolve().as_uri()}?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        table_names = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' ORDER BY name"
+            )
+        )
+        row_counts = []
+        for table_name in table_names:
+            quoted_name = table_name.replace('"', '""')
+            count = connection.execute(
+                f'SELECT COUNT(*) FROM "{quoted_name}"'
+            ).fetchone()[0]
+            row_counts.append((table_name, int(count)))
+    finally:
+        connection.close()
+
+    sidecars = tuple(
+        sidecar_path.name
+        for sidecar_path in sorted(
+            database_path.parent.glob(f"{database_path.name}-*")
+        )
+        if sidecar_path.is_file()
+    )
+    return LedgerSnapshot(
+        sha256=hashlib.sha256(database_body).hexdigest(),
+        size=database_stat.st_size,
+        mtime_ns=database_stat.st_mtime_ns,
+        row_counts=tuple(row_counts),
+        sidecars=sidecars,
+    )
+
+
+def _verify_cache_control_no_store(cache_control: str | None) -> None:
+    if cache_control is None:
+        raise CacheControlVerificationError("missing_cache_control_header")
+    if cache_control != "no-store":
+        raise CacheControlVerificationError("cache_control_is_not_no_store")
+
+
+def _packaged_schema_body() -> bytes:
+    return (
+        importlib.resources.files("hermes_cli.execution_contract_schemas")
+        .joinpath("hermes.execution.read.v1.schema.json")
+        .read_bytes()
+    )
+
+
+def _digest(body: bytes) -> str:
+    return f"sha256:{hashlib.sha256(body).hexdigest()}"
 
 
 @pytest.fixture
@@ -108,67 +235,216 @@ def _contract_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
-@pytest.mark.asyncio
-async def test_schema_wire_identity_matches_packaged_artifact_and_is_stable(
-    contract_adapter,
-):
-    packaged_body = (
-        importlib.resources.files("hermes_cli.execution_contract_schemas")
-        .joinpath("hermes.execution.read.v1.schema.json")
-        .read_bytes()
+def test_reference_schema_verifier_enforces_success_order() -> None:
+    body = _packaged_schema_body()
+    schema, completed_steps = _verify_schema_wire_identity(
+        body=body,
+        version_header=CONTRACT_VERSION,
+        digest_header=_digest(body),
+        trusted_version=CONTRACT_VERSION,
+        trusted_digest=_digest(body),
     )
-    app = _contract_app(contract_adapter)
 
-    async with TestClient(TestServer(app)) as client:
-        first_response = await client.get(
-            "/v1/execution-contract/schema",
-            headers=_auth(READ_KEY),
+    assert completed_steps == VERIFICATION_STEPS
+    assert schema["$id"].endswith("hermes.execution.read.v1.schema.json")
+
+
+@pytest.mark.parametrize(
+    ("version_header", "expected_code"),
+    [
+        pytest.param(None, "missing_version_header", id="missing"),
+        pytest.param(
+            f"{CONTRACT_VERSION} ",
+            "malformed_or_unsupported_version_header",
+            id="malformed",
+        ),
+    ],
+)
+def test_reference_schema_verifier_rejects_version_before_digest(
+    version_header: str | None,
+    expected_code: str,
+) -> None:
+    body = _packaged_schema_body()
+
+    with pytest.raises(SchemaWireVerificationError) as exc_info:
+        _verify_schema_wire_identity(
+            body=body,
+            version_header=version_header,
+            digest_header=_digest(body),
+            trusted_version=CONTRACT_VERSION,
+            trusted_digest=_digest(body),
         )
-        second_response = await client.get(
-            "/v1/execution-contract/schema",
-            headers=_auth(READ_KEY),
+
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.completed_steps == ()
+
+
+@pytest.mark.parametrize(
+    ("digest_header", "expected_code"),
+    [
+        pytest.param(None, "missing_digest_header", id="missing"),
+        pytest.param(
+            "sha256:not-lowercase-hex",
+            "malformed_digest_header",
+            id="malformed",
+        ),
+    ],
+)
+def test_reference_schema_verifier_rejects_digest_header_after_version(
+    digest_header: str | None,
+    expected_code: str,
+) -> None:
+    body = _packaged_schema_body()
+
+    with pytest.raises(SchemaWireVerificationError) as exc_info:
+        _verify_schema_wire_identity(
+            body=body,
+            version_header=CONTRACT_VERSION,
+            digest_header=digest_header,
+            trusted_version=CONTRACT_VERSION,
+            trusted_digest=_digest(body),
         )
-        assert first_response.status == second_response.status == 200
-        assert first_response.headers["Content-Type"] == "application/schema+json"
-        assert second_response.headers["Content-Type"] == "application/schema+json"
 
-        first_body = await first_response.read()
-        second_body = await second_response.read()
-        first_headers = dict(first_response.headers)
-        second_headers = dict(second_response.headers)
-        _assert_schema_wire_identity(first_body, first_headers, packaged_body)
-        _assert_schema_wire_identity(second_body, second_headers, packaged_body)
-        assert second_body == first_body
-        assert second_headers[SCHEMA_DIGEST_HEADER] == first_headers[SCHEMA_DIGEST_HEADER]
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.completed_steps == ("version",)
 
-        tampered_body = first_body.replace(b'"title"', b'"other"', 1)
-        with pytest.raises(AssertionError):
-            _assert_schema_wire_identity(tampered_body, first_headers, packaged_body)
 
-        mismatched_headers = {
-            **first_headers,
-            SCHEMA_DIGEST_HEADER: f"sha256:{'0' * 64}",
-        }
-        with pytest.raises(AssertionError):
-            _assert_schema_wire_identity(first_body, mismatched_headers, packaged_body)
+def test_reference_schema_verifier_rejects_untrusted_expected_digest() -> None:
+    body = _packaged_schema_body()
+
+    with pytest.raises(SchemaWireVerificationError) as exc_info:
+        _verify_schema_wire_identity(
+            body=body,
+            version_header=CONTRACT_VERSION,
+            digest_header=f"sha256:{'0' * 64}",
+            trusted_version=CONTRACT_VERSION,
+            trusted_digest=_digest(body),
+        )
+
+    assert exc_info.value.code == "untrusted_expected_digest"
+    assert exc_info.value.completed_steps == ("version",)
+
+
+def test_reference_schema_verifier_rejects_raw_body_tamper_before_parse() -> None:
+    body = _packaged_schema_body()
+    tampered_body = body.replace(b'"title"', b'"other"', 1)
+    assert tampered_body != body
+
+    with pytest.raises(SchemaWireVerificationError) as exc_info:
+        _verify_schema_wire_identity(
+            body=tampered_body,
+            version_header=CONTRACT_VERSION,
+            digest_header=_digest(body),
+            trusted_version=CONTRACT_VERSION,
+            trusted_digest=_digest(body),
+        )
+
+    assert exc_info.value.code == "raw_body_digest_mismatch"
+    assert exc_info.value.completed_steps == (
+        "version",
+        "digest_header_and_trusted_expected",
+    )
+
+
+def test_reference_schema_verifier_rejects_malformed_json_after_raw_hash() -> None:
+    body = b'{"$schema":'
+
+    with pytest.raises(SchemaWireVerificationError) as exc_info:
+        _verify_schema_wire_identity(
+            body=body,
+            version_header=CONTRACT_VERSION,
+            digest_header=_digest(body),
+            trusted_version=CONTRACT_VERSION,
+            trusted_digest=_digest(body),
+        )
+
+    assert exc_info.value.code == "malformed_json"
+    assert exc_info.value.completed_steps == VERIFICATION_STEPS[:3]
+
+
+def test_reference_schema_verifier_rejects_invalid_draft_2020_12_schema() -> None:
+    body = json.dumps(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": 42,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    with pytest.raises(SchemaWireVerificationError) as exc_info:
+        _verify_schema_wire_identity(
+            body=body,
+            version_header=CONTRACT_VERSION,
+            digest_header=_digest(body),
+            trusted_version=CONTRACT_VERSION,
+            trusted_digest=_digest(body),
+        )
+
+    assert exc_info.value.code == "invalid_draft_2020_12_schema"
+    assert exc_info.value.completed_steps == VERIFICATION_STEPS[:4]
+
+
+@pytest.mark.parametrize(
+    ("cache_control", "expected_code"),
+    [
+        pytest.param(None, "missing_cache_control_header", id="missing"),
+        pytest.param(
+            "max-age=60",
+            "cache_control_is_not_no_store",
+            id="not-no-store",
+        ),
+    ],
+)
+def test_reference_cache_control_verifier_requires_no_store(
+    cache_control: str | None,
+    expected_code: str,
+) -> None:
+    with pytest.raises(CacheControlVerificationError, match=expected_code):
+        _verify_cache_control_no_store(cache_control)
+
+
+def test_reference_cache_control_verifier_accepts_no_store() -> None:
+    _verify_cache_control_no_store("no-store")
 
 
 @pytest.mark.asyncio
-async def test_read_key_is_side_effect_free_and_returns_asserted_authority(
+async def test_socket_get_canary_is_empty_complete_and_leaves_ledger_unchanged(
     contract_adapter,
-):
+    request: pytest.FixtureRequest,
+) -> None:
     store = contract_adapter._execution_contract_store()
     assert not store.database_path.exists()
     store.initialize()
-    ledger_mtime = store.database_path.stat().st_mtime_ns
+    # Hold the real read path open so SQLite's WAL coordination sidecars exist
+    # before the measured HTTP interval; the GETs must preserve that inventory.
+    read_guard = ExitStack()
+    assert read_guard.enter_context(store._read_connection()) is not None
+    request.addfinalizer(read_guard.close)
+    before = _ledger_snapshot(store.database_path)
     app = _contract_app(contract_adapter)
+    request_headers = {
+        **_auth(READ_KEY),
+        VERSION_HEADER: CONTRACT_VERSION,
+    }
+    collection_routes = {
+        "/v1/execution-contract/executions": "executions",
+        "/v1/execution-contract/decisions": "decisions",
+        "/v1/execution-contract/events": "events",
+        "/v1/execution-contract/receipts": "receipts",
+    }
+    packaged_body = _packaged_schema_body()
+    trusted_digest = _digest(packaged_body)
 
     async with TestClient(TestServer(app)) as client:
         capabilities_response = await client.get(
             "/v1/execution-contract/capabilities",
-            headers=_auth(READ_KEY),
+            headers=request_headers,
         )
         assert capabilities_response.status == 200
+        assert capabilities_response.headers[VERSION_HEADER] == CONTRACT_VERSION
+        _verify_cache_control_no_store(
+            capabilities_response.headers.get("Cache-Control")
+        )
         capabilities = await capabilities_response.json()
         assert capabilities["contract_version"] == CONTRACT_VERSION
         assert capabilities["authority"] == store.authority.public()
@@ -178,28 +454,56 @@ async def test_read_key_is_side_effect_free_and_returns_asserted_authority(
         assert not capabilities["authority"]["profile_id"].endswith(":default")
         assert capabilities["features"]["action_dispatch"] is False
 
-        list_response = await client.get(
-            "/v1/execution-contract/executions",
-            headers=_auth(READ_KEY),
-        )
-        assert list_response.status == 200
-        payload = await list_response.json()
-        assert payload["executions"] == []
-        assert payload["page"]["completeness"] == "complete"
-        assert list_response.headers["Hermes-Execution-Contract-Version"] == (
-            CONTRACT_VERSION
-        )
-        assert list_response.headers["Cache-Control"] == "no-store"
+        schema_reads: list[tuple[bytes, str]] = []
+        for _ in range(2):
+            schema_response = await client.get(
+                "/v1/execution-contract/schema",
+                headers=request_headers,
+            )
+            assert schema_response.status == 200
+            assert schema_response.headers["Content-Type"] == (
+                "application/schema+json"
+            )
+            _verify_cache_control_no_store(
+                schema_response.headers.get("Cache-Control")
+            )
+            schema_body = await schema_response.read()
+            schema, completed_steps = _verify_schema_wire_identity(
+                body=schema_body,
+                version_header=schema_response.headers.get(VERSION_HEADER),
+                digest_header=schema_response.headers.get(SCHEMA_DIGEST_HEADER),
+                trusted_version=CONTRACT_VERSION,
+                trusted_digest=trusted_digest,
+            )
+            assert completed_steps == VERIFICATION_STEPS
+            assert schema_body == packaged_body
+            assert schema["$defs"]["receipt"]["additionalProperties"] is False
+            schema_reads.append(
+                (schema_body, schema_response.headers[SCHEMA_DIGEST_HEADER])
+            )
+        assert schema_reads[1] == schema_reads[0]
 
-        schema_response = await client.get(
-            "/v1/execution-contract/schema",
-            headers=_auth(FULL_KEY),
-        )
-        assert schema_response.status == 200
-        schema = await schema_response.json()
-        assert schema["$defs"]["receipt"]["additionalProperties"] is False
+        for route, collection_name in collection_routes.items():
+            response = await client.get(route, headers=request_headers)
+            assert response.status == 200, route
+            assert response.headers[VERSION_HEADER] == CONTRACT_VERSION
+            _verify_cache_control_no_store(response.headers.get("Cache-Control"))
+            payload = await response.json()
+            assert payload["contract_version"] == CONTRACT_VERSION
+            assert payload["authority"] == store.authority.public()
+            assert payload[collection_name] == []
+            assert payload["page"]["completeness"] == "complete"
+            assert payload["page"]["has_more"] is False
+            assert payload["page"]["cursor"] == 0
+            assert payload["page"]["high_water"] == 0
+            assert payload["page"]["snapshot_high_water"] == 0
 
-    assert store.database_path.stat().st_mtime_ns == ledger_mtime
+    after = _ledger_snapshot(store.database_path)
+    assert after.sha256 == before.sha256
+    assert after.size == before.size
+    assert after.mtime_ns == before.mtime_ns
+    assert after.row_counts == before.row_counts
+    assert after.sidecars == before.sidecars
 
 
 @pytest.mark.asyncio
