@@ -36,6 +36,9 @@ from hermes_constants import get_hermes_home
 
 CONTRACT_VERSION = "hermes.execution.read.v1"
 API_VERSION = "v1"
+CONTRACT_SCHEMA_FILENAME = f"{CONTRACT_VERSION}.schema.json"
+CONTRACT_SCHEMA_DIGEST_HEADER = "Hermes-Execution-Contract-Schema-Digest"
+CONTRACT_SCHEMA_DIGEST_ALGORITHM = "sha256"
 STORE_SCHEMA_VERSION = 1
 EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_PAGE_SIZE = 50
@@ -3396,14 +3399,30 @@ def contract_capabilities(
     }
 
 
+def contract_schema_artifact() -> tuple[bytes, dict[str, Any], str]:
+    """Load the exact packaged schema bytes, parsed value, and wire digest."""
+
+    resource = importlib.resources.files("hermes_cli.execution_contract_schemas").joinpath(
+        CONTRACT_SCHEMA_FILENAME
+    )
+    body = resource.read_bytes()
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ContractDataError(
+            "packaged execution contract schema is malformed"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ContractDataError("packaged execution contract schema is malformed")
+    digest = (
+        f"{CONTRACT_SCHEMA_DIGEST_ALGORITHM}:"
+        f"{hashlib.sha256(body).hexdigest()}"
+    )
+    return body, value, digest
+
+
 def contract_schema() -> dict[str, Any]:
     """Load the packaged closed JSON Schema for capability negotiation."""
 
-    resource = importlib.resources.files("hermes_cli.execution_contract_schemas").joinpath(
-        "hermes.execution.read.v1.schema.json"
-    )
-    with resource.open("r", encoding="utf-8") as handle:
-        value = json.load(handle)
-    if not isinstance(value, dict):
-        raise ContractDataError("packaged execution contract schema is malformed")
+    _, value, _ = contract_schema_artifact()
     return value

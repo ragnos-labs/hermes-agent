@@ -3504,11 +3504,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if guard:
             return guard
         try:
-            from hermes_cli.execution_contract import contract_schema
+            from hermes_cli.execution_contract import (
+                CONTRACT_SCHEMA_DIGEST_HEADER,
+                contract_schema_artifact,
+            )
 
-            return web.json_response(
-                contract_schema(),
-                headers=self._execution_contract_headers(),
+            body, _, digest = contract_schema_artifact()
+            headers = self._execution_contract_headers()
+            headers[CONTRACT_SCHEMA_DIGEST_HEADER] = digest
+            return web.Response(
+                body=body,
+                content_type="application/schema+json",
+                headers=headers,
             )
         except Exception as exc:
             return self._execution_contract_error_response(exc)

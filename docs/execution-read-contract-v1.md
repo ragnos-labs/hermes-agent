@@ -54,6 +54,35 @@ version. Supplying two different values is `400`; an unsupported version is
 `Hermes-Execution-Contract-Version: hermes.execution.read.v1` and
 `Cache-Control: no-store`.
 
+### Schema wire identity
+
+A successful `GET /v1/execution-contract/schema` returns the exact packaged
+`hermes.execution.read.v1.schema.json` bytes with
+`Content-Type: application/schema+json`. The response also includes:
+
+```http
+Hermes-Execution-Contract-Version: hermes.execution.read.v1
+Hermes-Execution-Contract-Schema-Digest: sha256:7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
+```
+
+The schema digest value is `sha256:` followed by 64 lowercase hexadecimal
+characters. It is computed over the exact packaged artifact bytes returned as
+the HTTP response body, before JSON parsing or serialization. The hexadecimal
+portion is therefore the same schema SHA-256 value carried by release metadata;
+the HTTP contract does not require consumers to understand a particular image
+registry or release system.
+
+A consumer must fail closed unless the version is supported, the advertised
+schema digest matches an independently trusted digest for that version, and
+SHA-256 of the unmodified response bytes matches the advertised digest. It
+then parses those same bytes and validates the JSON Schema and subsequent API
+documents semantically. JSON parsing, key reordering, whitespace removal, or
+other canonicalization must not happen before the byte digest is checked.
+Missing or malformed identity headers, a changed body, a changed digest, or a
+schema that is not valid Draft 2020-12 are contract failures. The digest is
+response metadata, not a schema field, so the schema never contains its own
+digest.
+
 ## Read routes
 
 All routes are also available under the existing multiplex prefix
