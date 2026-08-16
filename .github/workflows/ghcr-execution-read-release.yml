@@ -262,7 +262,10 @@ jobs:
 
           def accepted(*, environment_name, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
               dedicated_environment = environment_name == RELEASE_ENVIRONMENT
-              operator_review = RELEASE_OPERATOR in reviewers and prevent_self_review is False
+              operator_review = (
+                  reviewers == [{"type": "User", "login": RELEASE_OPERATOR}]
+                  and prevent_self_review is False
+              )
               no_admin_bypass = can_admins_bypass is False
               main_only = (
                   policy == "protected_branches"
@@ -273,7 +276,7 @@ jobs:
 
           protected = dict(
               environment_name=RELEASE_ENVIRONMENT,
-              reviewers=[RELEASE_OPERATOR],
+              reviewers=[{"type": "User", "login": RELEASE_OPERATOR}],
               prevent_self_review=False,
               can_admins_bypass=False,
               policy="protected_branches",
@@ -286,7 +289,9 @@ jobs:
           assert accepted(**custom_main)
           assert not accepted(**(protected | {"can_admins_bypass": True}))
           assert not accepted(**(protected | {"reviewers": []}))
-          assert not accepted(**(protected | {"reviewers": ["independent-maintainer"]}))
+          assert not accepted(**(protected | {"reviewers": [{"type": "User", "login": "independent-maintainer"}]}))
+          assert not accepted(**(protected | {"reviewers": protected["reviewers"] + [{"type": "User", "login": "backup-operator"}]}))
+          assert not accepted(**(protected | {"reviewers": protected["reviewers"] + [{"type": "Team", "login": "release-operators"}]}))
           assert not accepted(**(protected | {"prevent_self_review": True}))
           assert not accepted(**(protected | {"policy": None}))
           assert not accepted(**(protected | {"environment_name": "gh-image"}))
@@ -719,17 +724,18 @@ jobs:
           assert environment.get("name") == release_environment, (
               "GitHub returned the wrong release environment"
           )
-          reviewers = [
+          reviewer_rules = [
               rule for rule in environment.get("protection_rules", [])
               if rule.get("type") == "required_reviewers"
-              and rule.get("prevent_self_review") is False
-              and release_operator in {
-                  entry.get("reviewer", {}).get("login")
-                  for entry in rule.get("reviewers", [])
-              }
           ]
+          reviewers = reviewer_rules[0].get("reviewers", []) if len(reviewer_rules) == 1 else []
           policy = environment.get("deployment_branch_policy") or {}
-          assert reviewers, (
+          assert (
+              len(reviewers) == 1
+              and reviewers[0].get("type") == "User"
+              and reviewers[0].get("reviewer", {}).get("login") == release_operator
+              and reviewer_rules[0].get("prevent_self_review") is False
+          ), (
               f"{release_environment} must require the RAGnos release operator "
               "and permit its bounded approval"
           )
@@ -739,7 +745,7 @@ jobs:
           assert policy.get("protected_branches") or policy.get("custom_branch_policies"), (
               f"{release_environment} must restrict deployments to protected branches or custom main policy"
           )
-          print(json.dumps({"required_reviewer_rules": len(reviewers), "deployment_branch_policy": policy}))
+          print(json.dumps({"required_reviewer_rules": len(reviewer_rules), "deployment_branch_policy": policy}))
           PY
 
           custom_policies="$(jq -r '.deployment_branch_policy.custom_branch_policies // false' "$environment_json")"
