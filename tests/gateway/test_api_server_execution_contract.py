@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.resources
 import json
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
@@ -31,6 +33,7 @@ from hermes_cli.execution_contract import (
 FULL_KEY = "full-mutation-key-0123456789abcdef"
 READ_KEY = "execution-read-key-0123456789abcdef"
 NOW = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+SCHEMA_DIGEST_HEADER = "Hermes-Execution-Contract-Schema-Digest"
 
 
 def _auth(key: str) -> dict[str, str]:
@@ -39,6 +42,22 @@ def _auth(key: str) -> dict[str, str]:
 
 def _assert_closed_error(payload: dict) -> None:
     Draft202012Validator(contract_schema()["$defs"]["errorDetail"]).validate(payload)
+
+
+def _assert_schema_wire_identity(
+    body: bytes,
+    headers: dict[str, str],
+    packaged_body: bytes,
+) -> None:
+    expected_digest = f"sha256:{hashlib.sha256(packaged_body).hexdigest()}"
+    assert headers["Hermes-Execution-Contract-Version"] == CONTRACT_VERSION
+    assert headers[SCHEMA_DIGEST_HEADER] == expected_digest
+    assert body == packaged_body
+    assert f"sha256:{hashlib.sha256(body).hexdigest()}" == expected_digest
+
+    schema = json.loads(body)
+    Draft202012Validator.check_schema(schema)
+    assert schema["$id"].endswith("hermes.execution.read.v1.schema.json")
 
 
 @pytest.fixture
@@ -87,6 +106,51 @@ def _contract_app(adapter: APIServerAdapter) -> web.Application:
             app.router.add_route(method, path, handler)
             app.router.add_route(method, f"/p/{{profile}}{path}", handler)
     return app
+
+
+@pytest.mark.asyncio
+async def test_schema_wire_identity_matches_packaged_artifact_and_is_stable(
+    contract_adapter,
+):
+    packaged_body = (
+        importlib.resources.files("hermes_cli.execution_contract_schemas")
+        .joinpath("hermes.execution.read.v1.schema.json")
+        .read_bytes()
+    )
+    app = _contract_app(contract_adapter)
+
+    async with TestClient(TestServer(app)) as client:
+        first_response = await client.get(
+            "/v1/execution-contract/schema",
+            headers=_auth(READ_KEY),
+        )
+        second_response = await client.get(
+            "/v1/execution-contract/schema",
+            headers=_auth(READ_KEY),
+        )
+        assert first_response.status == second_response.status == 200
+        assert first_response.headers["Content-Type"] == "application/schema+json"
+        assert second_response.headers["Content-Type"] == "application/schema+json"
+
+        first_body = await first_response.read()
+        second_body = await second_response.read()
+        first_headers = dict(first_response.headers)
+        second_headers = dict(second_response.headers)
+        _assert_schema_wire_identity(first_body, first_headers, packaged_body)
+        _assert_schema_wire_identity(second_body, second_headers, packaged_body)
+        assert second_body == first_body
+        assert second_headers[SCHEMA_DIGEST_HEADER] == first_headers[SCHEMA_DIGEST_HEADER]
+
+        tampered_body = first_body.replace(b'"title"', b'"other"', 1)
+        with pytest.raises(AssertionError):
+            _assert_schema_wire_identity(tampered_body, first_headers, packaged_body)
+
+        mismatched_headers = {
+            **first_headers,
+            SCHEMA_DIGEST_HEADER: f"sha256:{'0' * 64}",
+        }
+        with pytest.raises(AssertionError):
+            _assert_schema_wire_identity(first_body, mismatched_headers, packaged_body)
 
 
 @pytest.mark.asyncio

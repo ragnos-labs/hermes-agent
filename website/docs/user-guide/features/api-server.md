@@ -447,6 +447,21 @@ curl http://localhost:8642/v1/execution-contract/capabilities \
   -H "Hermes-Execution-Contract-Version: hermes.execution.read.v1"
 ```
 
+The schema route serves the packaged schema bytes unchanged as
+`application/schema+json` and binds them to the version with an authoritative
+digest header:
+
+```http
+Hermes-Execution-Contract-Version: hermes.execution.read.v1
+Hermes-Execution-Contract-Schema-Digest: sha256:7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
+```
+
+Verify the version and digest against trusted release metadata, hash the raw
+body bytes before parsing, then parse and validate the schema and API documents
+semantically. Do not reserialize or canonicalize the JSON before hashing. A
+missing header, digest mismatch, tampered body, or invalid schema must fail
+closed.
+
 The server derives and asserts the profile-instance, authority, and executor
 identity from the active scoped Hermes home in every response; URL labels do
 not create authority. Under multiplexing,
