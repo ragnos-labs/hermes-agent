@@ -43,6 +43,7 @@ concurrency:
 env:
   IMAGE_NAME: ghcr.io/ragnos-labs/hermes-agent
   CONTRACT_VERSION: hermes.execution.read.v1
+  ORAS_VERSION: 1.3.3
   SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.read.v1.schema.json
   SCHEMA_SHA256: 7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
 
@@ -204,6 +205,69 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && needs.resolve.outputs.workflow_sha || github.event.pull_request.head.sha }}
           persist-credentials: false
+
+      - name: Set up ORAS under publication policy
+        uses: oras-project/setup-oras@0d9191fa0dd41eaefe9e28b375a02290706ce51d # upstream-main-2026-08-06
+        with:
+          version: ${{ env.ORAS_VERSION }}
+
+      - name: Test ORAS setup and release-step parity
+        env:
+          WORKFLOW_PATH: .github/workflows/ghcr-execution-read-release.yml
+        run: |
+          set -euo pipefail
+          version_output="$(oras version)"
+          version_lines=()
+          while IFS= read -r line; do
+            case "$line" in
+              Version:*) version_lines+=("$line") ;;
+            esac
+          done <<< "$version_output"
+          [ "${#version_lines[@]}" -eq 1 ] || {
+            echo "::error::oras version returned ${#version_lines[@]} Version: lines; expected exactly one."
+            exit 1
+          }
+          actual_version="${version_lines[0]#Version:}"
+          actual_version="${actual_version#"${actual_version%%[![:space:]]*}"}"
+          actual_version="${actual_version%"${actual_version##*[![:space:]]}"}"
+          [ "$actual_version" = "$ORAS_VERSION" ] || {
+            echo "::error::setup-oras installed ${actual_version:-no version}; expected ${ORAS_VERSION}."
+            exit 1
+          }
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path(os.environ["WORKFLOW_PATH"]).read_text(encoding="utf-8")
+
+
+          def job_body(name):
+              job = re.compile(
+                  rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)"
+              ).findall(text)
+              assert len(job) == 1, f"expected exactly one {name} job"
+              return job[0]
+
+
+          setup_contract = re.compile(
+              r"(?m)^\s+uses: oras-project/setup-oras@([0-9a-f]{40})\s+#\s+\S+\s*$\n"
+              r"^\s+with:\s*$\n"
+              r"^\s+version:\s+(\$\{\{\s*env\.ORAS_VERSION\s*\}\})\s*$"
+          )
+          setup_contracts = {}
+          for job_name in ("publication-policy", "manifest"):
+              matches = setup_contract.findall(job_body(job_name))
+              assert len(matches) == 1, (
+                  f"{job_name} must contain exactly one immutable setup-oras contract"
+              )
+              setup_contracts[job_name] = matches[0]
+          assert setup_contracts["publication-policy"] == setup_contracts["manifest"], (
+              "publication-policy and manifest must use the same setup-oras SHA "
+              "and shared ORAS version expression"
+          )
+          print("oras_setup_and_release_parity=passed")
+          PY
 
       - name: Test audited workflow dispatch fence
         run: |
@@ -1451,9 +1515,9 @@ jobs:
 
       - name: Set up ORAS for release-lifetime receipt attachment
         if: always()
-        uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
+        uses: oras-project/setup-oras@0d9191fa0dd41eaefe9e28b375a02290706ce51d # upstream-main-2026-08-06
         with:
-          version: 1.3.3
+          version: ${{ env.ORAS_VERSION }}
 
       - name: Preflight and create recoverable multi-architecture tags
         if: steps.children.outputs.ready == 'true'
