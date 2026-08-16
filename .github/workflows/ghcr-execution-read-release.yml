@@ -5,10 +5,10 @@ name: GHCR Execution Read Release
 # to a registry. Publishing is limited to an exact workflow_dispatch of this
 # audited workflow on protected main. A dispatch confirmation records intent;
 # it is not approval. Publication also fails closed unless the dedicated
-# hermes-execution-read-release environment has required reviewers,
-# prevent-self-review, disabled administrator bypass, and a main-only deployment
-# policy. Protected CalVer tags and GHCR package-writer restrictions remain
-# external release gates owned by the pilot.
+# hermes-execution-read-release environment requires the RAGnos release operator,
+# permits that operator to approve the bounded dispatch, disables administrator
+# bypass, and has a main-only deployment policy. Protected CalVer tags and GHCR
+# package-writer restrictions remain external release gates owned by the pilot.
 # This workflow never creates main or latest tags.
 on:
   pull_request:
@@ -257,23 +257,27 @@ jobs:
         run: |
           python3 - <<'PY'
           RELEASE_ENVIRONMENT = "hermes-execution-read-release"
+          RELEASE_OPERATOR = "ragnos-dev"
 
 
           def accepted(*, environment_name, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
               dedicated_environment = environment_name == RELEASE_ENVIRONMENT
-              independent_review = bool(reviewers) and prevent_self_review is True
+              operator_review = (
+                  reviewers == [{"type": "User", "login": RELEASE_OPERATOR}]
+                  and prevent_self_review is False
+              )
               no_admin_bypass = can_admins_bypass is False
               main_only = (
                   policy == "protected_branches"
                   or (policy == "custom_branch_policies" and "main" in custom_names)
               )
-              return dedicated_environment and independent_review and no_admin_bypass and main_only
+              return dedicated_environment and operator_review and no_admin_bypass and main_only
 
 
           protected = dict(
               environment_name=RELEASE_ENVIRONMENT,
-              reviewers=["independent-maintainer"],
-              prevent_self_review=True,
+              reviewers=[{"type": "User", "login": RELEASE_OPERATOR}],
+              prevent_self_review=False,
               can_admins_bypass=False,
               policy="protected_branches",
           )
@@ -285,7 +289,10 @@ jobs:
           assert accepted(**custom_main)
           assert not accepted(**(protected | {"can_admins_bypass": True}))
           assert not accepted(**(protected | {"reviewers": []}))
-          assert not accepted(**(protected | {"prevent_self_review": False}))
+          assert not accepted(**(protected | {"reviewers": [{"type": "User", "login": "independent-maintainer"}]}))
+          assert not accepted(**(protected | {"reviewers": protected["reviewers"] + [{"type": "User", "login": "backup-operator"}]}))
+          assert not accepted(**(protected | {"reviewers": protected["reviewers"] + [{"type": "Team", "login": "release-operators"}]}))
+          assert not accepted(**(protected | {"prevent_self_review": True}))
           assert not accepted(**(protected | {"policy": None}))
           assert not accepted(**(protected | {"environment_name": "gh-image"}))
           assert not accepted(**(custom_main | {"custom_names": ["release-copy"]}))
@@ -713,24 +720,32 @@ jobs:
 
           environment = json.load(open(sys.argv[1], encoding="utf-8"))
           release_environment = os.environ["RELEASE_ENVIRONMENT"]
+          release_operator = "ragnos-dev"
           assert environment.get("name") == release_environment, (
               "GitHub returned the wrong release environment"
           )
-          reviewers = [
+          reviewer_rules = [
               rule for rule in environment.get("protection_rules", [])
               if rule.get("type") == "required_reviewers"
-              and rule.get("reviewers")
-              and rule.get("prevent_self_review") is True
           ]
+          reviewers = reviewer_rules[0].get("reviewers", []) if len(reviewer_rules) == 1 else []
           policy = environment.get("deployment_branch_policy") or {}
-          assert reviewers, f"{release_environment} must have a required reviewer and prevent self-review"
+          assert (
+              len(reviewers) == 1
+              and reviewers[0].get("type") == "User"
+              and reviewers[0].get("reviewer", {}).get("login") == release_operator
+              and reviewer_rules[0].get("prevent_self_review") is False
+          ), (
+              f"{release_environment} must require the RAGnos release operator "
+              "and permit its bounded approval"
+          )
           assert environment.get("can_admins_bypass") is False, (
               f"{release_environment} must disable administrator protection-rule bypass"
           )
           assert policy.get("protected_branches") or policy.get("custom_branch_policies"), (
               f"{release_environment} must restrict deployments to protected branches or custom main policy"
           )
-          print(json.dumps({"required_reviewer_rules": len(reviewers), "deployment_branch_policy": policy}))
+          print(json.dumps({"required_reviewer_rules": len(reviewer_rules), "deployment_branch_policy": policy}))
           PY
 
           custom_policies="$(jq -r '.deployment_branch_policy.custom_branch_policies // false' "$environment_json")"
@@ -744,7 +759,7 @@ jobs:
             }
           fi
 
-          echo "External hold passed: ${RELEASE_ENVIRONMENT} required review and main deployment restriction are present."
+          echo "External hold passed: ${RELEASE_ENVIRONMENT} operator approval and main deployment restriction are present."
           echo "CalVer tag protection and GHCR package-writer restriction remain pilot-owned external gates."
 
       - name: Upload authorization failure receipt
