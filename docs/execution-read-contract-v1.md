@@ -262,3 +262,15 @@ The private durable-idempotency layer for existing full-key `POST /v1/runs`
 does not make proposal/action dispatch public and therefore does not change
 that capability value. See
 [execution-action-contract-v1.md](execution-action-contract-v1.md).
+
+### Additive action release identity
+
+The same exact-source container may additionally attest the private
+`hermes.execution.action.v1` profile and its own canonical schema. That
+identity is additive: `hermes.execution.read.v1`, this schema artifact and
+digest, all public objects and routes, `action_dispatch=false`, and the
+authoritative read release receipt remain unchanged. The action profile has a
+distinct OCI release receipt attached to the same immutable index; it points
+back to this read contract for durable status and terminal effect receipts.
+Packaging both identities does not make proposal dispatch, public decision
+mutation, deployment, activation, or runtime use true.

@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.nousresearch.com/contracts/hermes.execution.action.v1.schema.json",
+  "title": "Hermes Execution Action Contract v1",
+  "description": "Machine-readable identity for the private authenticated, durably idempotent Runs submission profile and its authoritative execution-read status and terminal-receipt bindings.",
+  "oneOf": [
+    {"$ref": "#/$defs/submissionEnvelope"},
+    {"$ref": "#/$defs/acceptedResponse"},
+    {"$ref": "#/$defs/statusBinding"},
+    {"$ref": "#/$defs/terminalReceiptBinding"},
+    {"$ref": "#/$defs/releaseReceipt"}
+  ],
+  "$defs": {
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ociDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "sourceSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?=\\S(?:.*\\S)?$)[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(?=\\S(?:.*\\S)?$)[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^run_[0-9a-f]{32}$"
+    },
+    "executionId": {
+      "type": "string",
+      "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"
+    },
+    "executionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "work_ref": {"$ref": "#/$defs/reference"},
+        "proposal_ref": {"$ref": "#/$defs/reference"},
+        "effect_id": {"$ref": "#/$defs/reference"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["effect_id"]},
+          "then": {"required": ["work_ref", "proposal_ref"]}
+        }
+      ]
+    },
+    "submissionBody": {
+      "type": "object",
+      "required": ["input", "execution_context"],
+      "properties": {
+        "input": {"type": "string", "minLength": 1},
+        "execution_context": {"$ref": "#/$defs/executionContext"},
+        "instructions": {"type": "string"},
+        "model": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "previous_response_id": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "submissionEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "method",
+        "route",
+        "idempotency_key",
+        "body"
+      ],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.action.v1"},
+        "method": {"const": "POST"},
+        "route": {"const": "/v1/runs"},
+        "idempotency_key": {"$ref": "#/$defs/idempotencyKey"},
+        "body": {"$ref": "#/$defs/submissionBody"}
+      }
+    },
+    "acceptedResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "execution_id", "status"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "execution_id": {"$ref": "#/$defs/executionId"},
+        "status": {"const": "started"}
+      }
+    },
+    "statusBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "route", "execution_id"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "route": {
+          "const": "/v1/execution-contract/executions/{execution_id}"
+        },
+        "execution_id": {"$ref": "#/$defs/executionId"}
+      }
+    },
+    "terminalReceiptBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "route", "receipt_id"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "route": {
+          "const": "/v1/execution-contract/receipts/{receipt_id}"
+        },
+        "receipt_id": {
+          "type": "string",
+          "pattern": "^rcp_[0-9a-f]{12}_[0-9a-f]{32}$"
+        }
+      }
+    },
+    "releaseReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_version",
+        "status",
+        "destination",
+        "release_tag",
+        "source_sha",
+        "workflow_sha",
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "contract",
+        "schema_sha256",
+        "read_contract",
+        "read_schema_sha256",
+        "index_digest"
+      ],
+      "properties": {
+        "receipt_version": {
+          "const": "hermes.execution.action.release-receipt.v1"
+        },
+        "status": {"const": "complete"},
+        "destination": {"const": "ghcr.io/ragnos-labs/hermes-agent"},
+        "release_tag": {
+          "type": "string",
+          "pattern": "^v[0-9]{4}\\.[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$"
+        },
+        "source_sha": {"$ref": "#/$defs/sourceSha"},
+        "workflow_sha": {"$ref": "#/$defs/sourceSha"},
+        "workflow_run_id": {"type": "string", "pattern": "^[0-9]+$"},
+        "workflow_run_attempt": {"type": "string", "pattern": "^[0-9]+$"},
+        "contract": {"const": "hermes.execution.action.v1"},
+        "schema_sha256": {"$ref": "#/$defs/sha256Hex"},
+        "read_contract": {"const": "hermes.execution.read.v1"},
+        "read_schema_sha256": {"$ref": "#/$defs/sha256Hex"},
+        "index_digest": {"$ref": "#/$defs/ociDigest"}
+      }
+    }
+  }
+}
