@@ -8,7 +8,7 @@ Contract identity: `hermes.execution.read.v1`
 
 HTTP API namespace: `/v1/execution-contract`
 
-Store schema: SQLite `PRAGMA user_version=1`
+Store schema: SQLite `PRAGMA user_version=2`
 
 ## Purpose and authority
 
@@ -245,6 +245,11 @@ validated for scoped IDs, references, digests, bindings, lifecycle/receipt
 combinations, revisions, and timestamp ordering before HTTP `200`; corruption
 returns the closed `500 execution_contract_corrupt` envelope.
 
+Store schema 2 adds a private hash-only keyed-submission table used by the
+full-authority Runs API. It does not change this contract's public objects,
+packaged schema, read routes, or wire identity. Version 1 stores migrate
+atomically before the listener starts.
+
 ## Release 2 hold
 
 Release 1 does not add proposal submission, general action dispatch,
@@ -252,3 +257,8 @@ WebAuthn/step-up authorization, public decision mutation, executor delegation,
 or recovery mutation routes. The capability document advertises
 `webauthn_decisions=false` and `action_dispatch=false`. Those features require
 a separate accepted decision and action-contract release.
+
+The private durable-idempotency layer for existing full-key `POST /v1/runs`
+does not make proposal/action dispatch public and therefore does not change
+that capability value. See
+[execution-action-contract-v1.md](execution-action-contract-v1.md).

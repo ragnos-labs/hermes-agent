@@ -1,5 +1,66 @@
 # Architecture Decision Records
 
+## 2026-08-22: Private durable-idempotent run submission
+
+Status: Accepted for a bounded source candidate. This decision does not claim
+merge, release, deployment, activation, executor evidence, or an outcome.
+
+Context:
+The Release 1 execution read contract already gives authenticated clients a
+durable execution identifier, lifecycle, and evidence-gated terminal receipt.
+The full-authority `POST /v1/runs` route already creates those execution rows,
+but every request creates a fresh run. A PM coordinator retrying an ambiguous
+HTTP response can therefore dispatch the same approved intent twice. The
+existing generic API idempotency cache is process-local, expires quickly, and
+does not reject a changed request under the same key.
+
+Decision:
+- Keep `POST /v1/runs` as the private full-key submission edge. A request with
+  `Idempotency-Key` receives durable profile-scoped replay semantics; an
+  unkeyed request preserves the existing runs behavior.
+- Hash the key before persistence and retain only that hash, a canonical
+  request digest, generated run and execution identifiers, authority binding,
+  and creation time. Do not persist the request body, prompt, session key, or
+  raw idempotency key in the execution ledger.
+- Atomically reserve the keyed submission, create its queued execution, and
+  append `execution.created`. An exact retry returns the original `202` body
+  without launching another agent. Reusing the key for a changed request is a
+  closed `409` conflict.
+- Include the JSON request body and `X-Hermes-Session-Key` value in the
+  canonical request digest because either can change execution semantics.
+- Migrate the profile-local store from schema 1 to schema 2 before serving;
+  the migration adds only the private submission table. Preserve the released
+  `hermes.execution.read.v1` objects, schema artifact, routes, and wire identity.
+- Retain the v1 read surface and action table across an offline prior-binary
+  rollback. The v2 operator hook must create and validate a consistent private
+  backup before lowering `user_version`; a paired v2 restore hook is the hard
+  stop if the prior binary fails its read-only reopen canary. Both hooks require
+  one explicit existing profile-home or ledger path and an independently known
+  expected profile identity; default, absent, ambiguous, or mismatched targets
+  fail before mutation.
+- Continue to require `API_SERVER_KEY` for submission. `API_SERVER_READ_KEY`
+  remains read-only and receives `403` on `POST /v1/runs`.
+- Reuse `GET /v1/execution-contract/executions/{execution_id}` for durable
+  status and `GET /v1/execution-contract/receipts/{receipt_id}` for terminal
+  evidence. Do not add a second status or receipt authority.
+
+Consequences:
+- A coordinator can safely retry the same accepted submission across process
+  restarts without duplicate dispatch.
+- Admission failures before durable reservation, including concurrency
+  rejection, remain retryable with the same key.
+- Exact durable replay is resolved before new-work concurrency admission and
+  therefore neither consumes nor bypasses capacity for a new execution.
+- A crash after reservation but before or during execution is recovered by the
+  existing startup rule as terminal ambiguity; replay never silently restarts
+  it or projects success.
+- Generic run completion still cannot publish an authoritative effect receipt.
+  A named executor must call the closed evidence hook with exact bindings and
+  digests. Public proposal dispatch, public decision mutation, and WebAuthn
+  step-up remain held, so `action_dispatch=false` stays accurate.
+
+Detailed contract: [execution-action-contract-v1.md](execution-action-contract-v1.md)
+
 ## 2026-08-15: Durable, profile-scoped public execution read contract
 
 Status: Accepted for the Release 1 source candidate. This status records the

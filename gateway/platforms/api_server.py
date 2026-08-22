@@ -7431,17 +7431,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs — start an agent run, return run_id immediately."""
+        """POST /v1/runs — start or durably replay an agent run submission."""
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
 
         try:
             body = await request.json()
@@ -7524,13 +7518,83 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        idempotency_key = request.headers.get("Idempotency-Key")
+        request_digest = None
+        if idempotency_key is not None:
+            try:
+                from hermes_cli.execution_contract import canonical_digest
+
+                request_digest = canonical_digest(
+                    {
+                        "body": body,
+                        "gateway_session_key": gateway_session_key,
+                    }
+                )
+                replay = self._execution_contract_store().lookup_action_submission(
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                )
+                if replay is not None:
+                    response_headers = (
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key
+                        else {}
+                    )
+                    return web.json_response(
+                        {
+                            "run_id": replay["run_id"],
+                            "execution_id": replay["execution"]["execution_id"],
+                            "status": "started",
+                        },
+                        status=202,
+                        headers=response_headers,
+                    )
+            except Exception as exc:
+                return self._execution_contract_error_response(exc)
+
+        # New work remains subject to the shared agent-serving concurrency
+        # cap.  Exact durable replays above are reads of an already-admitted
+        # identity and must remain available while that cap is saturated.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
         try:
-            durable_execution = self._create_execution_contract_run(
-                run_id,
-                execution_context,
-            )
+            if idempotency_key is not None:
+                assert request_digest is not None
+                submission = self._execution_contract_store().create_action_submission(
+                    idempotency_key=idempotency_key,
+                    request_digest=request_digest,
+                    run_id=run_id,
+                    work_ref=execution_context.get("work_ref"),
+                    proposal_ref=execution_context.get("proposal_ref"),
+                    effect_id=execution_context.get("effect_id"),
+                )
+                run_id = submission["run_id"]
+                durable_execution = submission["execution"]
+                if submission["replayed"]:
+                    response_headers = (
+                        {"X-Hermes-Session-Key": gateway_session_key}
+                        if gateway_session_key
+                        else {}
+                    )
+                    return web.json_response(
+                        {
+                            "run_id": run_id,
+                            "execution_id": durable_execution["execution_id"],
+                            "status": "started",
+                        },
+                        status=202,
+                        headers=response_headers,
+                    )
+                self._run_execution_ids[run_id] = durable_execution["execution_id"]
+            else:
+                durable_execution = self._create_execution_contract_run(
+                    run_id,
+                    execution_context,
+                )
         except Exception as exc:
             return self._execution_contract_error_response(exc)
         # Approval queues gate host-side tool execution and must be isolated
