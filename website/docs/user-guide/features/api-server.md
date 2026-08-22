@@ -357,6 +357,19 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 
 Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
 
+Private coordinators that need retry-safe dispatch can send an
+`Idempotency-Key` with the full `API_SERVER_KEY`. Hermes durably binds the
+hashed key to the canonical request, `run_id`, and execution-read
+`execution_id`. An exact retry returns the same `202` response without a
+second launch; changing the body or `X-Hermes-Session-Key` under that key
+returns `409`. The raw key and request body are not stored in the execution
+ledger.
+
+When the body includes closed `execution_context` bindings, the response also
+contains the durable `execution_id`. Poll that object through the execution
+read contract. An authoritative terminal receipt still requires exact evidence
+from a named executor; generic run completion is not evidence.
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.
@@ -656,6 +669,8 @@ gateway:
 ### Concurrent-run cap
 
 The API server limits how many agent runs may execute at once across the OpenAI-compatible and Runs endpoints. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). When the cap is reached, new run-starting requests are rejected with **HTTP 429** `Too many concurrent runs (max N)` — clients should back off and retry.
+
+An exact durable `Idempotency-Key` replay on `POST /v1/runs` is resolved before this new-work check. It returns the original accepted identity without launching another run or consuming a new concurrency slot.
 
 ## Security Headers
 

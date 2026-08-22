@@ -39,7 +39,7 @@ API_VERSION = "v1"
 CONTRACT_SCHEMA_FILENAME = f"{CONTRACT_VERSION}.schema.json"
 CONTRACT_SCHEMA_DIGEST_HEADER = "Hermes-Execution-Contract-Schema-Digest"
 CONTRACT_SCHEMA_DIGEST_ALGORITHM = "sha256"
-STORE_SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
 EVENT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
@@ -551,6 +551,8 @@ class ExecutionContractStore:
         profile_name: Optional[str] = None,
         runtime_instance_id: Optional[str] = None,
     ) -> None:
+        self._profile_home_was_explicit = profile_home is not None
+        self._database_path_was_explicit = database_path is not None
         active_home = Path(
             profile_home
             or (database_path.parent if database_path is not None else get_hermes_home())
@@ -603,12 +605,15 @@ class ExecutionContractStore:
         try:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
             if version == 0:
-                self._create_schema_v1(connection)
+                self._create_schema_v2(connection)
+            elif version == 1:
+                self._migrate_schema_v1_to_v2(connection)
             elif version != STORE_SCHEMA_VERSION:
                 raise UnsupportedContractVersionError(
                     f"unsupported execution store schema version: {version}"
                 )
             self._validate_schema_metadata(connection)
+            self._validate_action_submissions_schema(connection)
         finally:
             connection.close()
         self._tighten_permissions()
@@ -681,6 +686,7 @@ class ExecutionContractStore:
                     f"unsupported execution store schema version: {version}"
                 )
             self._validate_schema_metadata(connection)
+            self._validate_action_submissions_schema(connection)
         except sqlite3.OperationalError as exc:
             if connection is not None:
                 connection.close()
@@ -714,7 +720,30 @@ class ExecutionContractStore:
             except OSError:
                 pass
 
-    def _create_schema_v1(self, connection: sqlite3.Connection) -> None:
+    @staticmethod
+    def _action_submissions_schema_sql() -> str:
+        return """
+            CREATE TABLE IF NOT EXISTS action_submissions (
+                idempotency_key_hash TEXT PRIMARY KEY,
+                profile_id TEXT NOT NULL,
+                authority_id TEXT NOT NULL,
+                request_digest TEXT NOT NULL,
+                run_id TEXT NOT NULL UNIQUE,
+                execution_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (execution_id) REFERENCES executions(execution_id),
+                CHECK (
+                    length(idempotency_key_hash) = 64
+                    AND idempotency_key_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                CHECK (
+                    length(request_digest) = 64
+                    AND request_digest NOT GLOB '*[^0-9a-f]*'
+                )
+            );
+        """
+
+    def _create_schema_v2(self, connection: sqlite3.Connection) -> None:
         quoted_profile_id = connection.execute(
             "SELECT quote(?)",
             (self.authority.profile_id,),
@@ -871,6 +900,8 @@ class ExecutionContractStore:
             CREATE INDEX IF NOT EXISTS executions_lifecycle_ordinal
                 ON executions(lifecycle, ordinal);
 
+            {self._action_submissions_schema_sql()}
+
             INSERT OR IGNORE INTO execution_contract_metadata(key, value)
                 VALUES ('contract_version', 'hermes.execution.read.v1');
             INSERT OR IGNORE INTO execution_contract_metadata(key, value)
@@ -884,10 +915,358 @@ class ExecutionContractStore:
             INSERT OR IGNORE INTO execution_contract_metadata(key, value)
                 VALUES ('executor_id', {quoted_executor_id});
 
-            PRAGMA user_version=1;
+            PRAGMA user_version=2;
             COMMIT;
             """
         )
+
+    @staticmethod
+    def _validate_action_submissions_schema(
+        connection: sqlite3.Connection,
+    ) -> None:
+        expected_columns = [
+            ("idempotency_key_hash", "TEXT", 0, None, 1),
+            ("profile_id", "TEXT", 1, None, 0),
+            ("authority_id", "TEXT", 1, None, 0),
+            ("request_digest", "TEXT", 1, None, 0),
+            ("run_id", "TEXT", 1, None, 0),
+            ("execution_id", "TEXT", 1, None, 0),
+            ("created_at", "TEXT", 1, None, 0),
+        ]
+        expected_indexes = {
+            (1, "pk", 0, ("idempotency_key_hash",)),
+            (1, "u", 0, ("run_id",)),
+            (1, "u", 0, ("execution_id",)),
+        }
+        expected_foreign_keys = {
+            (
+                "executions",
+                "execution_id",
+                "execution_id",
+                "NO ACTION",
+                "NO ACTION",
+                "NONE",
+            )
+        }
+        try:
+            actual_columns = [
+                (
+                    str(row[1]),
+                    str(row[2]).upper(),
+                    int(row[3]),
+                    row[4],
+                    int(row[5]),
+                )
+                for row in connection.execute(
+                    "PRAGMA table_info(action_submissions)"
+                ).fetchall()
+            ]
+            actual_indexes = set()
+            for row in connection.execute(
+                "PRAGMA index_list(action_submissions)"
+            ).fetchall():
+                columns = tuple(
+                    str(index_row[0])
+                    for index_row in connection.execute(
+                        "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                        (str(row[1]),),
+                    ).fetchall()
+                )
+                actual_indexes.add(
+                    (int(row[2]), str(row[3]), int(row[4]), columns)
+                )
+            actual_foreign_keys = {
+                (
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]),
+                    str(row[5]),
+                    str(row[6]),
+                    str(row[7]),
+                )
+                for row in connection.execute(
+                    "PRAGMA foreign_key_list(action_submissions)"
+                ).fetchall()
+            }
+            schema_row = connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='action_submissions'"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise ContractDataError(
+                "action submission schema is unavailable"
+            ) from exc
+        canonical_sql = re.sub(
+            r"\s+",
+            "",
+            ExecutionContractStore._action_submissions_schema_sql().lower(),
+        ).replace("createtableifnotexists", "createtable", 1).rstrip(";")
+        actual_sql = (
+            re.sub(r"\s+", "", str(schema_row[0]).lower()).rstrip(";")
+            if schema_row and schema_row[0]
+            else ""
+        )
+        if (
+            actual_columns != expected_columns
+            or actual_indexes != expected_indexes
+            or actual_foreign_keys != expected_foreign_keys
+            or actual_sql != canonical_sql
+        ):
+            raise ContractDataError("action submission schema is incomplete")
+
+    def _migrate_schema_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        """Add private keyed-submission identity without changing read-v1 rows."""
+
+        # Keep the version advance in the same explicit transaction as the
+        # table creation and validation.  A prior interrupted attempt may
+        # already have created the complete table while leaving user_version
+        # at 1; IF NOT EXISTS makes that state recoverable.  An incompatible
+        # partial table fails validation and rolls back without falsely
+        # advertising schema v2.
+        with write_txn(connection):
+            connection.execute(self._action_submissions_schema_sql())
+            self._validate_action_submissions_schema(connection)
+            connection.execute("PRAGMA user_version=2")
+
+    def describe_v1_binary_rollback_target(
+        self,
+        *,
+        expected_profile_id: str,
+    ) -> dict[str, Any]:
+        """Resolve and validate the exact existing ledger targeted by rollback."""
+
+        if self._profile_home_was_explicit == self._database_path_was_explicit:
+            raise ContractValidationError(
+                "rollback requires exactly one explicit profile_home or database_path"
+            )
+        expected_profile_id = cast(
+            str,
+            _validated_ref(
+                expected_profile_id,
+                field="expected_profile_id",
+                required=True,
+                max_length=128,
+            ),
+        )
+        resolved_profile_home = self.profile_home.resolve(strict=False)
+        resolved_database_path = self.database_path.resolve(strict=False)
+        if resolved_database_path.parent != resolved_profile_home:
+            raise ContractForbiddenError(
+                "rollback target ledger path does not belong to the explicit profile"
+            )
+        if not resolved_database_path.is_file():
+            raise ContractNotFoundError("rollback target execution ledger is absent")
+        if not _profile_anchor_exists(resolved_profile_home):
+            raise ContractDataError(
+                "rollback target is missing its profile instance anchor"
+            )
+        if self.authority.profile_id != expected_profile_id:
+            raise ContractForbiddenError(
+                "rollback target profile does not match expected profile identity"
+            )
+
+        uri = resolved_database_path.as_uri() + "?mode=ro"
+        connection = connect_tracked(
+            uri,
+            tracking_path=resolved_database_path,
+            uri=True,
+            timeout=1.0,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version not in {1, STORE_SCHEMA_VERSION}:
+                raise UnsupportedContractVersionError(
+                    f"unsupported execution store schema version: {version}"
+                )
+            self._validate_schema_metadata(connection)
+            action_table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='action_submissions'"
+            ).fetchone()
+            if version == STORE_SCHEMA_VERSION or action_table_exists is not None:
+                self._validate_action_submissions_schema(connection)
+        finally:
+            connection.close()
+        return {
+            "profile_home": str(resolved_profile_home),
+            "database_path": str(resolved_database_path),
+            "profile_id": self.authority.profile_id,
+            "schema_version": version,
+        }
+
+    def prepare_v1_binary_rollback(
+        self,
+        *,
+        backup_path: Path,
+        expected_profile_id: str,
+    ) -> None:
+        """Back up schema v2, then expose its unchanged read-v1 surface.
+
+        The caller must stop every gateway and execution-ledger writer before
+        invoking this closed operator hook.  The action-submission table is
+        retained, so reopening with this release revalidates and advances the
+        same store to v2 without losing keyed submission identity.
+        """
+
+        target = self.describe_v1_binary_rollback_target(
+            expected_profile_id=expected_profile_id
+        )
+        if target["schema_version"] != STORE_SCHEMA_VERSION:
+            raise UnsupportedContractVersionError(
+                "rollback preparation requires execution store schema version 2"
+            )
+        backup_path = Path(backup_path)
+        if backup_path.exists() or backup_path.is_symlink():
+            raise ContractConflictError("rollback backup path already exists")
+        if not backup_path.parent.is_dir():
+            raise ContractValidationError(
+                "rollback backup parent directory does not exist"
+            )
+        if backup_path.resolve() == self.database_path.resolve():
+            raise ContractValidationError(
+                "rollback backup path must differ from the execution ledger"
+            )
+
+        lock_connection = self._connect_write()
+        source_connection: Optional[sqlite3.Connection] = None
+        backup_connection: Optional[sqlite3.Connection] = None
+        backup_created = False
+        completed = False
+        try:
+            lock_connection.execute("BEGIN IMMEDIATE")
+            opened_path = Path(
+                str(lock_connection.execute("PRAGMA database_list").fetchone()[2])
+            ).resolve(strict=False)
+            if str(opened_path) != target["database_path"]:
+                raise ContractForbiddenError(
+                    "opened rollback ledger does not match the resolved target"
+                )
+            version = int(
+                lock_connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if version != STORE_SCHEMA_VERSION:
+                raise UnsupportedContractVersionError(
+                    f"unsupported execution store schema version: {version}"
+                )
+            self._validate_schema_metadata(lock_connection)
+            self._validate_action_submissions_schema(lock_connection)
+
+            source_uri = self.database_path.resolve().as_uri() + "?mode=ro"
+            source_connection = connect_tracked(
+                source_uri,
+                tracking_path=self.database_path,
+                uri=True,
+                timeout=5.0,
+            )
+            try:
+                backup_fd = os.open(
+                    backup_path,
+                    os.O_CREAT | os.O_EXCL | os.O_RDWR,
+                    0o600,
+                )
+            except FileExistsError as exc:
+                raise ContractConflictError(
+                    "rollback backup path already exists"
+                ) from exc
+            else:
+                os.close(backup_fd)
+                backup_created = True
+            backup_connection = connect_tracked(backup_path, timeout=5.0)
+            source_connection.backup(backup_connection)
+            backup_connection.commit()
+            backup_connection.row_factory = sqlite3.Row
+            if int(backup_connection.execute("PRAGMA user_version").fetchone()[0]) != 2:
+                raise ContractDataError("rollback backup schema version is invalid")
+            self._validate_schema_metadata(backup_connection)
+            self._validate_action_submissions_schema(backup_connection)
+
+            lock_connection.execute("PRAGMA user_version=1")
+            lock_connection.execute("COMMIT")
+            completed = True
+        except Exception:
+            with suppress(sqlite3.Error):
+                lock_connection.execute("ROLLBACK")
+            raise
+        finally:
+            for connection in (backup_connection, source_connection, lock_connection):
+                if connection is not None:
+                    with suppress(sqlite3.Error):
+                        connection.close()
+            if backup_created and not completed:
+                with suppress(OSError):
+                    backup_path.unlink(missing_ok=True)
+        if not backup_created:
+            raise ContractUnavailableError("rollback backup was not created")
+        try:
+            backup_path.chmod(0o600)
+        except OSError:
+            pass
+
+    def restore_v2_rollback_backup(
+        self,
+        *,
+        backup_path: Path,
+        expected_profile_id: str,
+    ) -> None:
+        """Restore a validated v2 backup after a failed prior-binary reopen."""
+
+        target = self.describe_v1_binary_rollback_target(
+            expected_profile_id=expected_profile_id
+        )
+        backup_path = Path(backup_path)
+        if not backup_path.is_file() or backup_path.is_symlink():
+            raise ContractValidationError("rollback backup is unavailable")
+        if backup_path.resolve() == self.database_path.resolve():
+            raise ContractValidationError(
+                "rollback backup path must differ from the execution ledger"
+            )
+
+        source_uri = backup_path.resolve().as_uri() + "?mode=ro"
+        source_connection = connect_tracked(
+            source_uri,
+            tracking_path=backup_path,
+            uri=True,
+            timeout=5.0,
+        )
+        destination_connection: Optional[sqlite3.Connection] = None
+        try:
+            source_connection.row_factory = sqlite3.Row
+            if int(source_connection.execute("PRAGMA user_version").fetchone()[0]) != 2:
+                raise ContractDataError("rollback backup schema version is invalid")
+            self._validate_schema_metadata(source_connection)
+            self._validate_action_submissions_schema(source_connection)
+
+            destination_connection = self._connect_write()
+            opened_path = Path(
+                str(destination_connection.execute("PRAGMA database_list").fetchone()[2])
+            ).resolve(strict=False)
+            if str(opened_path) != target["database_path"]:
+                raise ContractForbiddenError(
+                    "opened rollback ledger does not match the resolved target"
+                )
+            destination_version = int(
+                destination_connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if destination_version not in {1, STORE_SCHEMA_VERSION}:
+                raise UnsupportedContractVersionError(
+                    f"unsupported execution store schema version: {destination_version}"
+                )
+            self._validate_schema_metadata(destination_connection)
+            source_connection.backup(destination_connection)
+            destination_connection.row_factory = sqlite3.Row
+            if int(destination_connection.execute("PRAGMA user_version").fetchone()[0]) != 2:
+                raise ContractDataError("restored execution ledger version is invalid")
+            self._validate_schema_metadata(destination_connection)
+            self._validate_action_submissions_schema(destination_connection)
+        finally:
+            if destination_connection is not None:
+                with suppress(sqlite3.Error):
+                    destination_connection.close()
+            with suppress(sqlite3.Error):
+                source_connection.close()
+        self._tighten_permissions()
 
     def _validate_schema_metadata(self, connection: sqlite3.Connection) -> None:
         try:
@@ -916,6 +1295,204 @@ class ExecutionContractStore:
     # ------------------------------------------------------------------
     # Durable mutation hooks (not public HTTP mutation routes)
     # ------------------------------------------------------------------
+
+    def _action_submission_identity(
+        self,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> tuple[str, str]:
+        clean_key = cast(
+            str,
+            _validated_ref(
+                idempotency_key,
+                field="idempotency_key",
+                required=True,
+                max_length=256,
+            ),
+        )
+        clean_digest = cast(
+            str,
+            _validated_digest(
+                request_digest,
+                field="request_digest",
+                required=True,
+            ),
+        )
+        key_hash = hashlib.sha256(
+            b"hermes-execution-action-idempotency-v1\x00"
+            + clean_key.encode("utf-8")
+        ).hexdigest()
+        return key_hash, clean_digest
+
+    def _action_submission_replay(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        key_hash: str,
+        request_digest: str,
+    ) -> Optional[dict[str, Any]]:
+        existing = connection.execute(
+            "SELECT * FROM action_submissions WHERE idempotency_key_hash=?",
+            (key_hash,),
+        ).fetchone()
+        if existing is None:
+            return None
+        if existing["request_digest"] != request_digest:
+            raise ContractConflictError(
+                "idempotency key is already bound to a different request"
+            )
+        execution = self._execution_row(
+            connection,
+            str(existing["execution_id"]),
+        )
+        if execution is None:
+            raise ContractDataError("action submission execution is missing")
+        if (
+            existing["profile_id"] != self.authority.profile_id
+            or existing["authority_id"] != self.authority.authority_id
+            or execution["source_run_id"] != existing["run_id"]
+        ):
+            raise ContractDataError("action submission authority binding is corrupt")
+        return {
+            "run_id": str(existing["run_id"]),
+            "execution": self._execution_from_row(execution),
+            "replayed": True,
+        }
+
+    def lookup_action_submission(
+        self,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+    ) -> Optional[dict[str, Any]]:
+        """Read an exact durable replay without reserving new execution state."""
+
+        key_hash, request_digest = self._action_submission_identity(
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        with self._read_connection() as connection:
+            if connection is None:
+                return None
+            return self._action_submission_replay(
+                connection,
+                key_hash=key_hash,
+                request_digest=request_digest,
+            )
+
+    def create_action_submission(
+        self,
+        *,
+        idempotency_key: str,
+        request_digest: str,
+        run_id: str,
+        work_ref: Optional[str] = None,
+        proposal_ref: Optional[str] = None,
+        effect_id: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Atomically reserve one private API submission and execution.
+
+        The raw idempotency key and request body are never persisted. Exact
+        replay returns the original identities; reusing the key for a changed
+        canonical request fails closed.
+        """
+
+        self.initialize()
+        key_hash, request_digest = self._action_submission_identity(
+            idempotency_key=idempotency_key,
+            request_digest=request_digest,
+        )
+        run_id = cast(
+            str,
+            _validated_ref(run_id, field="run_id", required=True, max_length=128),
+        )
+        work_ref = _validated_ref(work_ref, field="work_ref")
+        proposal_ref = _validated_ref(proposal_ref, field="proposal_ref")
+        effect_id = _validated_ref(effect_id, field="effect_id")
+        if effect_id and not (work_ref and proposal_ref):
+            raise ContractValidationError(
+                "effect_id requires exact work_ref and proposal_ref bindings"
+            )
+        instant = _timestamp(now)
+        execution_id = self._new_id("exe")
+        receipt_state = "pending_evidence" if effect_id else "not_applicable"
+        connection = self._connect_write()
+        try:
+            with write_txn(connection):
+                replay = self._action_submission_replay(
+                    connection,
+                    key_hash=key_hash,
+                    request_digest=request_digest,
+                )
+                if replay is not None:
+                    return replay
+
+                connection.execute(
+                    """
+                    INSERT INTO executions(
+                        execution_id, profile_id, authority_id, executor_id,
+                        source_run_id, work_ref, proposal_ref, effect_id,
+                        lifecycle, receipt_state, created_at, started_at,
+                        updated_at, revision, runtime_instance_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, NULL, ?, 1, ?)
+                    """,
+                    (
+                        execution_id,
+                        self.authority.profile_id,
+                        self.authority.authority_id,
+                        self.authority.executor_id,
+                        run_id,
+                        work_ref,
+                        proposal_ref,
+                        effect_id,
+                        receipt_state,
+                        instant,
+                        instant,
+                        self.runtime_instance_id,
+                    ),
+                )
+                self._append_event_in_txn(
+                    connection,
+                    execution_id=execution_id,
+                    event_type="execution.created",
+                    to_lifecycle="queued",
+                    occurred_at=instant,
+                    revision=1,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO action_submissions(
+                        idempotency_key_hash, profile_id, authority_id,
+                        request_digest, run_id, execution_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key_hash,
+                        self.authority.profile_id,
+                        self.authority.authority_id,
+                        request_digest,
+                        run_id,
+                        execution_id,
+                        instant,
+                    ),
+                )
+                row = self._execution_row(connection, execution_id)
+                assert row is not None
+                return {
+                    "run_id": run_id,
+                    "execution": self._execution_from_row(row),
+                    "replayed": False,
+                }
+        except sqlite3.IntegrityError as exc:
+            raise ContractConflictError("action submission identity conflicts") from exc
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                raise ContractRateLimitedError("execution ledger is busy") from exc
+            raise ContractUnavailableError("execution ledger is unavailable") from exc
+        finally:
+            connection.close()
 
     def create_execution(
         self,

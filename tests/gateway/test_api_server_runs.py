@@ -148,6 +148,157 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_keyed_start_replays_durable_identity_without_redispatch(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "programos-intent-0001"}
+                body = {
+                    "input": "perform the synthetic approved action",
+                    "execution_context": {
+                        "work_ref": "work:programos:1",
+                        "proposal_ref": "proposal:programos:1",
+                        "effect_id": "effect:programos:1",
+                    },
+                }
+
+                first = await cli.post("/v1/runs", json=body, headers=headers)
+                replay = await cli.post("/v1/runs", json=body, headers=headers)
+                assert first.status == replay.status == 202
+                assert await replay.json() == await first.json()
+
+                for _ in range(40):
+                    if mock_create.call_count == 1:
+                        break
+                    await asyncio.sleep(0.05)
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_keyed_replay_bypasses_new_work_concurrency_gate(self, adapter):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, _ = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "programos-replay-at-capacity"}
+                body = {"input": "perform one synthetic action"}
+
+                first = await cli.post("/v1/runs", json=body, headers=headers)
+                assert first.status == 202
+                first_payload = await first.json()
+                assert agent_ready.wait(timeout=3.0)
+
+                replay = await cli.post("/v1/runs", json=body, headers=headers)
+                assert replay.status == 202
+                assert await replay.json() == first_payload
+
+                new_work = await cli.post("/v1/runs", json={"input": "new work"})
+                assert new_work.status == 429
+                assert mock_create.call_count == 1
+
+                stop = await cli.post(f"/v1/runs/{first_payload['run_id']}/stop")
+                assert stop.status == 200
+
+    @pytest.mark.asyncio
+    async def test_expired_keyed_run_replay_does_not_restore_process_mapping(
+        self,
+        adapter,
+    ):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "programos-expired-replay"}
+                body = {"input": "perform one expiring synthetic action"}
+
+                first = await cli.post("/v1/runs", json=body, headers=headers)
+                payload = await first.json()
+                run_id = payload["run_id"]
+                for _ in range(40):
+                    status = adapter._run_statuses.get(run_id, {})
+                    if status.get("status") in {"completed", "failed", "cancelled"}:
+                        break
+                    await asyncio.sleep(0.05)
+                assert run_id in adapter._run_execution_ids
+                adapter._run_statuses[run_id]["updated_at"] = (
+                    time.time() - adapter._RUN_STATUS_TTL - 1
+                )
+                adapter._sweep_orphaned_runs_once()
+                assert run_id not in adapter._run_execution_ids
+
+                replay = await cli.post("/v1/runs", json=body, headers=headers)
+                assert replay.status == 202
+                assert await replay.json() == payload
+                assert run_id not in adapter._run_execution_ids
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_keyed_start_changed_request_conflicts_without_redispatch(
+        self,
+        auth_adapter,
+    ):
+        adapter = auth_adapter
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {
+                    "Authorization": "Bearer sk-secret",
+                    "Idempotency-Key": "programos-intent-conflict",
+                }
+
+                first = await cli.post(
+                    "/v1/runs",
+                    json={"input": "first approved action"},
+                    headers=headers,
+                )
+                conflict = await cli.post(
+                    "/v1/runs",
+                    json={"input": "changed approved action"},
+                    headers=headers,
+                )
+                session_conflict = await cli.post(
+                    "/v1/runs",
+                    json={"input": "first approved action"},
+                    headers={
+                        **headers,
+                        "X-Hermes-Session-Key": "different-memory-scope",
+                    },
+                )
+
+                assert first.status == 202
+                assert conflict.status == 409
+                payload = await conflict.json()
+                assert payload["error"]["code"] == "execution_contract_conflict"
+                assert session_conflict.status == 409
+                session_payload = await session_conflict.json()
+                assert session_payload["error"]["code"] == (
+                    "execution_contract_conflict"
+                )
+                for _ in range(40):
+                    if mock_create.call_count == 1:
+                        break
+                    await asyncio.sleep(0.05)
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
