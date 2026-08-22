@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.execution_contract import (
+    ACTION_CONTRACT_VERSION,
     CONTRACT_VERSION,
     ContractConflictError,
     ContractCursorGoneError,
@@ -30,6 +31,8 @@ from hermes_cli.execution_contract import (
     ContractValidationError,
     ExecutionContractStore,
     UnsupportedContractVersionError,
+    action_contract_schema,
+    action_contract_schema_artifact,
     canonical_digest,
     contract_capabilities,
     contract_schema,
@@ -901,6 +904,30 @@ def test_packaged_schema_and_synthetic_fixtures_are_closed(tmp_path):
         key: value for key, value in fixture_capabilities.items() if key != "authority"
     }
     assert schema["$defs"]["errorDetail"]["additionalProperties"] is False
+
+
+def test_packaged_action_schema_binds_submission_read_and_release_identities():
+    body, schema, digest = action_contract_schema_artifact()
+
+    assert action_contract_schema() == schema
+    assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert schema["$id"].endswith(
+        "hermes.execution.action.v1.schema.json"
+    )
+    assert digest == f"sha256:{hashlib.sha256(body).hexdigest()}"
+    assert ACTION_CONTRACT_VERSION == "hermes.execution.action.v1"
+    assert schema["$defs"]["submissionEnvelope"]["properties"][
+        "contract_version"
+    ] == {"const": ACTION_CONTRACT_VERSION}
+    assert schema["$defs"]["statusBinding"]["properties"][
+        "contract_version"
+    ] == {"const": CONTRACT_VERSION}
+    assert schema["$defs"]["terminalReceiptBinding"]["properties"][
+        "contract_version"
+    ] == {"const": CONTRACT_VERSION}
+    assert schema["$defs"]["releaseReceipt"]["properties"][
+        "receipt_version"
+    ] == {"const": "hermes.execution.action.release-receipt.v1"}
 
 
 def test_unknown_store_version_fails_closed(tmp_path):

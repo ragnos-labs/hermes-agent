@@ -35,8 +35,10 @@ from hermes_cli.sqlite_util import write_txn
 from hermes_constants import get_hermes_home
 
 CONTRACT_VERSION = "hermes.execution.read.v1"
+ACTION_CONTRACT_VERSION = "hermes.execution.action.v1"
 API_VERSION = "v1"
 CONTRACT_SCHEMA_FILENAME = f"{CONTRACT_VERSION}.schema.json"
+ACTION_CONTRACT_SCHEMA_FILENAME = f"{ACTION_CONTRACT_VERSION}.schema.json"
 CONTRACT_SCHEMA_DIGEST_HEADER = "Hermes-Execution-Contract-Schema-Digest"
 CONTRACT_SCHEMA_DIGEST_ALGORITHM = "sha256"
 STORE_SCHEMA_VERSION = 2
@@ -4002,4 +4004,35 @@ def contract_schema() -> dict[str, Any]:
     """Load the packaged closed JSON Schema for capability negotiation."""
 
     _, value, _ = contract_schema_artifact()
+    return value
+
+
+def action_contract_schema_artifact() -> tuple[bytes, dict[str, Any], str]:
+    """Load the packaged private action profile schema and wire digest."""
+
+    resource = importlib.resources.files("hermes_cli.execution_contract_schemas").joinpath(
+        ACTION_CONTRACT_SCHEMA_FILENAME
+    )
+    body = resource.read_bytes()
+    try:
+        value = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ContractDataError(
+            "packaged execution action contract schema is malformed"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ContractDataError(
+            "packaged execution action contract schema is malformed"
+        )
+    digest = (
+        f"{CONTRACT_SCHEMA_DIGEST_ALGORITHM}:"
+        f"{hashlib.sha256(body).hexdigest()}"
+    )
+    return body, value, digest
+
+
+def action_contract_schema() -> dict[str, Any]:
+    """Load the packaged schema for the private durable action profile."""
+
+    _, value, _ = action_contract_schema_artifact()
     return value

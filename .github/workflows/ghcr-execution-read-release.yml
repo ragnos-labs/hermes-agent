@@ -43,9 +43,12 @@ concurrency:
 env:
   IMAGE_NAME: ghcr.io/ragnos-labs/hermes-agent
   CONTRACT_VERSION: hermes.execution.read.v1
+  ACTION_CONTRACT_VERSION: hermes.execution.action.v1
   ORAS_VERSION: 1.3.3
   SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.read.v1.schema.json
   SCHEMA_SHA256: 7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
+  ACTION_SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json
+  ACTION_SCHEMA_SHA256: d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870
 
 jobs:
   resolve:
@@ -547,6 +550,15 @@ jobs:
           assert 'git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA"' in text
           assert '"${IMAGE_NAME}@${final_release_digest}" --raw' in text
           assert "application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json" in text
+          assert "ACTION_CONTRACT_VERSION: hermes.execution.action.v1" in text
+          assert "ACTION_SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json" in text
+          assert "ACTION_SCHEMA_SHA256: d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870" in text
+          assert text.count("io.ragnos.hermes.execution.action-contract") >= 8
+          assert text.count("io.ragnos.hermes.execution.action-schema-sha256") >= 8
+          assert text.count("io.ragnos.hermes.execution.action-source-sha") >= 8
+          assert "index:io.ragnos.hermes.execution.action-contract=${ACTION_CONTRACT_VERSION}" in text
+          assert "application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json" in text
+          assert "hermes.execution.action.release-receipt.v1" in text
           print("publication_graph_and_exact_digest_fences=passed")
           PY
 
@@ -584,9 +596,18 @@ jobs:
             exit 1
           }
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
+          printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
           python3 - <<'PY'
-          from hermes_cli.execution_contract import CONTRACT_VERSION
+          from hermes_cli.execution_contract import (
+              ACTION_CONTRACT_VERSION,
+              CONTRACT_VERSION,
+              action_contract_schema,
+          )
           assert CONTRACT_VERSION == "hermes.execution.read.v1", CONTRACT_VERSION
+          assert ACTION_CONTRACT_VERSION == "hermes.execution.action.v1", ACTION_CONTRACT_VERSION
+          assert action_contract_schema()["$id"].endswith(
+              "hermes.execution.action.v1.schema.json"
+          )
           PY
           {
             echo "### Exact source proof"
@@ -595,6 +616,8 @@ jobs:
             echo "- tree: \`$source_tree\`"
             echo "- contract: \`$CONTRACT_VERSION\`"
             echo "- schema SHA-256: \`$SCHEMA_SHA256\`"
+            echo "- action contract: \`$ACTION_CONTRACT_VERSION\`"
+            echo "- action schema SHA-256: \`$ACTION_SCHEMA_SHA256\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up uv
@@ -612,7 +635,7 @@ jobs:
         with:
           command: uv sync --locked --python 3.11 --extra dev --extra messaging
 
-      - name: Run execution contract and API conformance
+      - name: Run execution read/action contract and API conformance
         run: |
           scripts/run_tests.sh \
             tests/hermes_cli/test_execution_contract.py \
@@ -657,6 +680,7 @@ jobs:
           [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
           [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ]
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
+          printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -676,6 +700,9 @@ jobs:
             org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
             io.ragnos.hermes.execution.contract=${{ env.CONTRACT_VERSION }}
             io.ragnos.hermes.execution.schema-sha256=${{ env.SCHEMA_SHA256 }}
+            io.ragnos.hermes.execution.action-contract=${{ env.ACTION_CONTRACT_VERSION }}
+            io.ragnos.hermes.execution.action-schema-sha256=${{ env.ACTION_SCHEMA_SHA256 }}
+            io.ragnos.hermes.execution.action-source-sha=${{ needs.resolve.outputs.source_sha }}
           build-args: |
             HERMES_GIT_SHA=${{ needs.resolve.outputs.source_sha }}
           cache-from: ${{ matrix.cache-from }}
@@ -691,9 +718,15 @@ jobs:
           revision="$(docker image inspect "$image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           contract="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.contract" }}')"
           schema_digest="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.schema-sha256" }}')"
+          action_contract="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.action-contract" }}')"
+          action_schema_digest="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.action-schema-sha256" }}')"
+          action_source_sha="$(docker image inspect "$image" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.action-source-sha" }}')"
           [ "$revision" = "$SOURCE_SHA" ]
           [ "$contract" = "$CONTRACT_VERSION" ]
           [ "$schema_digest" = "$SCHEMA_SHA256" ]
+          [ "$action_contract" = "$ACTION_CONTRACT_VERSION" ]
+          [ "$action_schema_digest" = "$ACTION_SCHEMA_SHA256" ]
+          [ "$action_source_sha" = "$SOURCE_SHA" ]
           docker run --rm -i \
             -e EXPECTED_SOURCE_SHA="$SOURCE_SHA" \
             --entrypoint /opt/hermes/.venv/bin/python "$image" - <<'PY'
@@ -702,21 +735,38 @@ jobs:
           from importlib.resources import files
           from pathlib import Path
 
-          from hermes_cli.execution_contract import CONTRACT_VERSION, contract_schema
+          from hermes_cli.execution_contract import (
+              ACTION_CONTRACT_VERSION,
+              CONTRACT_VERSION,
+              action_contract_schema,
+              contract_schema,
+          )
 
           expected_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          expected_action_sha = "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
           expected_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
           schema_path = files("hermes_cli").joinpath(
               "execution_contract_schemas/hermes.execution.read.v1.schema.json"
           )
           actual_sha = hashlib.sha256(schema_path.read_bytes()).hexdigest()
+          action_schema_path = files("hermes_cli").joinpath(
+              "execution_contract_schemas/hermes.execution.action.v1.schema.json"
+          )
+          actual_action_sha = hashlib.sha256(action_schema_path.read_bytes()).hexdigest()
           assert expected_source == os.environ["EXPECTED_SOURCE_SHA"], expected_source
           assert CONTRACT_VERSION == "hermes.execution.read.v1", CONTRACT_VERSION
           assert contract_schema()["$id"].endswith("hermes.execution.read.v1.schema.json")
           assert actual_sha == expected_sha, actual_sha
+          assert ACTION_CONTRACT_VERSION == "hermes.execution.action.v1"
+          assert action_contract_schema()["$id"].endswith(
+              "hermes.execution.action.v1.schema.json"
+          )
+          assert actual_action_sha == expected_action_sha, actual_action_sha
           print(f"source_sha={expected_source}")
           print(f"contract={CONTRACT_VERSION}")
           print(f"packaged_schema_sha256={actual_sha}")
+          print(f"action_contract={ACTION_CONTRACT_VERSION}")
+          print(f"packaged_action_schema_sha256={actual_action_sha}")
           PY
 
   authorize:
@@ -1032,6 +1082,9 @@ jobs:
                   and annotations.get("org.opencontainers.image.revision") == os.environ["SOURCE_SHA"]
                   and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
                   and annotations.get("io.ragnos.hermes.execution.schema-sha256") == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+                  and annotations.get("io.ragnos.hermes.execution.action-contract") == "hermes.execution.action.v1"
+                  and annotations.get("io.ragnos.hermes.execution.action-schema-sha256") == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+                  and annotations.get("io.ragnos.hermes.execution.action-source-sha") == os.environ["SOURCE_SHA"]
               )
               digest = Path(os.environ[f"{prefix}_DIGEST_PATH"]).read_text(encoding="utf-8").strip()
               return {"state": "matching" if matches else "conflict", "digest": digest}
@@ -1167,6 +1220,7 @@ jobs:
             exit 1
           }
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
+          printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -1190,6 +1244,9 @@ jobs:
             org.opencontainers.image.revision=${{ needs.resolve.outputs.source_sha }}
             io.ragnos.hermes.execution.contract=${{ env.CONTRACT_VERSION }}
             io.ragnos.hermes.execution.schema-sha256=${{ env.SCHEMA_SHA256 }}
+            io.ragnos.hermes.execution.action-contract=${{ env.ACTION_CONTRACT_VERSION }}
+            io.ragnos.hermes.execution.action-schema-sha256=${{ env.ACTION_SCHEMA_SHA256 }}
+            io.ragnos.hermes.execution.action-source-sha=${{ needs.resolve.outputs.source_sha }}
           build-args: |
             HERMES_GIT_SHA=${{ needs.resolve.outputs.source_sha }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -1273,9 +1330,15 @@ jobs:
           revision="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           contract="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.contract" }}')"
           schema_digest="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.schema-sha256" }}')"
+          action_contract="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.action-contract" }}')"
+          action_schema_digest="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.action-schema-sha256" }}')"
+          action_source_sha="$(docker image inspect "$published_ref" --format '{{ index .Config.Labels "io.ragnos.hermes.execution.action-source-sha" }}')"
           [ "$revision" = "$SOURCE_SHA" ]
           [ "$contract" = "$CONTRACT_VERSION" ]
           [ "$schema_digest" = "$SCHEMA_SHA256" ]
+          [ "$action_contract" = "$ACTION_CONTRACT_VERSION" ]
+          [ "$action_schema_digest" = "$ACTION_SCHEMA_SHA256" ]
+          [ "$action_source_sha" = "$SOURCE_SHA" ]
 
           docker run --rm -i \
             -e EXPECTED_SOURCE_SHA="$SOURCE_SHA" \
@@ -1287,9 +1350,15 @@ jobs:
 
           from jsonschema.validators import Draft202012Validator
 
-          from hermes_cli.execution_contract import CONTRACT_VERSION, contract_schema
+          from hermes_cli.execution_contract import (
+              ACTION_CONTRACT_VERSION,
+              CONTRACT_VERSION,
+              action_contract_schema,
+              contract_schema,
+          )
 
           expected_schema_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          expected_action_schema_sha = "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
           embedded_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
           packaged_schema = files("hermes_cli").joinpath(
               "execution_contract_schemas/hermes.execution.read.v1.schema.json"
@@ -1297,10 +1366,23 @@ jobs:
           schema = contract_schema()
           Draft202012Validator.check_schema(schema)
           actual_schema_sha = hashlib.sha256(packaged_schema.read_bytes()).hexdigest()
+          packaged_action_schema = files("hermes_cli").joinpath(
+              "execution_contract_schemas/hermes.execution.action.v1.schema.json"
+          )
+          action_schema = action_contract_schema()
+          Draft202012Validator.check_schema(action_schema)
+          actual_action_schema_sha = hashlib.sha256(
+              packaged_action_schema.read_bytes()
+          ).hexdigest()
           assert embedded_source == os.environ["EXPECTED_SOURCE_SHA"], embedded_source
           assert CONTRACT_VERSION == "hermes.execution.read.v1", CONTRACT_VERSION
           assert schema["$id"].endswith("hermes.execution.read.v1.schema.json")
           assert actual_schema_sha == expected_schema_sha, actual_schema_sha
+          assert ACTION_CONTRACT_VERSION == "hermes.execution.action.v1"
+          assert action_schema["$id"].endswith(
+              "hermes.execution.action.v1.schema.json"
+          )
+          assert actual_action_schema_sha == expected_action_schema_sha
           print("pushed_digest_contract_closure=passed")
           PY
 
@@ -1844,6 +1926,12 @@ jobs:
                   and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
                   and annotations.get("io.ragnos.hermes.execution.schema-sha256")
                   == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+                  and annotations.get("io.ragnos.hermes.execution.action-contract")
+                  == "hermes.execution.action.v1"
+                  and annotations.get("io.ragnos.hermes.execution.action-schema-sha256")
+                  == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+                  and annotations.get("io.ragnos.hermes.execution.action-source-sha")
+                  == os.environ["SOURCE_SHA"]
               )
               digest = Path(os.environ[digest_name]).read_text(encoding="utf-8").strip()
               return {"state": "matching" if matches else "conflict", "digest": digest}
@@ -1898,6 +1986,9 @@ jobs:
               --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
               --annotation "index:io.ragnos.hermes.execution.contract=${CONTRACT_VERSION}" \
               --annotation "index:io.ragnos.hermes.execution.schema-sha256=${SCHEMA_SHA256}" \
+              --annotation "index:io.ragnos.hermes.execution.action-contract=${ACTION_CONTRACT_VERSION}" \
+              --annotation "index:io.ragnos.hermes.execution.action-schema-sha256=${ACTION_SCHEMA_SHA256}" \
+              --annotation "index:io.ragnos.hermes.execution.action-source-sha=${SOURCE_SHA}" \
               --tag "$sha_ref" \
               "${sources[@]}"
           elif jq -e '.actions | index("create_sha_from_release")' "$plan_path" >/dev/null; then
@@ -1954,6 +2045,12 @@ jobs:
               and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
               and annotations.get("io.ragnos.hermes.execution.schema-sha256")
               == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+              and annotations.get("io.ragnos.hermes.execution.action-contract")
+              == "hermes.execution.action.v1"
+              and annotations.get("io.ragnos.hermes.execution.action-schema-sha256")
+              == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+              and annotations.get("io.ragnos.hermes.execution.action-source-sha")
+              == os.environ["SOURCE_SHA"]
           )
           if not valid:
               receipt_path = Path(os.environ["RECEIPT_PATH"])
@@ -2039,6 +2136,9 @@ jobs:
           assert annotations["org.opencontainers.image.revision"] == os.environ["SOURCE_SHA"]
           assert annotations["io.ragnos.hermes.execution.contract"] == "hermes.execution.read.v1"
           assert annotations["io.ragnos.hermes.execution.schema-sha256"] == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
+          assert annotations["io.ragnos.hermes.execution.action-contract"] == "hermes.execution.action.v1"
+          assert annotations["io.ragnos.hermes.execution.action-schema-sha256"] == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+          assert annotations["io.ragnos.hermes.execution.action-source-sha"] == os.environ["SOURCE_SHA"]
 
           receipt_path = Path(os.environ["RECEIPT_PATH"])
           receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -2124,6 +2224,139 @@ jobs:
             echo "- authoritative OCI receipt: \`${IMAGE_NAME}@${receipt_digest}\`"
             echo "- receipt subject: \`${IMAGE_NAME}@${subject_digest}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach authoritative action receipt to the immutable index
+        if: steps.manifest.outputs.digest != ''
+        id: action-receipt
+        env:
+          INDEX_DIGEST: ${{ steps.manifest.outputs.digest }}
+          RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-action-receipt.json
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
+          ACTION_CONTRACT_VERSION="$ACTION_CONTRACT_VERSION" \
+          ACTION_SCHEMA_PATH="$ACTION_SCHEMA_PATH" \
+          ACTION_SCHEMA_SHA256="$ACTION_SCHEMA_SHA256" \
+          INDEX_DIGEST="$INDEX_DIGEST" \
+          READ_CONTRACT_VERSION="$CONTRACT_VERSION" \
+          READ_SCHEMA_SHA256="$SCHEMA_SHA256" \
+          RECEIPT_PATH="$RECEIPT_PATH" \
+          RELEASE_TAG="$RELEASE_TAG" \
+          SOURCE_SHA="$SOURCE_SHA" \
+          WORKFLOW_RUN_ATTEMPT="$WORKFLOW_RUN_ATTEMPT" \
+          WORKFLOW_RUN_ID="$WORKFLOW_RUN_ID" \
+          WORKFLOW_SHA="$WORKFLOW_SHA" \
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          schema = json.loads(Path(os.environ["ACTION_SCHEMA_PATH"]).read_text(encoding="utf-8"))
+          receipt = {
+              "receipt_version": "hermes.execution.action.release-receipt.v1",
+              "status": "complete",
+              "destination": "ghcr.io/ragnos-labs/hermes-agent",
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "workflow_run_id": os.environ["WORKFLOW_RUN_ID"],
+              "workflow_run_attempt": os.environ["WORKFLOW_RUN_ATTEMPT"],
+              "contract": os.environ["ACTION_CONTRACT_VERSION"],
+              "schema_sha256": os.environ["ACTION_SCHEMA_SHA256"],
+              "read_contract": os.environ["READ_CONTRACT_VERSION"],
+              "read_schema_sha256": os.environ["READ_SCHEMA_SHA256"],
+              "index_digest": os.environ["INDEX_DIGEST"],
+          }
+          definition = schema["$defs"]["releaseReceipt"]
+          assert definition["additionalProperties"] is False
+          assert set(receipt) == set(definition["required"])
+          for name, value in receipt.items():
+              rule = definition["properties"][name]
+              if "$ref" in rule:
+                  rule = schema["$defs"][rule["$ref"].rsplit("/", 1)[-1]]
+              if "const" in rule:
+                  assert value == rule["const"], (name, value)
+              if "pattern" in rule:
+                  assert re.fullmatch(rule["pattern"], value), (name, value)
+          Path(os.environ["RECEIPT_PATH"]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(receipt, indent=2, sort_keys=True))
+          PY
+
+          receipt_dir="$RUNNER_TEMP/oci-action-receipt"
+          verify_dir="$RUNNER_TEMP/oci-action-receipt-verify"
+          mkdir -p "$receipt_dir" "$verify_dir"
+          cp "$RECEIPT_PATH" "$receipt_dir/receipt.json"
+          cd "$receipt_dir"
+          receipt_digest=""
+          for attempt in 1 2 3; do
+            set +e
+            receipt_digest="$(timeout 120 oras attach \
+              --artifact-type application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json \
+              --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+              --annotation "io.ragnos.hermes.execution.action-contract=${ACTION_CONTRACT_VERSION}" \
+              --annotation "io.ragnos.hermes.execution.action-schema-sha256=${ACTION_SCHEMA_SHA256}" \
+              --annotation "io.ragnos.hermes.execution.action-source-sha=${SOURCE_SHA}" \
+              --annotation "io.ragnos.hermes.release-tag=${RELEASE_TAG}" \
+              --annotation "io.ragnos.hermes.workflow-revision=${WORKFLOW_SHA}" \
+              --format go-template --template '{{.digest}}' \
+              "${IMAGE_NAME}@${INDEX_DIGEST}" \
+              receipt.json:application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json)"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ] && [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              break
+            fi
+            receipt_digest=""
+            sleep "$attempt"
+          done
+          [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::Authoritative action receipt could not be attached durably after bounded retry."
+            exit 1
+          }
+          oras manifest fetch "${IMAGE_NAME}@${receipt_digest}" > "$RUNNER_TEMP/oci-action-receipt-manifest.json"
+          jq -e \
+            --arg contract "$ACTION_CONTRACT_VERSION" \
+            --arg schema "$ACTION_SCHEMA_SHA256" \
+            --arg source "$SOURCE_SHA" \
+            --arg subject "$INDEX_DIGEST" \
+            '.artifactType == "application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json"
+             and .subject.digest == $subject
+             and .annotations["org.opencontainers.image.revision"] == $source
+             and .annotations["io.ragnos.hermes.execution.action-contract"] == $contract
+             and .annotations["io.ragnos.hermes.execution.action-schema-sha256"] == $schema
+             and .annotations["io.ragnos.hermes.execution.action-source-sha"] == $source' \
+            "$RUNNER_TEMP/oci-action-receipt-manifest.json" >/dev/null
+          oras pull --output "$verify_dir" "${IMAGE_NAME}@${receipt_digest}"
+          cmp -s receipt.json "$verify_dir/receipt.json"
+          cp "$RUNNER_TEMP/oci-action-receipt-manifest.json" "$RUNNER_TEMP/ghcr-execution-action-receipt-oci-manifest.json"
+          echo "digest=$receipt_digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "- action contract: \`$ACTION_CONTRACT_VERSION\`"
+            echo "- action schema SHA-256: \`$ACTION_SCHEMA_SHA256\`"
+            echo "- authoritative action OCI receipt: \`${IMAGE_NAME}@${receipt_digest}\`"
+            echo "- action receipt subject: \`${IMAGE_NAME}@${INDEX_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload durable machine-readable action receipt
+        if: steps.action-receipt.outputs.digest != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-execution-action-receipt-${{ needs.resolve.outputs.release_tag }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ghcr-execution-action-receipt.json
+            ${{ runner.temp }}/ghcr-execution-action-receipt-oci-manifest.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Upload durable machine-readable receipt
         if: always()

@@ -3,6 +3,14 @@
 Status: bounded source candidate. This document does not claim merge, release,
 deployment, activation, executor evidence, terminal success, or an outcome.
 
+Contract identity: `hermes.execution.action.v1`
+
+Canonical schema:
+`hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json`
+
+Schema SHA-256:
+`d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870`
+
 This private contract adds durable retry safety to the existing authenticated
 Runs API. It deliberately reuses the released execution read contract for
 status and receipts rather than creating a second authority surface.
@@ -111,6 +119,31 @@ subject/evidence/result digests, and latest decision binding when applicable.
 Without that evidence, terminalization remains `terminal_ambiguous` with
 `receipt_state=unproven`. This contract does not enable public action dispatch,
 public decision mutation, WebAuthn step-up, or executor delegation.
+
+## Additive release identity
+
+The fork-owned GHCR workflow packages this private action profile beside the
+existing `hermes.execution.read.v1` contract. It does not replace or rename the
+read identity. A conforming action release binds all of the following to the
+same immutable multi-architecture index:
+
+- `hermes.execution.action.v1` and the exact action-schema SHA-256 above;
+- the exact source commit in `org.opencontainers.image.revision` and
+  `io.ragnos.hermes.execution.action-source-sha`;
+- action contract, schema, and source labels on each child image and matching
+  annotations on the immutable index;
+- conformance that validates the action schema and exercises authenticated,
+  keyed `POST /v1/runs`, exact replay, and the durable execution-read status
+  binding; and
+- a distinct
+  `hermes.execution.action.release-receipt.v1` OCI artifact attached to the
+  immutable index and validated against the packaged action schema.
+
+The action receipt also binds the unchanged read-contract identity and schema
+digest because durable status and terminal receipts remain owned by
+`hermes.execution.read.v1`. The existing read labels, schema, release receipt,
+and consumers remain intact. The source candidate does not claim that an image,
+receipt, tag, release, deployment, or runtime activation exists.
 
 ## Store migration
 

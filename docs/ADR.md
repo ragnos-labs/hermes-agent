@@ -1,5 +1,48 @@
 # Architecture Decision Records
 
+## 2026-08-22: Additive private action release identity
+
+Status: Accepted for a bounded source candidate. This decision does not claim
+merge, publication, tagging, deployment, activation, migration, or runtime use.
+
+Context:
+The private durable-idempotent Runs profile is implemented and reuses
+`hermes.execution.read.v1` for status and terminal receipts. The existing
+fork-owned GHCR workflow, however, attests only the read contract. Packaging
+the action implementation under that read-only identity would not give a
+downstream coordinator a machine-verifiable action dependency.
+
+Decision:
+
+- Add the distinct identity `hermes.execution.action.v1` and a packaged Draft
+  2020-12 schema for the authenticated keyed submission envelope, accepted
+  response, durable read-status binding, terminal-receipt binding, and action
+  release receipt.
+- Keep `hermes.execution.read.v1` unchanged. Do not rename its schema, labels,
+  receipt, API routes, capability values, or consumers.
+- Bind action contract, schema SHA-256, and exact source SHA at both child-image
+  and immutable-index levels while retaining the existing read annotations.
+- Run schema validation and the real authenticated keyed Runs API in release
+  conformance. Exact replay must return the same accepted identity and durable
+  status must validate through the read contract.
+- Attach a separate authoritative
+  `hermes.execution.action.release-receipt.v1` OCI artifact to the immutable
+  index. The action receipt binds the exact index, source, workflow, action
+  schema, and unchanged read dependency; the existing read receipt remains a
+  separate artifact.
+
+Consequences:
+
+- ProgramOS can qualify the private action profile by exact contract, schema,
+  source, index, and receipt rather than inferring action support from packaged
+  source code.
+- Existing read consumers retain identical wire identity and release evidence.
+- `action_dispatch=false` remains accurate: this identity covers the existing
+  private full-key Runs edge, not public proposal dispatch, WebAuthn, or public
+  decision mutation.
+- Publication still requires the existing protected manual workflow and
+  operator gates; this source change performs no registry or runtime effect.
+
 ## 2026-08-22: Private durable-idempotent run submission
 
 Status: Accepted for a bounded source candidate. This decision does not claim

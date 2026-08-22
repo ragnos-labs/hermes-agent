@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import importlib.resources
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
+from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -28,10 +30,12 @@ from gateway.config import (
 )
 from gateway.platforms.api_server import APIServerAdapter, _api_request_profile
 from hermes_cli.execution_contract import (
+    ACTION_CONTRACT_VERSION,
     CONTRACT_VERSION,
     ContractDataError,
     ContractRateLimitedError,
     ContractUnavailableError,
+    action_contract_schema,
     canonical_digest,
     contract_schema,
 )
@@ -247,6 +251,101 @@ def test_reference_schema_verifier_enforces_success_order() -> None:
 
     assert completed_steps == VERIFICATION_STEPS
     assert schema["$id"].endswith("hermes.execution.read.v1.schema.json")
+
+
+@pytest.mark.asyncio
+async def test_action_schema_conforms_to_authenticated_keyed_runs_api(
+    contract_adapter,
+):
+    schema = action_contract_schema()
+    Draft202012Validator.check_schema(schema)
+
+    def validate_definition(
+        document_schema: dict[str, Any],
+        definition: str,
+        payload: dict[str, Any],
+    ) -> None:
+        wrapper = {
+            key: value
+            for key, value in document_schema.items()
+            if key != "oneOf"
+        }
+        wrapper["$ref"] = f"#/$defs/{definition}"
+        Draft202012Validator(wrapper).validate(payload)
+
+    action_body = {
+        "input": "execute one synthetic approved action",
+        "execution_context": {
+            "work_ref": "work:synthetic",
+            "proposal_ref": "proposal:synthetic",
+            "effect_id": "effect:synthetic",
+        },
+    }
+    idempotency_key = "programos-action-contract-0001"
+    validate_definition(
+        schema,
+        "submissionEnvelope",
+        {
+            "contract_version": ACTION_CONTRACT_VERSION,
+            "method": "POST",
+            "route": "/v1/runs",
+            "idempotency_key": idempotency_key,
+            "body": action_body,
+        },
+    )
+
+    app = _contract_app(contract_adapter)
+    mock_agent = MagicMock()
+    mock_agent.run_conversation.return_value = {"final_response": "synthetic"}
+    mock_agent.session_prompt_tokens = 0
+    mock_agent.session_completion_tokens = 0
+    mock_agent.session_total_tokens = 0
+    headers = {
+        **_auth(FULL_KEY),
+        "Idempotency-Key": idempotency_key,
+    }
+    async with TestClient(TestServer(app)) as client:
+        with patch.object(
+            contract_adapter,
+            "_create_agent",
+            return_value=mock_agent,
+        ) as create_agent:
+            first = await client.post("/v1/runs", json=action_body, headers=headers)
+            for _ in range(40):
+                if create_agent.call_count == 1:
+                    break
+                await asyncio.sleep(0.05)
+            assert create_agent.call_count == 1
+            replay = await client.post("/v1/runs", json=action_body, headers=headers)
+            assert create_agent.call_count == 1
+
+        assert first.status == replay.status == 202
+        accepted = await first.json()
+        assert await replay.json() == accepted
+        validate_definition(schema, "acceptedResponse", accepted)
+        validate_definition(
+            schema,
+            "statusBinding",
+            {
+                "contract_version": CONTRACT_VERSION,
+                "route": "/v1/execution-contract/executions/{execution_id}",
+                "execution_id": accepted["execution_id"],
+            },
+        )
+
+        status = await client.get(
+            f"/v1/execution-contract/executions/{accepted['execution_id']}",
+            headers=_auth(READ_KEY),
+        )
+        assert status.status == 200
+        detail = await status.json()
+        validate_definition(
+            contract_schema(),
+            "executionDetail",
+            detail,
+        )
+        assert detail["execution"]["execution_id"] == accepted["execution_id"]
+        assert detail["execution"]["source_run_id"] == accepted["run_id"]
 
 
 @pytest.mark.parametrize(
