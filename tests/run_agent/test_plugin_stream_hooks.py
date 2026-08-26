@@ -54,24 +54,22 @@ def test_stream_delta_plugin_hook_is_queued_off_token_path(monkeypatch):
 
     shutdown_plugin_stream_hook_dispatcher()
     calls = []
+    caller_thread_id = threading.get_ident()
 
     def on_stream_delta(**kwargs):
-        time.sleep(0.2)
-        calls.append(("on_stream_delta", kwargs))
+        calls.append(("on_stream_delta", kwargs, threading.get_ident()))
 
     monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
 
     agent = _agent()
 
-    started = time.monotonic()
     agent._fire_stream_delta("hello")
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 0.05
     _wait_for(lambda: calls)
     shutdown_plugin_stream_hook_dispatcher()
 
     assert calls[0][0] == "on_stream_delta"
+    assert calls[0][2] != caller_thread_id
     assert calls[0][1]["delta"] == "hello"
     assert calls[0][1]["kind"] == "text"
     assert calls[0][1]["model"] == "test/model"
