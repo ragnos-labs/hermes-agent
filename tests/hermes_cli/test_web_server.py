@@ -633,6 +633,60 @@ class TestWebServerEndpoints:
             200
         ] * len(paths)
 
+    def test_read_open_waits_for_inflight_bootstrap_after_file_appears(
+        self, monkeypatch, tmp_path
+    ):
+        """A non-zero SQLite file is not proof that schema init is complete."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = tmp_path / "state.db"
+        bootstrap_started = Event()
+        release_bootstrap = Event()
+        second_attempted = Event()
+        read_opened = Event()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                if read_only:
+                    read_opened.set()
+                    return
+
+                # Model SQLite creating a non-zero file before virtual-table
+                # schema setup finishes. A size-only fast path would now let a
+                # sibling reader bypass the in-flight bootstrap lock.
+                db_path.write_bytes(b"sqlite-header-in-progress")
+                bootstrap_started.set()
+                assert release_bootstrap.wait(timeout=5)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        def open_read():
+            return web_server._open_session_db_at_path(db_path, read_only=True)
+
+        def open_second_read():
+            second_attempted.set()
+            return open_read()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(open_read)
+            assert bootstrap_started.wait(timeout=5)
+            second = pool.submit(open_second_read)
+            assert second_attempted.wait(timeout=5)
+            try:
+                assert not read_opened.wait(timeout=0.2)
+            finally:
+                release_bootstrap.set()
+
+            first.result(timeout=5).close()
+            second.result(timeout=5).close()
+
 
 
 

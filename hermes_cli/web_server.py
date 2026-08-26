@@ -12103,10 +12103,14 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
         except OSError:
             return False
 
-    if _needs_bootstrap():
-        with _session_db_bootstrap_lock:
-            if _needs_bootstrap():
-                SessionDB(db_path=db_path, read_only=False).close()
+    # Always cross the bootstrap lock before the first read-only open. SQLite
+    # creates a non-zero file before SessionDB finishes schema/FTS setup, so a
+    # sibling request that checked only file size could otherwise bypass the
+    # lock and observe a half-initialized virtual table. Healthy stores pay
+    # only this short in-process lock/check; no writable open is performed.
+    with _session_db_bootstrap_lock:
+        if _needs_bootstrap():
+            SessionDB(db_path=db_path, read_only=False).close()
 
     def _open_probed():
         db = SessionDB(db_path=db_path, read_only=True)
