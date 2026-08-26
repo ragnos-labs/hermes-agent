@@ -687,6 +687,60 @@ class TestWebServerEndpoints:
             first.result(timeout=5).close()
             second.result(timeout=5).close()
 
+    def test_read_open_does_not_wait_for_other_store_bootstrap(
+        self, monkeypatch, tmp_path
+    ):
+        """A fresh profile must not convoy an unrelated profile's reads."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        blocked_path = tmp_path / "blocked" / "state.db"
+        independent_path = tmp_path / "independent" / "state.db"
+        blocked_path.parent.mkdir()
+        independent_path.parent.mkdir()
+        blocked_started = Event()
+        release_blocked = Event()
+        independent_opened = Event()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                if read_only:
+                    return
+                db_path.write_bytes(b"sqlite-header-in-progress")
+                if db_path == blocked_path:
+                    blocked_started.set()
+                    assert release_blocked.wait(timeout=5)
+                elif db_path == independent_path:
+                    independent_opened.set()
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            blocked = pool.submit(
+                web_server._open_session_db_at_path,
+                blocked_path,
+                read_only=True,
+            )
+            assert blocked_started.wait(timeout=5)
+            independent = pool.submit(
+                web_server._open_session_db_at_path,
+                independent_path,
+                read_only=True,
+            )
+            try:
+                assert independent_opened.wait(timeout=1)
+                independent.result(timeout=1).close()
+            finally:
+                release_blocked.set()
+
+            blocked.result(timeout=5).close()
+
 
 
 

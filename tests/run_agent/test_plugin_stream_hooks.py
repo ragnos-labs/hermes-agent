@@ -54,22 +54,40 @@ def test_stream_delta_plugin_hook_is_queued_off_token_path(monkeypatch):
 
     shutdown_plugin_stream_hook_dispatcher()
     calls = []
-    caller_thread_id = threading.get_ident()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    caller_returned = threading.Event()
+    caller_thread_ids = []
 
     def on_stream_delta(**kwargs):
+        callback_started.set()
+        assert release_callback.wait(timeout=5)
         calls.append(("on_stream_delta", kwargs, threading.get_ident()))
 
     monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
 
     agent = _agent()
 
-    agent._fire_stream_delta("hello")
+    def fire_delta():
+        caller_thread_ids.append(threading.get_ident())
+        agent._fire_stream_delta("hello")
+        caller_returned.set()
 
-    _wait_for(lambda: calls)
-    shutdown_plugin_stream_hook_dispatcher()
+    caller = threading.Thread(target=fire_delta)
+    caller.start()
+    try:
+        assert callback_started.wait(timeout=5)
+        # The callback is deliberately parked. Returning now proves the token
+        # path neither invokes it inline nor spawns and then joins its worker.
+        assert caller_returned.wait(timeout=1)
+        assert calls == []
+    finally:
+        release_callback.set()
+        caller.join(timeout=5)
+        shutdown_plugin_stream_hook_dispatcher()
 
     assert calls[0][0] == "on_stream_delta"
-    assert calls[0][2] != caller_thread_id
+    assert calls[0][2] != caller_thread_ids[0]
     assert calls[0][1]["delta"] == "hello"
     assert calls[0][1]["kind"] == "text"
     assert calls[0][1]["model"] == "test/model"
