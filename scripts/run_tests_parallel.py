@@ -45,8 +45,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -379,22 +381,36 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    # Pytest's default numbered temp root contains a shared ``pytest-current``
+    # symlink. Parallel per-file subprocesses can race while pruning that
+    # symlink after every test in a file has already passed. Give each pytest
+    # process its own root so teardown is deterministic as well as execution.
+    # Keep this deliberately short: macOS limits AF_UNIX paths to 104 bytes,
+    # and pytest appends user/test names below this root.
+    short_temp_parent = "/tmp" if os.path.isdir("/tmp") else None
+    pytest_temp_root = tempfile.mkdtemp(prefix="hp-", dir=short_temp_parent)
+    child_env = os.environ.copy()
+    child_env["PYTEST_DEBUG_TEMPROOT"] = pytest_temp_root
     
     subproc_start = time.monotonic()
     # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=child_env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
+        )
+    except BaseException:
+        shutil.rmtree(pytest_temp_root, ignore_errors=True)
+        raise
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -425,6 +441,7 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        shutil.rmtree(pytest_temp_root, ignore_errors=True)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -432,6 +449,8 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+
+    shutil.rmtree(pytest_temp_root, ignore_errors=True)
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a

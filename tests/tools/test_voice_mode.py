@@ -209,7 +209,9 @@ class TestDetectAudioEnvironment:
                             lambda: (MagicMock(), MagicMock()))
 
         proc_version = tmp_path / "proc_version"
-        proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
+        proc_version.write_text(
+            "Linux 5.15.0-microsoft-standard-WSL2", encoding="utf-8"
+        )
 
         _real_open = open
         def _fake_open(f, *a, **kw):
@@ -1376,6 +1378,7 @@ class TestDefaultInputSamplerate:
             assert wf.getframerate() == 48000
 
 
+@pytest.mark.linux_only
 class TestWSL2PowerShellFallback:
     """Regression tests for WSL2 PowerShell TTS fallback (issue #17608).
 

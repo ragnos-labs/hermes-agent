@@ -48,7 +48,29 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 # against glibc 2.36, which runs cleanly on our Debian 13 (trixie, glibc
 # 2.41) runtime.  Bumping to a new Node major is a one-line ARG change; see
 # #4977.
-FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
+FROM node:26-bookworm-slim@sha256:4db36457f406501e6f608802e5da617e5fbd0e80b75901b6a09de1ae5a667d32 AS node_source
+# npm 11.19.0 still bundles four dependencies below their security fix floors.
+# Replace only those bundled packages with registry tarballs whose SHA-512
+# integrities are pinned to the root lockfile. Patch releases preserve npm's
+# dependency contracts while keeping the copied npm tree free of the known
+# vulnerable versions.
+RUN set -eux; \
+    patch_npm_package() { \
+        package_name="$1"; package_version="$2"; expected_integrity="$3"; \
+        archive="$(npm pack "${package_name}@${package_version}" --silent --pack-destination /tmp)"; \
+        NPM_TARBALL="/tmp/${archive}" EXPECTED_INTEGRITY="${expected_integrity}" \
+            node -e 'const fs=require("fs"),crypto=require("crypto"); const actual="sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.env.NPM_TARBALL)).digest("base64"); if(actual!==process.env.EXPECTED_INTEGRITY) throw new Error(`integrity mismatch: ${actual}`)'; \
+        target="/usr/local/lib/node_modules/npm/node_modules/${package_name}"; \
+        rm -rf "${target}"; mkdir -p "${target}"; \
+        tar -xzf "/tmp/${archive}" --strip-components=1 -C "${target}"; \
+        rm -f "/tmp/${archive}"; \
+    }; \
+    patch_npm_package tar 7.5.22 'sha512-MFO/QzvtAOmJbkhOaCTvbGcFN9L9b+JunIsDwaKljSOdcLMea3NJ1k9Usz/rjdfSXTq4dfzfeS7W4p4YOAAHeA=='; \
+    patch_npm_package brace-expansion 5.0.9 'sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg=='; \
+    patch_npm_package ip-address 10.3.1 'sha512-1e9d3kb97NHJTIJDZW9rKqW2h6+dFa50Dy0fpPSMQp2ADje5gvKsXmdiK6dwY5t76TaTt5+P5N1Y/LoToIxP6g=='; \
+    patch_npm_package undici 6.28.0 'sha512-LIY910g9TI13YS95lrMFrs8Rm/u/irgHeTWoKCoteeJ04CUJ92eEfj0rVn+7VKMPBpUPiUoBKfhNyLI23EE/KA=='; \
+    node -e 'for (const [name,expected] of Object.entries({tar:"7.5.22","brace-expansion":"5.0.9","ip-address":"10.3.1",undici:"6.28.0"})) { const actual=require(`/usr/local/lib/node_modules/npm/node_modules/${name}/package.json`).version; if(actual!==expected) throw new Error(`${name}: ${actual}`) }'; \
+    npm --version
 FROM debian:13.4
 
 # Disable Python stdout buffering to ensure logs are printed immediately.

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import yaml
@@ -92,19 +93,38 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         assert proc.stdin is not None
         assert proc.stdout is not None
         stdout = proc.stdout
-        threading.Thread(
-            target=lambda: output.put(stdout.readline()),
-            daemon=True,
-        ).start()
-        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
-        proc.stdin.flush()
-        try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
-        response = json.loads(line)
-        assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        def read_responses():
+            for line in stdout:
+                output.put(line)
+
+        threading.Thread(target=read_responses, daemon=True).start()
+
+        expected_tool = "mcp__profileprobe__hermes_61922_profile_probe"
+        deadline = time.monotonic() + 20
+        last_output = ""
+        request_id = 0
+        while time.monotonic() < deadline:
+            request_id += 1
+            proc.stdin.write(
+                json.dumps({"id": request_id, "command": "/tools"}) + "\n"
+            )
+            proc.stdin.flush()
+            try:
+                remaining = max(0.01, deadline - time.monotonic())
+                line = output.get(timeout=min(2, remaining))
+            except queue.Empty:
+                continue
+            response = json.loads(line)
+            assert response["ok"] is True
+            last_output = response["output"]
+            if expected_tool in last_output:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(
+                "profile-local MCP tool was not discovered within 20 seconds; "
+                f"last /tools output: {last_output}"
+            )
     finally:
         proc.terminate()
         try:

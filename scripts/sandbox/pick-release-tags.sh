@@ -14,15 +14,19 @@
 #
 # Usage:
 #   scripts/sandbox/pick-release-tags.sh [--count N] [--repo DIR]
+#                                         [--remote NAME-OR-URL]
 #
 #   --count   how many tags to emit (default 5, minimum 1). Fewer tags than
 #             requested emits all of them.
 #   --repo    repository to read tags from (default: this checkout).
+#   --remote  keep only tags advertised by this remote. This lets a fork test
+#             updates from the upstream releases its installer actually uses,
+#             without admitting release-shaped fork-only tags.
 #
-# Reads tags from the local checkout, so it needs one fetched with tags
-# (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). A shallow
-# checkout has no tags and this exits non-zero rather than silently emitting an
-# empty matrix.
+# Without --remote, reads tags from the local checkout, so it needs one fetched
+# with tags (actions/checkout with fetch-depth: 0, or `fetch-tags: true`). With
+# --remote, the advertised remote refs are authoritative; this also admits a
+# new upstream release before a fork has mirrored its tag locally.
 #
 # Only vYYYY.M.D[.N] release tags are considered; the repo also carries
 # backup/* and one-off tags that are not releases.
@@ -34,6 +38,7 @@ COUNT=5
 # path so a symlinked or copied script still reads the checkout it lives in
 # rather than whatever repo the caller happens to be standing in.
 REPO=""
+REMOTE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --count)
@@ -42,6 +47,9 @@ while [ "$#" -gt 0 ]; do
     --repo)
       [ "$#" -ge 2 ] || { echo 'error: --repo needs a value' >&2; exit 1; }
       REPO="$2"; shift 2 ;;
+    --remote)
+      [ "$#" -ge 2 ] || { echo 'error: --remote needs a value' >&2; exit 1; }
+      REMOTE="$2"; shift 2 ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "error: unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -66,11 +74,26 @@ fi
 
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
 # lexicographic sort gets wrong.
-mapfile -t tags < <(
-  git -C "$REPO" tag --list 'v*' \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
-    | sort -V
-)
+if [ -n "$REMOTE" ]; then
+  remote_output="$(
+    git -C "$REPO" ls-remote --tags --refs "$REMOTE" 'refs/tags/v*'
+  )" || {
+    echo "error: could not list release tags from $REMOTE" >&2
+    exit 1
+  }
+  mapfile -t tags < <(
+    printf '%s\n' "$remote_output" \
+      | awk '{sub(/^refs\/tags\//, "", $2); print $2}' \
+      | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+      | sort -V
+  )
+else
+  mapfile -t tags < <(
+    git -C "$REPO" tag --list 'v*' \
+      | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+      | sort -V
+  )
+fi
 
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then

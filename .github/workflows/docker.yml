@@ -169,7 +169,9 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
         run: |
-          scripts/run_tests.sh tests/docker/ --file-timeout 600
+          # Bound daemon pressure: every worker starts heavyweight containers,
+          # so CPU-count-derived fan-out creates timeout flakes on shared hosts.
+          scripts/run_tests.sh tests/docker/ -j 4 --file-timeout 600 --file-retries 0
 
   # ---------------------------------------------------------------------------
   # Rebuild and push each architecture only after the unprivileged build/test

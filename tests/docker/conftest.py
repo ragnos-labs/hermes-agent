@@ -20,6 +20,9 @@ from collections.abc import Iterator
 import pytest
 
 IMAGE_TAG = os.environ.get("HERMES_TEST_IMAGE", "hermes-agent-harness:latest")
+CONTAINER_READY_TIMEOUT_S = float(
+    os.environ.get("HERMES_DOCKER_READY_TIMEOUT", "120")
+)
 
 
 def _docker_available() -> bool:
@@ -138,7 +141,7 @@ def docker_exec_sh(
 def wait_for_container_ready(
     container: str,
     *,
-    deadline_s: float = 30.0,
+    deadline_s: float = CONTAINER_READY_TIMEOUT_S,
     interval_s: float = 0.25,
 ) -> None:
     """Poll until the container has finished s6 cont-init (stage2 + reconcile).
@@ -165,8 +168,22 @@ def wait_for_container_ready(
         if r.returncode == 0 and "profile=default" in r.stdout:
             return
         time.sleep(interval_s)
+    state = subprocess.run(
+        ["docker", "inspect", "--format", "{{json .State}}", container],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    logs = subprocess.run(
+        ["docker", "logs", "--tail", "80", container],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
     raise TimeoutError(
-        f"container {container} did not finish cont-init within {deadline_s}s"
+        f"container {container} did not finish cont-init within {deadline_s}s; "
+        f"state={state.stdout.strip() or state.stderr.strip()!r}; "
+        f"logs={(logs.stdout + logs.stderr)[-4000:]!r}"
     )
 
 
@@ -188,7 +205,7 @@ def start_container(
         timeout: ``docker run`` subprocess timeout.
 
     Returns the container name. Raises on ``docker run`` failure or if
-    the container never finishes cont-init within 30s.
+    the container never finishes cont-init within the bounded readiness window.
     """
     args = ["docker", "run", "-d", "--name", name]
     for e in env:
@@ -270,7 +287,7 @@ def wait_for_log(
     log_path: str,
     needle: str,
     *,
-    deadline_s: float = 30.0,
+    deadline_s: float = CONTAINER_READY_TIMEOUT_S,
     interval_s: float = 0.25,
 ) -> str:
     """Poll until a log file inside the container contains ``needle``.

@@ -24,6 +24,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import unquote, urlsplit
 
 ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
@@ -31,6 +32,7 @@ ROOT, CERTS, REAL_CA = map(pathlib.Path, sys.argv[1:])
 LISTEN_ADDRESS = ('127.0.0.1', 8080)
 MAX_REQUEST_BYTES = 65536
 UPSTREAM_TIMEOUT_SECONDS = 30
+UPSTREAM_READ_RETRIES = 2
 CERT_VALIDITY_DAYS = 2
 
 
@@ -151,11 +153,41 @@ def relay(source, destination):
 
 
 def forward_https(conn, host, port, request):
+    method = request.split(b' ', 1)[0].decode('ascii', 'replace').upper()
+    max_attempts = 1 + (UPSTREAM_READ_RETRIES if method in {'GET', 'HEAD'} else 0)
     context = ssl.create_default_context(cafile=str(REAL_CA))
-    with socket.create_connection((host, port), timeout=UPSTREAM_TIMEOUT_SECONDS) as raw:
-        with context.wrap_socket(raw, server_hostname=host) as upstream:
-            upstream.sendall(close_request(request))
-            relay(upstream, conn)
+    for attempt in range(1, max_attempts + 1):
+        response_started = False
+        try:
+            with socket.create_connection(
+                (host, port), timeout=UPSTREAM_TIMEOUT_SECONDS
+            ) as raw:
+                with context.wrap_socket(raw, server_hostname=host) as upstream:
+                    upstream.sendall(close_request(request))
+                    while True:
+                        chunk = upstream.recv(MAX_REQUEST_BYTES)
+                        if not chunk:
+                            if response_started:
+                                return
+                            raise ConnectionError(
+                                "upstream closed before sending an HTTP response"
+                            )
+                        # Once upstream returned bytes, replay could duplicate a
+                        # partial response at the client. Fail terminally instead.
+                        response_started = True
+                        conn.sendall(chunk)
+        except OSError as error:
+            if response_started or attempt == max_attempts:
+                raise
+            print(
+                'proxy upstream retry: '
+                f'host={host} method={method} '
+                f'stage=before_response attempt={attempt}/{max_attempts} '
+                f'error={error!r}',
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(0.25 * attempt)
 
 
 def forward_http(conn, host, port, request, target):

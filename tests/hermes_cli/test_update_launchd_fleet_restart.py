@@ -21,8 +21,6 @@ in a domain it does not live in.
 from __future__ import annotations
 
 import subprocess
-import sys
-
 import pytest
 
 import hermes_cli.gateway as gw
@@ -39,10 +37,7 @@ from hermes_cli.update_cmd import (
 )
 
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="launchd fleet restart is macOS-only; helpers use POSIX os.getuid",
-)
+pytestmark = pytest.mark.macos_only
 
 UID = 501
 
@@ -214,6 +209,12 @@ class TestGetServicePidsScoping:
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
 
+        def fake_run(cmd, **_kwargs):
+            assert cmd == ["launchctl", "list"]
+            return _completed(0)
+
+        monkeypatch.setattr(gw.subprocess, "run", fake_run)
+
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted
         services, not only the invoking profile's (else the sweep SIGTERMs
@@ -264,7 +265,7 @@ def _fleet(monkeypatch, tmp_path, *, current, labels, located,
 
     plist = tmp_path / f"{current}.plist"
     if plist_exists:
-        plist.write_text("<plist/>")
+        plist.write_text("<plist/>", encoding="utf-8")
 
     def fake_locate(label):
         rec.locates.append(label)
