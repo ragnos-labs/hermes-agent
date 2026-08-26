@@ -371,29 +371,36 @@ jobs:
       - name: Test fail-closed registry inspection and ambiguous delivery recovery
         run: |
           python3 - <<'PY'
-          import re
-
-          ABSENT = re.compile(
-              r"(?:MANIFEST_UNKNOWN|manifest unknown|"
-              r"ghcr\.io/v2/.+/manifests/.+: not found|"
-              r"ghcr\.io/ragnos-labs/hermes-agent:(?:sha-[0-9a-f]{40}|v[0-9.]+): not found|"
-              r"unexpected status from HEAD request to https://ghcr\.io/v2/.+/manifests/.+: 404 Not Found)"
-          )
+          from scripts.ci.classify_ghcr_release_absence import is_explicit_absence
 
 
           def classify_attempt(returncode, stderr, raw_valid=False, digest_valid=False):
               if returncode == 0:
                   return "present" if raw_valid and digest_valid else "unknown"
-              return "absent" if ABSENT.search(stderr) else "unknown"
+              return "absent" if is_explicit_absence(stderr) else "unknown"
 
 
           assert classify_attempt(0, "", True, True) == "present"
           assert classify_attempt(0, "", False, True) == "unknown"
           assert classify_attempt(1, "MANIFEST_UNKNOWN: manifest unknown") == "absent"
-          assert classify_attempt(1, "ghcr.io/ragnos-labs/hermes-agent:v2026.8.15: not found") == "absent"
           assert classify_attempt(
-              1, "unexpected status from HEAD request to https://ghcr.io/v2/ragnos-labs/hermes-agent/manifests/v1: 404 Not Found"
+              1, "ghcr.io/ragnos-labs/hermes-agent:v2026.8.19-ragnos.1: not found"
           ) == "absent"
+          assert classify_attempt(
+              1, "unexpected status from HEAD request to "
+              "https://ghcr.io/v2/ragnos-labs/hermes-agent/manifests/"
+              "v2026.8.19.2-ragnos.3: 404 Not Found"
+          ) == "absent"
+          malformed = (
+              "ghcr.io/ragnos-labs/hermes-agent:v2026.8.19: not found",
+              "ghcr.io/ragnos-labs/hermes-agent:v2026.8-ragnos.1: not found",
+              "ghcr.io/ragnos-labs/hermes-agent:v2026.8.19-ragnos.0: not found",
+              "ghcr.io/ragnos-labs/hermes-agent:v2026.8.19-ragnos.1-extra: not found",
+              "ghcr.io/another-owner/hermes-agent:v2026.8.19-ragnos.1: not found",
+          )
+          for error in malformed:
+              assert classify_attempt(1, error) == "unknown", error
+          absence = "ghcr.io/ragnos-labs/hermes-agent:v2026.8.19-ragnos.1: not found"
           for error in (
               "unauthorized: authentication required",
               "context deadline exceeded",
@@ -402,6 +409,7 @@ jobs:
               "malformed registry response",
           ):
               assert classify_attempt(1, error) == "unknown", error
+              assert classify_attempt(1, f"{absence}\n{error}") == "unknown", error
 
           def bounded_result(attempts):
               if "present" in attempts:
@@ -966,7 +974,7 @@ jobs:
           }
 
           explicit_absence() {
-            grep -Eiq '(MANIFEST_UNKNOWN|manifest unknown|ghcr\.io/v2/.+/manifests/.+: not found|ghcr\.io/ragnos-labs/hermes-agent:(sha-[0-9a-f]{40}|v[0-9.]+): not found|unexpected status from HEAD request to https://ghcr\.io/v2/.+/manifests/.+: 404 Not Found)' "$1"
+            python3 scripts/ci/classify_ghcr_release_absence.py "$1"
           }
 
           inspect_ref() {
@@ -1710,7 +1718,7 @@ jobs:
                   return 0
                 fi
                 saw_unknown=true
-              elif grep -Eiq '(MANIFEST_UNKNOWN|manifest unknown|ghcr\.io/v2/.+/manifests/.+: not found|ghcr\.io/ragnos-labs/hermes-agent:(sha-[0-9a-f]{40}|v[0-9.]+): not found|unexpected status from HEAD request to https://ghcr\.io/v2/.+/manifests/.+: 404 Not Found)' "$error_path"; then
+              elif python3 scripts/ci/classify_ghcr_release_absence.py "$error_path"; then
                 rm -f "$raw_tmp" "$digest_tmp"
                 if [ "$attempt" -eq 3 ] && [ "$saw_unknown" = false ]; then
                   echo absent > "$state_path"
