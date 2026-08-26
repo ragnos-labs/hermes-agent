@@ -75,6 +75,13 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
     artifacts = list(tmp_path.glob(artifact_glob))
     assert artifacts
 
+    expected = {
+        path.relative_to(PROJECT_ROOT).as_posix()
+        for pattern in ("plugin.yaml", "plugin.yml")
+        for path in (PROJECT_ROOT / "plugins").rglob(pattern)
+    }
+    assert expected, "expected bundled plugin manifests under plugins/"
+
     contract_schema_path = (
         "hermes_cli/execution_contract_schemas/"
         "hermes.execution.read.v1.schema.json"
@@ -96,6 +103,8 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
             assert member is not None
             packaged_contract = json.loads(member.read())
 
+    missing = sorted(expected - shipped)
+    assert not missing, f"{kind} omits bundled plugin manifests: {missing}"
     assert contract_schema_path in shipped
     assert packaged_contract["$id"] == (
         "https://hermes-agent.nousresearch.com/contracts/"

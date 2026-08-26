@@ -7,8 +7,10 @@ name: GHCR Execution Read Release
 # it is not approval. Publication also fails closed unless the dedicated
 # hermes-execution-read-release environment requires the RAGnos release operator,
 # permits that operator to approve the bounded dispatch, disables administrator
-# bypass, and has a main-only deployment policy. Protected CalVer tags and GHCR
-# package-writer restrictions remain external release gates owned by the pilot.
+# bypass, and has a main-only deployment policy. Protected fork-qualified tags
+# and GHCR package-writer restrictions remain external release gates owned by
+# the pilot. The -ragnos.N suffix keeps fork releases distinct from immutable
+# NousResearch upstream tags.
 # This workflow never creates main or latest tags.
 on:
   pull_request:
@@ -19,11 +21,11 @@ on:
         required: true
         type: string
       source_ref:
-        description: Exact release tag ref (refs/tags/vYYYY.M.D[.N]) that resolves to source_sha.
+        description: Exact fork release ref (refs/tags/vYYYY.M.D[.N]-ragnos.N) that resolves to source_sha.
         required: true
         type: string
       release_tag:
-        description: Approved CalVer image tag (vYYYY.M.D[.N]).
+        description: Approved fork image tag (vYYYY.M.D[.N]-ragnos.N).
         required: true
         type: string
       confirm_publish:
@@ -147,8 +149,8 @@ jobs:
           }
 
           if [ "$publish" = true ]; then
-            [[ "$release_tag" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
-              echo "::error::release_tag must preserve the vYYYY.M.D[.N] CalVer convention."
+            [[ "$release_tag" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?-ragnos\.[1-9][0-9]*$ ]] || {
+              echo "::error::release_tag must use the non-colliding vYYYY.M.D[.N]-ragnos.N convention."
               exit 1
             }
             [ "$source_ref" = "refs/tags/${release_tag}" ] || {
