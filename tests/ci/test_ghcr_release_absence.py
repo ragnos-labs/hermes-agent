@@ -50,7 +50,6 @@ def test_mixed_absence_and_registry_failure_stays_unknown():
 
 def test_audited_classifier_runs_outside_an_old_source_checkout(tmp_path):
     repo = Path(__file__).resolve().parents[2]
-    source_sha = "6df4078de6c6b606d22b16725d603b7960f98b26"
     workflow_sha = subprocess.run(
         ["git", "rev-parse", "HEAD^{commit}"],
         cwd=repo,
@@ -81,6 +80,39 @@ def test_audited_classifier_runs_outside_an_old_source_checkout(tmp_path):
         ],
         check=True,
     )
+    subprocess.run(
+        ["git", "checkout", "--quiet", "--orphan", "synthetic-old-source"],
+        cwd=old_source_checkout,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "rm", "--quiet", "-r", "--force", "."],
+        cwd=old_source_checkout,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Hermes CI",
+            "-c",
+            "user.email=ci@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "synthetic old source",
+        ],
+        cwd=old_source_checkout,
+        check=True,
+    )
+    source_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD^{commit}"],
+        cwd=old_source_checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     subprocess.run(
         ["git", "checkout", "--quiet", "--detach", source_sha],
         cwd=old_source_checkout,

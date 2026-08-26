@@ -19,6 +19,15 @@ from agent.lsp.client import LSPClient
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
+# These integration tests intentionally spawn and terminate their own mock
+# language-server subprocess.  Under a highly parallel suite the child can
+# finish and be reparented between asyncio's return-code check and its
+# best-effort terminate call, so the generic live-system guard can no longer
+# prove the PID belongs to this test.  The bypass is confined to this file's
+# synthetic child-process lifecycle; no gateway discovery or host process IDs
+# enter either test.
+pytestmark = pytest.mark.live_system_guard_bypass
+
 
 def _client(workspace: Path, script: str = "clean") -> LSPClient:
     env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
@@ -35,7 +44,7 @@ def _client(workspace: Path, script: str = "clean") -> LSPClient:
 async def test_client_lifecycle_clean(tmp_path: Path):
     """Full lifecycle: spawn, initialize, open, get clean diagnostics, shutdown."""
     f = tmp_path / "x.py"
-    f.write_text("print('hi')\n")
+    f.write_text("print('hi')\n", encoding="utf-8")
 
     client = _client(tmp_path, "clean")
     await client.start()
@@ -54,7 +63,7 @@ async def test_client_lifecycle_clean(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_client_receives_published_errors(tmp_path: Path):
     f = tmp_path / "x.py"
-    f.write_text("print('hi')\n")
+    f.write_text("print('hi')\n", encoding="utf-8")
 
     client = _client(tmp_path, "errors")
     await client.start()
@@ -70,8 +79,6 @@ async def test_client_receives_published_errors(tmp_path: Path):
         assert "synthetic error" in d["message"]
     finally:
         await client.shutdown()
-
-
 
 
 

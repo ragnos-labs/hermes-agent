@@ -6,10 +6,12 @@ gateway deployments.
 """
 
 import os
-import signal
 import subprocess
 import sys
 import threading
+
+import psutil
+import pytest
 
 
 
@@ -22,11 +24,7 @@ def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
 
 def _pid_alive(pid: int) -> bool:
     """Return True if a process with the given PID is still running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
+    return psutil.pid_exists(pid)
 
 
 class TestZombieReproduction:
@@ -58,8 +56,8 @@ class TestZombieReproduction:
         finally:
             for pid in pids:
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
+                    psutil.Process(pid).kill()
+                except psutil.Error:
                     pass
 
     def test_explicit_terminate_reaps_processes(self):
@@ -457,12 +455,14 @@ class TestDelegationCleanup:
         from tools.delegate_tool import _run_single_child
 
         relay_runtime._reset_for_tests()
+        pytest.importorskip("nemo_relay")
         profile_home = tmp_path / "profile-timeout"
         profile_token = set_hermes_home_override(profile_home)
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
         parent = MagicMock()
+        parent.session_id = "timed-out-parent"
         parent._active_children = []
         parent._active_children_lock = threading.Lock()
         child = MagicMock()
@@ -470,16 +470,24 @@ class TestDelegationCleanup:
         child._delegate_saved_tool_names = ["tool1"]
         child.get_activity_summary.return_value = {"api_call_count": 1}
         parent._active_children.append(child)
-        relay_host = MagicMock()
+        profile_key = relay_runtime.current_profile_key()
+        relay_host = relay_runtime.SESSION_COORDINATOR.registry.for_profile(profile_key)
+        assert isinstance(relay_host, relay_runtime.RelayRuntime)
+        unregister_subagent = MagicMock(wraps=relay_host.unregister_subagent)
+        monkeypatch.setattr(relay_host, "unregister_subagent", unregister_subagent)
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
-        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
+        # Keep the timeout short enough to exercise cleanup while leaving
+        # enough room for the worker thread to start under a loaded CI host.
+        monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 1.0)
 
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
                 session_id=child.session_id,
                 platform="subagent",
+                parent_session_id=parent.session_id,
             )
+            assert lease.parent_session_id == "timed-out-parent"
             turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
                 lease,
                 turn_id="timed-out-child-turn",
@@ -515,17 +523,22 @@ class TestDelegationCleanup:
             assert child_started.is_set()
             assert result["status"] == "timeout"
             assert relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=str(profile_home),
+                profile_key=profile_key,
                 session_id=child.session_id,
             )
-            relay_host.unregister_subagent.assert_not_called()
+            assert relay_host.get_session(child.session_id) is not None
+            unregister_subagent.assert_not_called()
 
             release_child.set()
             assert child_finished.wait(timeout=5)
             assert not relay_runtime.SESSION_COORDINATOR.has_active_turn(
-                profile_key=str(profile_home),
+                profile_key=profile_key,
                 session_id=child.session_id,
             )
+            unregister_subagent.assert_called_once_with(
+                {"child_session_id": child.session_id}
+            )
+            assert relay_host.get_session(child.session_id) is None
         finally:
             release_child.set()
             reset_hermes_home_override(profile_token)

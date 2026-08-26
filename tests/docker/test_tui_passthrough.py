@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -22,6 +23,20 @@ pytestmark = pytest.mark.skipif(
     shutil.which("script") is None,
     reason="`script` command not available on this host",
 )
+
+
+def _run_in_host_pty(command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+    """Run *command* in a host PTY with portable BSD/GNU ``script`` syntax."""
+    if sys.platform == "darwin":
+        argv = ["script", "-q", "/dev/null", *command]
+    else:
+        argv = ["script", "-qc", shlex.join(command), "/dev/null"]
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 def test_tty_passthrough_to_container(built_image: str) -> None:
@@ -38,13 +53,12 @@ def test_tty_passthrough_to_container(built_image: str) -> None:
     probe = (
         f'if [ -t 1 ]; then echo "{marker}=$(tput cols)"; else echo "{marker}=NO_TTY"; fi'
     )
-    cmd = (
-        f"docker run --rm -t -e COLUMNS=123 {built_image} "
-        f"sh -c {shlex.quote(probe)}"
-    )
-    r = subprocess.run(
-        ["script", "-qc", cmd, "/dev/null"],
-        capture_output=True, text=True, timeout=120,
+    r = _run_in_host_pty(
+        [
+            "docker", "run", "--rm", "-t", "-e", "COLUMNS=123",
+            built_image, "sh", "-c", probe,
+        ],
+        timeout=120,
     )
     output = r.stdout
     matches = re.findall(rf"{marker}=(\S+)", output)
@@ -57,9 +71,8 @@ def test_tty_passthrough_to_container(built_image: str) -> None:
 
 def test_tui_flag_recognized(built_image: str) -> None:
     """``docker run -it <image> --help`` should run without crashing."""
-    cmd = f"docker run --rm -t {built_image} --help"
-    r = subprocess.run(
-        ["script", "-qc", cmd, "/dev/null"],
-        capture_output=True, text=True, timeout=60,
+    r = _run_in_host_pty(
+        ["docker", "run", "--rm", "-t", built_image, "--help"],
+        timeout=60,
     )
     assert r.returncode == 0

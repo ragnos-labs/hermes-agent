@@ -274,6 +274,10 @@ def _make_monitor_job(hermes_env, script_body: str):
         schedule="every 5m",
         monitor_script="mon.sh",
         deliver="local",
+        # The agent stub below resolves to the synthetic ``test`` provider.
+        # Pin the job to that same provider so these monitor tests exercise
+        # monitor semantics instead of the independent provider-drift gate.
+        provider="test",
     )
 
 

@@ -55,7 +55,7 @@ def _pid_alive(pid: int) -> bool:
         # test is skipped on Windows so the path is unreachable.
         raise RuntimeError("_pid_alive POSIX-only")
     try:
-        os.kill(pid, 0)
+        os.kill(pid, 0)  # windows-footgun: ok - POSIX-only test
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -98,6 +98,53 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stdout
     assert "UnicodeEncodeError" not in proc.stdout
     assert "1 tests passed" in proc.stdout
+
+
+def test_parallel_files_receive_isolated_pytest_temp_roots(tmp_path: Path) -> None:
+    """Concurrent pytest children never share numbered-directory cleanup."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    records = tmp_path / "roots"
+    records.mkdir()
+
+    for index in range(8):
+        (probe_dir / f"test_temp_root_{index}.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n\n"
+            f"def test_root_{index}():\n"
+            "    root = os.environ.get('PYTEST_DEBUG_TEMPROOT')\n"
+            "    assert root\n"
+            f"    Path({str(records)!r}, '{index}').write_text(root, encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "8",
+            "--file-timeout",
+            "30",
+            "--file-retries",
+            "0",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    roots = [path.read_text(encoding="utf-8") for path in records.iterdir()]
+    assert len(roots) == 8
+    assert len(set(roots)) == 8
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
@@ -160,10 +207,10 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
                 "diag": first_line,
                 "test_pid": os.getpid(),
                 "test_pgid": os.getpgid(0),
-            }}))
+            }}), encoding="utf-8")
             assert child.pid > 0
     """).strip()
-    probe.write_text(probe_src + "\n")
+    probe.write_text(probe_src + "\n", encoding="utf-8")
 
     # Run the parallel runner against just the probe file. The runner
     # discovers under ``tests/`` by default, so we override via --paths.
@@ -194,7 +241,7 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
     assert handoff.exists(), (
         f"probe never wrote handoff file; runner output:\n{proc.stdout}"
     )
-    handoff_data = json.loads(handoff.read_text())
+    handoff_data = json.loads(handoff.read_text(encoding="utf-8"))
     grandchild_pid = handoff_data["pid"]
     diag = handoff_data.get("diag", "(no diag)")
     test_pid = handoff_data.get("test_pid")

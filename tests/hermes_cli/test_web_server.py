@@ -155,7 +155,7 @@ class TestReloadEnv:
     def test_removes_deleted_known_vars(self, tmp_path):
         """reload_env() removes known Hermes vars not present in .env."""
         env_file = tmp_path / ".env"
-        env_file.write_text("")  # empty .env
+        env_file.write_text("", encoding="utf-8")  # empty .env
         # Pick a known key from OPTIONAL_ENV_VARS
         known_key = next(iter(OPTIONAL_ENV_VARS.keys()))
         with patch.dict(reload_env.__globals__, {"get_env_path": lambda: env_file}):
@@ -632,6 +632,173 @@ class TestWebServerEndpoints:
         assert [response.status_code for response in responses] == [
             200
         ] * len(paths)
+
+    def test_read_open_waits_for_inflight_bootstrap_after_file_appears(
+        self, monkeypatch, tmp_path
+    ):
+        """A non-zero SQLite file is not proof that schema init is complete."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = tmp_path / "state.db"
+        bootstrap_started = Event()
+        release_bootstrap = Event()
+        second_attempted = Event()
+        read_opened = Event()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                if read_only:
+                    read_opened.set()
+                    return
+
+                # Model SQLite creating a non-zero file before virtual-table
+                # schema setup finishes. A size-only fast path would now let a
+                # sibling reader bypass the in-flight bootstrap lock.
+                db_path.write_bytes(b"sqlite-header-in-progress")
+                bootstrap_started.set()
+                assert release_bootstrap.wait(timeout=5)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        def open_read():
+            return web_server._open_session_db_at_path(db_path, read_only=True)
+
+        def open_second_read():
+            second_attempted.set()
+            return open_read()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(open_read)
+            assert bootstrap_started.wait(timeout=5)
+            second = pool.submit(open_second_read)
+            assert second_attempted.wait(timeout=5)
+            try:
+                assert not read_opened.wait(timeout=0.2)
+            finally:
+                release_bootstrap.set()
+
+            first.result(timeout=5).close()
+            second.result(timeout=5).close()
+
+    def test_read_open_does_not_wait_for_other_store_bootstrap(
+        self, monkeypatch, tmp_path
+    ):
+        """A fresh profile must not convoy an unrelated profile's reads."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        blocked_path = tmp_path / "blocked" / "state.db"
+        independent_path = tmp_path / "independent" / "state.db"
+        blocked_path.parent.mkdir()
+        independent_path.parent.mkdir()
+        blocked_started = Event()
+        release_blocked = Event()
+        independent_opened = Event()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                if read_only:
+                    return
+                db_path.write_bytes(b"sqlite-header-in-progress")
+                if db_path == blocked_path:
+                    blocked_started.set()
+                    assert release_blocked.wait(timeout=5)
+                elif db_path == independent_path:
+                    independent_opened.set()
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            blocked = pool.submit(
+                web_server._open_session_db_at_path,
+                blocked_path,
+                read_only=True,
+            )
+            assert blocked_started.wait(timeout=5)
+            independent = pool.submit(
+                web_server._open_session_db_at_path,
+                independent_path,
+                read_only=True,
+            )
+            try:
+                assert independent_opened.wait(timeout=1)
+                independent.result(timeout=1).close()
+            finally:
+                release_blocked.set()
+
+            blocked.result(timeout=5).close()
+
+    def test_read_open_waits_for_same_store_through_symlink_alias(
+        self, monkeypatch, tmp_path
+    ):
+        """Two filesystem aliases for one store must share a bootstrap lock."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        real_dir = tmp_path / "real"
+        alias_dir = tmp_path / "alias"
+        real_dir.mkdir()
+        try:
+            alias_dir.symlink_to(real_dir, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+        real_path = real_dir / "state.db"
+        alias_path = alias_dir / "state.db"
+        bootstrap_started = Event()
+        release_bootstrap = Event()
+        alias_read_opened = Event()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                if read_only:
+                    alias_read_opened.set()
+                    return
+
+                db_path.write_bytes(b"sqlite-header-in-progress")
+                bootstrap_started.set()
+                assert release_bootstrap.wait(timeout=5)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                web_server._open_session_db_at_path,
+                real_path,
+                read_only=True,
+            )
+            assert bootstrap_started.wait(timeout=5)
+            alias = pool.submit(
+                web_server._open_session_db_at_path,
+                alias_path,
+                read_only=True,
+            )
+            try:
+                assert not alias_read_opened.wait(timeout=0.2)
+            finally:
+                release_bootstrap.set()
+
+            first.result(timeout=5).close()
+            alias.result(timeout=5).close()
 
 
 
@@ -1712,13 +1879,13 @@ class TestWebServerEndpoints:
         # actually received the write.
         env_var = custom_endpoint_key_env("worker-proxy")
 
-        worker_cfg = (worker_home / "config.yaml").read_text()
+        worker_cfg = (worker_home / "config.yaml").read_text(encoding="utf-8")
         assert "worker-proxy" in worker_cfg
         assert env_var in worker_cfg
-        assert "sk-worker-secret" in (worker_home / ".env").read_text()
+        assert "sk-worker-secret" in (worker_home / ".env").read_text(encoding="utf-8")
 
         for leaked in (default_home / "config.yaml", default_home / ".env"):
-            text = leaked.read_text() if leaked.exists() else ""
+            text = leaked.read_text(encoding="utf-8") if leaked.exists() else ""
             assert "worker-proxy" not in text, f"endpoint leaked into default profile ({leaked.name})"
             assert "sk-worker-secret" not in text, f"credential leaked into default profile ({leaked.name})"
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -89,8 +90,26 @@ class TestFormatters:
 # ---------------------------------------------------------------------------
 
 class TestSpawnAsyncDiagnostic:
+    @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only diagnostic")
-    def test_spawns_subprocess_and_writes_output(self, tmp_path):
+    def test_spawns_subprocess_and_writes_output(self, tmp_path, monkeypatch):
+        # The production helper intentionally launches and later reaps its own
+        # diagnostic child, which is the documented narrow use for the live
+        # system guard bypass.  macOS does not ship GNU ``timeout``; provide a
+        # test-local argv-compatible shim so this remains a real subprocess
+        # behavior test on every supported POSIX host.
+        if shutil.which("timeout") is None:
+            timeout_bin = tmp_path / "bin" / "timeout"
+            timeout_bin.parent.mkdir()
+            timeout_bin.write_text(
+                "#!/bin/sh\nshift\nexec \"$@\"\n",
+                encoding="utf-8",
+            )
+            timeout_bin.chmod(0o755)
+            monkeypatch.setenv(
+                "PATH", f"{timeout_bin.parent}{os.pathsep}{os.environ['PATH']}"
+            )
+
         log_path = tmp_path / "diag.log"
         pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=3.0)
         assert pid is not None and pid > 0

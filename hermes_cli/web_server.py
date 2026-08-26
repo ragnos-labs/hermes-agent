@@ -12036,11 +12036,35 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 
 
 
-# Serialises the one-time writable schema bootstrap for read-only opens.
-# Concurrent first-load polls otherwise race sqlite file creation: the losers
-# open mode=ro against a store whose schema is still being written and every
-# query raises "no such table: sessions".
-_session_db_bootstrap_lock = threading.Lock()
+# Serialises the one-time writable schema bootstrap for read-only opens of the
+# same store. Locks are keyed by normalized path so a fresh or contended
+# profile cannot convoy healthy reads for unrelated profiles. The reference
+# count includes waiters, which prevents a lock from being removed and
+# replaced while another thread is about to acquire it.
+_session_db_bootstrap_locks_guard = threading.Lock()
+_session_db_bootstrap_locks: Dict[str, list] = {}
+
+
+@contextmanager
+def _session_db_bootstrap_guard(db_path: Path):
+    # Resolve symlink/junction aliases as well as lexical ``..`` segments so
+    # every name for the same state.db shares one bootstrap lock.
+    key = os.path.normcase(os.fspath(Path(db_path).resolve(strict=False)))
+    with _session_db_bootstrap_locks_guard:
+        entry = _session_db_bootstrap_locks.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _session_db_bootstrap_locks[key] = entry
+        entry[1] += 1
+
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _session_db_bootstrap_locks_guard:
+            entry[1] -= 1
+            if entry[1] == 0 and _session_db_bootstrap_locks.get(key) is entry:
+                _session_db_bootstrap_locks.pop(key, None)
 
 
 def _session_db_read_probe_statements() -> tuple:
@@ -12103,10 +12127,14 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
         except OSError:
             return False
 
-    if _needs_bootstrap():
-        with _session_db_bootstrap_lock:
-            if _needs_bootstrap():
-                SessionDB(db_path=db_path, read_only=False).close()
+    # Always cross the bootstrap lock before the first read-only open. SQLite
+    # creates a non-zero file before SessionDB finishes schema/FTS setup, so a
+    # sibling request that checked only file size could otherwise bypass the
+    # lock and observe a half-initialized virtual table. Healthy stores pay
+    # only this short in-process lock/check; no writable open is performed.
+    with _session_db_bootstrap_guard(db_path):
+        if _needs_bootstrap():
+            SessionDB(db_path=db_path, read_only=False).close()
 
     def _open_probed():
         db = SessionDB(db_path=db_path, read_only=True)

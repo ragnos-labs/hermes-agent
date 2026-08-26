@@ -104,9 +104,13 @@ async def test_cleanup_off_loop_does_not_block_event_loop():
     await hb
     executor.shutdown(wait=False)
 
-    assert ticks_during_block >= 5, (
-        f"event loop was blocked during agent cleanup (#53175): only "
-        f"{ticks_during_block} ticks while close() was running"
+    # Any tick after close() entered its blocking section proves cleanup did
+    # not run on the event loop. Do not require a throughput count here: under
+    # the 20-file stress runner, host scheduling can legitimately coalesce a
+    # 5 ms heartbeat while the loop remains live.
+    assert ticks_during_block > 0, (
+        "event loop was blocked during agent cleanup (#53175): heartbeat "
+        "made no progress while close() was running"
     )
 
 
@@ -164,5 +168,4 @@ async def test_cleanup_off_loop_swallows_executor_failure(caplog):
     assert any(
         "failed" in r.message and "#53175" in r.message for r in caplog.records
     ), "expected the cleanup-failure warning to be logged"
-
 
