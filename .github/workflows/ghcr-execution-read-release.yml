@@ -50,7 +50,7 @@ env:
   SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.read.v1.schema.json
   SCHEMA_SHA256: 7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
   ACTION_SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json
-  ACTION_SCHEMA_SHA256: d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870
+  ACTION_SCHEMA_SHA256: bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b
 
 jobs:
   resolve:
@@ -458,6 +458,38 @@ jobs:
           print("registry_inspection_and_delivery_recovery=passed")
           PY
 
+      - name: Test action receipt release-tag compatibility
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          schema_bytes = Path(os.environ["ACTION_SCHEMA_PATH"]).read_bytes()
+          assert hashlib.sha256(schema_bytes).hexdigest() == os.environ["ACTION_SCHEMA_SHA256"]
+          schema = json.loads(schema_bytes)
+          pattern = schema["$defs"]["releaseReceipt"]["properties"]["release_tag"]["pattern"]
+          for release_tag in (
+              "v2026.8.19",
+              "v2026.8.19.2",
+              "v2026.8.19-ragnos.1",
+              "v2026.8.19.2-ragnos.3",
+          ):
+              assert re.fullmatch(pattern, release_tag), release_tag
+          for release_tag in (
+              "v2026.8",
+              "v2026.8.19-ragnos.0",
+              "v2026.8.19-ragnos.01",
+              "v2026.8.19-ragnos",
+              "v2026.8.19-ragnos.1-extra",
+              "v2026.8.19-other.1",
+          ):
+              assert re.fullmatch(pattern, release_tag) is None, release_tag
+          print("action_receipt_release_tag_compatibility=passed")
+          PY
+
       - name: Test fail-closed tag and recovery transitions
         run: |
           python3 - <<'PY'
@@ -582,7 +614,7 @@ jobs:
           assert "application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json" in text
           assert "ACTION_CONTRACT_VERSION: hermes.execution.action.v1" in text
           assert "ACTION_SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json" in text
-          assert "ACTION_SCHEMA_SHA256: d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870" in text
+          assert "ACTION_SCHEMA_SHA256: bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b" in text
           assert text.count("io.ragnos.hermes.execution.action-contract") >= 8
           assert text.count("io.ragnos.hermes.execution.action-schema-sha256") >= 8
           assert text.count("io.ragnos.hermes.execution.action-source-sha") >= 8
@@ -773,7 +805,7 @@ jobs:
           )
 
           expected_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
-          expected_action_sha = "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+          expected_action_sha = "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
           expected_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
           schema_path = files("hermes_cli").joinpath(
               "execution_contract_schemas/hermes.execution.read.v1.schema.json"
@@ -1135,7 +1167,7 @@ jobs:
                   and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
                   and annotations.get("io.ragnos.hermes.execution.schema-sha256") == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
                   and annotations.get("io.ragnos.hermes.execution.action-contract") == "hermes.execution.action.v1"
-                  and annotations.get("io.ragnos.hermes.execution.action-schema-sha256") == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+                  and annotations.get("io.ragnos.hermes.execution.action-schema-sha256") == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
                   and annotations.get("io.ragnos.hermes.execution.action-source-sha") == os.environ["SOURCE_SHA"]
               )
               digest = Path(os.environ[f"{prefix}_DIGEST_PATH"]).read_text(encoding="utf-8").strip()
@@ -1410,7 +1442,7 @@ jobs:
           )
 
           expected_schema_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
-          expected_action_schema_sha = "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+          expected_action_schema_sha = "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
           embedded_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
           packaged_schema = files("hermes_cli").joinpath(
               "execution_contract_schemas/hermes.execution.read.v1.schema.json"
@@ -2004,7 +2036,7 @@ jobs:
                   and annotations.get("io.ragnos.hermes.execution.action-contract")
                   == "hermes.execution.action.v1"
                   and annotations.get("io.ragnos.hermes.execution.action-schema-sha256")
-                  == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+                  == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
                   and annotations.get("io.ragnos.hermes.execution.action-source-sha")
                   == os.environ["SOURCE_SHA"]
               )
@@ -2123,7 +2155,7 @@ jobs:
               and annotations.get("io.ragnos.hermes.execution.action-contract")
               == "hermes.execution.action.v1"
               and annotations.get("io.ragnos.hermes.execution.action-schema-sha256")
-              == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+              == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
               and annotations.get("io.ragnos.hermes.execution.action-source-sha")
               == os.environ["SOURCE_SHA"]
           )
@@ -2212,7 +2244,7 @@ jobs:
           assert annotations["io.ragnos.hermes.execution.contract"] == "hermes.execution.read.v1"
           assert annotations["io.ragnos.hermes.execution.schema-sha256"] == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
           assert annotations["io.ragnos.hermes.execution.action-contract"] == "hermes.execution.action.v1"
-          assert annotations["io.ragnos.hermes.execution.action-schema-sha256"] == "d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870"
+          assert annotations["io.ragnos.hermes.execution.action-schema-sha256"] == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
           assert annotations["io.ragnos.hermes.execution.action-source-sha"] == os.environ["SOURCE_SHA"]
 
           receipt_path = Path(os.environ["RECEIPT_PATH"])

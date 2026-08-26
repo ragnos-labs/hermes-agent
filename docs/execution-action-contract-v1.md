@@ -9,7 +9,7 @@ Canonical schema:
 `hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json`
 
 Schema SHA-256:
-`d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870`
+`bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b`
 
 This private contract adds durable retry safety to the existing authenticated
 Runs API. It deliberately reuses the released execution read contract for
@@ -126,8 +126,13 @@ The fork-owned GHCR workflow packages this private action profile beside the
 existing `hermes.execution.read.v1` contract. It does not replace or rename the
 read identity. Fork releases use `vYYYY.M.D[.N]-ragnos.N`; the prefix names the
 exact NousResearch upstream release baseline and the required suffix prevents
-the RAGnos artifact tag from colliding with that immutable upstream tag. A
-conforming action release binds all of the following to the same immutable
+the RAGnos artifact tag from colliding with that immutable upstream tag. The v1
+release-receipt schema remains backward compatible with the original
+unsuffixed `vYYYY.M.D[.N]` CalVer identity while also accepting the canonical
+fork-qualified form. Other suffixes, zero or zero-padded RAGnos release
+numbers, and malformed CalVer values remain invalid.
+
+A conforming action release binds all of the following to the same immutable
 multi-architecture index:
 
 - `hermes.execution.action.v1` and the exact action-schema SHA-256 above;

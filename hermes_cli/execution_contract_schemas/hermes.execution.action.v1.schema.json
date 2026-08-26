@@ -152,7 +152,7 @@
         "destination": {"const": "ghcr.io/ragnos-labs/hermes-agent"},
         "release_tag": {
           "type": "string",
-          "pattern": "^v[0-9]{4}\\.[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$"
+          "pattern": "^v[0-9]{4}\\.[0-9]+\\.[0-9]+(?:\\.[0-9]+)?(?:-ragnos\\.[1-9][0-9]*)?$"
         },
         "source_sha": {"$ref": "#/$defs/sourceSha"},
         "workflow_sha": {"$ref": "#/$defs/sourceSha"},
