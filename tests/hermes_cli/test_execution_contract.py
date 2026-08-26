@@ -7,6 +7,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -928,6 +929,42 @@ def test_packaged_action_schema_binds_submission_read_and_release_identities():
     assert schema["$defs"]["releaseReceipt"]["properties"][
         "receipt_version"
     ] == {"const": "hermes.execution.action.release-receipt.v1"}
+
+
+@pytest.mark.parametrize(
+    "release_tag",
+    [
+        "v2026.8.19",
+        "v2026.8.19.2",
+        "v2026.8.19-ragnos.1",
+        "v2026.8.19.2-ragnos.3",
+    ],
+)
+def test_action_release_receipt_accepts_calver_and_fork_tags(release_tag):
+    pattern = action_contract_schema()["$defs"]["releaseReceipt"]["properties"][
+        "release_tag"
+    ]["pattern"]
+
+    assert re.fullmatch(pattern, release_tag)
+
+
+@pytest.mark.parametrize(
+    "release_tag",
+    [
+        "v2026.8",
+        "v2026.8.19-ragnos.0",
+        "v2026.8.19-ragnos.01",
+        "v2026.8.19-ragnos",
+        "v2026.8.19-ragnos.1-extra",
+        "v2026.8.19-other.1",
+    ],
+)
+def test_action_release_receipt_rejects_malformed_or_unowned_tags(release_tag):
+    pattern = action_contract_schema()["$defs"]["releaseReceipt"]["properties"][
+        "release_tag"
+    ]["pattern"]
+
+    assert re.fullmatch(pattern, release_tag) is None
 
 
 def test_unknown_store_version_fails_closed(tmp_path):
