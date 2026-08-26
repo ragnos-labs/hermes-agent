@@ -124,8 +124,11 @@ public decision mutation, WebAuthn step-up, or executor delegation.
 
 The fork-owned GHCR workflow packages this private action profile beside the
 existing `hermes.execution.read.v1` contract. It does not replace or rename the
-read identity. A conforming action release binds all of the following to the
-same immutable multi-architecture index:
+read identity. Fork releases use `vYYYY.M.D[.N]-ragnos.N`; the prefix names the
+exact NousResearch upstream release baseline and the required suffix prevents
+the RAGnos artifact tag from colliding with that immutable upstream tag. A
+conforming action release binds all of the following to the same immutable
+multi-architecture index:
 
 - `hermes.execution.action.v1` and the exact action-schema SHA-256 above;
 - the exact source commit in `org.opencontainers.image.revision` and
