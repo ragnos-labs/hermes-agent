@@ -12047,7 +12047,9 @@ _session_db_bootstrap_locks: Dict[str, list] = {}
 
 @contextmanager
 def _session_db_bootstrap_guard(db_path: Path):
-    key = os.path.normcase(os.path.abspath(os.fspath(db_path)))
+    # Resolve symlink/junction aliases as well as lexical ``..`` segments so
+    # every name for the same state.db shares one bootstrap lock.
+    key = os.path.normcase(os.fspath(Path(db_path).resolve(strict=False)))
     with _session_db_bootstrap_locks_guard:
         entry = _session_db_bootstrap_locks.get(key)
         if entry is None:

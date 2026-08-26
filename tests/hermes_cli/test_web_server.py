@@ -741,6 +741,65 @@ class TestWebServerEndpoints:
 
             blocked.result(timeout=5).close()
 
+    def test_read_open_waits_for_same_store_through_symlink_alias(
+        self, monkeypatch, tmp_path
+    ):
+        """Two filesystem aliases for one store must share a bootstrap lock."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        real_dir = tmp_path / "real"
+        alias_dir = tmp_path / "alias"
+        real_dir.mkdir()
+        try:
+            alias_dir.symlink_to(real_dir, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+
+        real_path = real_dir / "state.db"
+        alias_path = alias_dir / "state.db"
+        bootstrap_started = Event()
+        release_bootstrap = Event()
+        alias_read_opened = Event()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only):
+                if read_only:
+                    alias_read_opened.set()
+                    return
+
+                db_path.write_bytes(b"sqlite-header-in-progress")
+                bootstrap_started.set()
+                assert release_bootstrap.wait(timeout=5)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                web_server._open_session_db_at_path,
+                real_path,
+                read_only=True,
+            )
+            assert bootstrap_started.wait(timeout=5)
+            alias = pool.submit(
+                web_server._open_session_db_at_path,
+                alias_path,
+                read_only=True,
+            )
+            try:
+                assert not alias_read_opened.wait(timeout=0.2)
+            finally:
+                release_bootstrap.set()
+
+            first.result(timeout=5).close()
+            alias.result(timeout=5).close()
+
 
 
 
