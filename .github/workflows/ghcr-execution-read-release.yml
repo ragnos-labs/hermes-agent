@@ -541,9 +541,22 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
 
           text = Path(os.environ["WORKFLOW_PATH"]).read_text(encoding="utf-8")
+
+
+          def job_body(name):
+              matches = re.compile(
+                  rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)"
+              ).findall(text)
+              assert len(matches) == 1, name
+              return matches[0]
+
+
+          registry_preflight = job_body("registry-preflight")
+          manifest = job_body("manifest")
           assert "'ghcr-execution-read-publication'" in text
           assert text.index("\n  registry-preflight:\n") < text.index("\n  publish:\n") < text.index("\n  manifest:\n")
           assert "needs: [resolve, authorize, registry-preflight]" in text
@@ -558,6 +571,13 @@ jobs:
           assert mutable_sha_copy not in text
           assert mutable_release_copy not in text
           assert 'git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA"' in text
+          for runtime_job in (registry_preflight, manifest):
+              assert runtime_job.count("name: Materialize audited registry policy outside the source checkout") == 1
+              assert runtime_job.count('classifier_spec="${WORKFLOW_SHA}:scripts/ci/classify_ghcr_release_absence.py"') == 1
+              assert runtime_job.count('git show "$classifier_spec" > "$classifier_path"') == 1
+              assert 'python3 scripts/ci/classify_ghcr_release_absence.py' not in runtime_job
+          assert registry_preflight.count('python3 "$AUDITED_GHCR_ABSENCE_CLASSIFIER" "$1"') == 1
+          assert manifest.count('python3 "$AUDITED_GHCR_ABSENCE_CLASSIFIER" "$error_path"') == 1
           assert '"${IMAGE_NAME}@${final_release_digest}" --raw' in text
           assert "application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json" in text
           assert "ACTION_CONTRACT_VERSION: hermes.execution.action.v1" in text
@@ -918,6 +938,28 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Materialize audited registry policy outside the source checkout
+        env:
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin refs/heads/main
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA" ] || {
+            echo "::error::Protected main moved before audited registry policy could be materialized."
+            exit 1
+          }
+          classifier_spec="${WORKFLOW_SHA}:scripts/ci/classify_ghcr_release_absence.py"
+          [ "$(git cat-file -t "$classifier_spec")" = blob ]
+          expected_blob="$(git rev-parse --verify "$classifier_spec")"
+          policy_root="$(mktemp -d "$RUNNER_TEMP/audited-workflow-policy.XXXXXX")"
+          classifier_path="$policy_root/classify_ghcr_release_absence.py"
+          git show "$classifier_spec" > "$classifier_path"
+          [ "$(git hash-object "$classifier_path")" = "$expected_blob" ] || {
+            echo "::error::Materialized registry policy does not match the audited workflow revision."
+            exit 1
+          }
+          echo "AUDITED_GHCR_ABSENCE_CLASSIFIER=$classifier_path" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -974,7 +1016,7 @@ jobs:
           }
 
           explicit_absence() {
-            python3 scripts/ci/classify_ghcr_release_absence.py "$1"
+            python3 "$AUDITED_GHCR_ABSENCE_CLASSIFIER" "$1"
           }
 
           inspect_ref() {
@@ -1593,6 +1635,29 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Materialize audited registry policy outside the source checkout
+        if: steps.children.outputs.ready == 'true'
+        env:
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags origin refs/heads/main
+          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$WORKFLOW_SHA" ] || {
+            echo "::error::Protected main moved before audited registry policy could be materialized."
+            exit 1
+          }
+          classifier_spec="${WORKFLOW_SHA}:scripts/ci/classify_ghcr_release_absence.py"
+          [ "$(git cat-file -t "$classifier_spec")" = blob ]
+          expected_blob="$(git rev-parse --verify "$classifier_spec")"
+          policy_root="$(mktemp -d "$RUNNER_TEMP/audited-workflow-policy.XXXXXX")"
+          classifier_path="$policy_root/classify_ghcr_release_absence.py"
+          git show "$classifier_spec" > "$classifier_path"
+          [ "$(git hash-object "$classifier_path")" = "$expected_blob" ] || {
+            echo "::error::Materialized registry policy does not match the audited workflow revision."
+            exit 1
+          }
+          echo "AUDITED_GHCR_ABSENCE_CLASSIFIER=$classifier_path" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         if: steps.children.outputs.ready == 'true'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -1718,7 +1783,7 @@ jobs:
                   return 0
                 fi
                 saw_unknown=true
-              elif python3 scripts/ci/classify_ghcr_release_absence.py "$error_path"; then
+              elif python3 "$AUDITED_GHCR_ABSENCE_CLASSIFIER" "$error_path"; then
                 rm -f "$raw_tmp" "$digest_tmp"
                 if [ "$attempt" -eq 3 ] && [ "$saw_unknown" = false ]; then
                   echo absent > "$state_path"
