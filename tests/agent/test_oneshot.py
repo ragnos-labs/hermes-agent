@@ -15,8 +15,10 @@ from agent.conversation_loop import (
     _require_strict_single_attempt_mode,
     _reserve_strict_output_budget,
 )
+from agent.turn_finalizer import finalize_turn
 from hermes_cli.oneshot import _run_agent as run_cli_oneshot_agent
 from hermes_cli.oneshot import _strict_output_budget
+from run_agent import AIAgent
 
 
 class TestRenderTemplate:
@@ -126,8 +128,102 @@ class TestHelpers:
         assert result["final_response"] == "ok"
         assert agent_type.call_args.kwargs["max_tokens"] == 2000
         assert agent_type.call_args.kwargs["reasoning_config"] == {"enabled": False}
+        assert agent_type.call_args.kwargs["skip_background_review"] is True
         assert fake_agent._strict_output_token_budget == 2000
         assert fake_agent._strict_output_tokens_reserved == 0
+
+    @pytest.mark.parametrize(
+        ("strict_mode", "expected_review_calls"),
+        [(True, 0), (False, 1)],
+    )
+    def test_cli_oneshot_background_review_policy_follows_strict_mode(
+        self, strict_mode, expected_review_calls
+    ):
+        model_config = {"default": "test-model", "max_tokens": 2000}
+        if strict_mode:
+            model_config["output_budget_mode"] = "strict"
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        created = []
+
+        def build_agent(**kwargs):
+            agent = AIAgent(
+                **kwargs,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            agent._spawn_background_review = MagicMock()
+            agent._save_trajectory = MagicMock()
+            agent._cleanup_task_resources = MagicMock()
+            agent._persist_session = MagicMock()
+            agent._session_messages = []
+            agent._file_mutation_verifier_enabled = lambda: False
+            agent.clear_interrupt = MagicMock()
+            agent._stream_callback = None
+            agent._sync_external_memory_for_turn = MagicMock()
+            agent._skill_nudge_interval = 1
+            agent._iters_since_skill = 1
+            agent.valid_tool_names = {"skill_manage"}
+            agent.iteration_budget = MagicMock()
+            agent.iteration_budget.remaining = 100
+            agent.iteration_budget.used = 1
+            agent.iteration_budget.max_total = 100
+            agent.max_iterations = 50
+            agent._emit_status = MagicMock()
+            agent._safe_print = MagicMock()
+            agent._apply_persist_user_message_override = MagicMock()
+            agent.context_compressor = None
+            agent._turn_preflight_display_snapshot = None
+            agent._turn_received_provider_response = False
+            agent._turn_failed_file_mutations = {}
+            agent._db_flush_scan_prefix = None
+
+            def finish_turn(_prompt):
+                finalize_turn(
+                    agent,
+                    final_response="ok",
+                    api_call_count=1,
+                    interrupted=False,
+                    failed=False,
+                    messages=[{"role": "assistant", "content": "ok"}],
+                    conversation_history=[],
+                    effective_task_id="strict-oneshot",
+                    turn_id="strict-oneshot-turn",
+                    user_message="hello",
+                    original_user_message="hello",
+                    _should_review_memory=False,
+                    _turn_exit_reason="text_response(1)",
+                )
+                return {"final_response": "ok"}
+
+            agent.run_conversation = MagicMock(side_effect=finish_turn)
+            agent.shutdown_memory_provider = MagicMock()
+            agent.close = MagicMock()
+            created.append(agent)
+            return agent
+
+        with (
+            patch("hermes_cli.config.load_config", return_value={"model": model_config}),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+            patch("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"),
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot", return_value=None),
+            patch("hermes_cli.oneshot.get_fallback_chain", return_value=[]),
+            patch("run_agent.AIAgent", side_effect=build_agent) as agent_type,
+        ):
+            text, result = run_cli_oneshot_agent("hello")
+
+        assert text == "ok"
+        assert result["final_response"] == "ok"
+        assert agent_type.call_args.kwargs["skip_background_review"] is strict_mode
+        assert created[0].skip_background_review is strict_mode
+        assert created[0]._spawn_background_review.call_count == expected_review_calls
 
     def test_strict_output_budget_accepts_bedrock_wire_cap_once(self):
         agent = MagicMock()
