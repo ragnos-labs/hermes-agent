@@ -68,36 +68,38 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
     if getattr(agent, "request_overrides", None):
         raise RuntimeError("strict output budget rejects provider request overrides")
 
+    cap_keys = {"max_output_tokens", "max_completion_tokens", "max_tokens", "maxTokens"}
+    for sidecar_name in ("extra_body", "extra_json"):
+        sidecar = api_kwargs.get(sidecar_name)
+        if sidecar is None:
+            continue
+        if not isinstance(sidecar, dict):
+            raise RuntimeError("strict output budget rejects non-object request sidecars")
+        pending = [sidecar]
+        while pending:
+            current = pending.pop()
+            for key, value in current.items():
+                if key in cap_keys:
+                    raise RuntimeError(
+                        "strict output budget rejects output caps in request sidecars"
+                    )
+                if isinstance(value, dict):
+                    pending.append(value)
+
     caps: list[int] = []
     for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
         if key not in api_kwargs:
             continue
         raw = api_kwargs[key]
-        if isinstance(raw, bool):
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
             raise RuntimeError("strict output budget requires one positive output cap")
-        try:
-            value = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "strict output budget requires one positive output cap"
-            ) from exc
-        if value <= 0:
-            raise RuntimeError("strict output budget requires one positive output cap")
-        caps.append(value)
+        caps.append(raw)
     inference_config = api_kwargs.get("inferenceConfig")
     if isinstance(inference_config, dict) and "maxTokens" in inference_config:
         raw = inference_config["maxTokens"]
-        if isinstance(raw, bool):
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
             raise RuntimeError("strict output budget requires one positive output cap")
-        try:
-            value = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "strict output budget requires one positive output cap"
-            ) from exc
-        if value <= 0:
-            raise RuntimeError("strict output budget requires one positive output cap")
-        caps.append(value)
+        caps.append(raw)
     if len(caps) != 1:
         raise RuntimeError("strict output budget requires exactly one output cap")
 

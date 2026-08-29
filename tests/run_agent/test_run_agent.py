@@ -3958,6 +3958,77 @@ class TestRunConversation:
         assert agent._strict_output_tokens_reserved == 0
         agent.client.chat.completions.create.assert_not_called()
 
+    @pytest.mark.parametrize("invalid_cap", ["2000", 2000.0, True])
+    def test_strict_oneshot_rejects_non_integer_cap_before_dispatch(
+        self, agent, invalid_cap
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        def replace_cap(_request, callback, **_kwargs):
+            return callback(
+                {"model": agent.model, "messages": [], "max_tokens": invalid_cap}
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=replace_cap,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "sidecar",
+        [
+            {"max_tokens": 5000},
+            {"provider": {"max_completion_tokens": 5000}},
+        ],
+    )
+    def test_strict_oneshot_rejects_sidecar_cap_override_before_dispatch(
+        self, agent, sidecar
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        def add_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    "extra_body": sidecar,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
