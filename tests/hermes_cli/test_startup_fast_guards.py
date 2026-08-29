@@ -272,6 +272,7 @@ def test_strict_yaml_rejects_duplicate_keys_before_effects(
     duplicate_suffixes = (
         "  default: conflicting-model\n",
         "  provider: auto\n",
+        "  output_budget_mode: ordinary\n",
         "  tools: []\n  tools: [delegate_task]\n",
         "agent: {}\nagent: {}\n",
         "model:\n  output_budget_mode: strict\n",
@@ -304,6 +305,43 @@ def test_strict_yaml_rejects_duplicate_keys_before_effects(
             if name in {"hermes_cli.main", "openai", "run_agent", "model_tools"}
         }
         assert after == before
+
+
+def test_nonstrict_duplicate_keys_delegate_to_ordinary_entrypoint(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import entrypoint
+
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  default: ordinary-model\n"
+        "agent: {system_prompt: first}\n"
+        "agent: {system_prompt: second}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    delegated = []
+    monkeypatch.setattr(
+        entrypoint,
+        "_dispatch_ordinary",
+        lambda: delegated.append(True) or 73,
+    )
+    before = {
+        name
+        for name in sys.modules
+        if name in {"hermes_cli.oneshot", "openai", "run_agent", "model_tools"}
+    }
+
+    assert entrypoint.main(["-z", "ordinary prompt"]) == 73
+    assert delegated == [True]
+    after = {
+        name
+        for name in sys.modules
+        if name in {"hermes_cli.oneshot", "openai", "run_agent", "model_tools"}
+    }
+    assert after == before
 
 
 def test_strict_wire_call_is_exactly_one_nonstreaming_request():

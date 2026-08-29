@@ -77,7 +77,9 @@ def _profile_home(argv: Sequence[str], environ: Mapping[str, str]) -> Path:
     return root / "profiles" / active
 
 
-def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+def _read_yaml_mapping(
+    path: Path, *, reject_duplicate_keys: bool = False
+) -> dict[str, Any]:
     try:
         stat_result = path.stat()
     except FileNotFoundError:
@@ -106,15 +108,67 @@ def _read_yaml_mapping(path: Path) -> dict[str, Any]:
                     mapping[key] = self.construct_object(value_node, deep=deep)
                 return mapping
 
-        value = yaml.load(
-            path.read_text(encoding="utf-8"), Loader=_StrictMappingLoader
-        ) or {}
+        text = path.read_text(encoding="utf-8")
+        if reject_duplicate_keys:
+            value = yaml.load(text, Loader=_StrictMappingLoader) or {}
+        else:
+            value = yaml.safe_load(text) or {}
     except Exception:
         raise StrictRejected from None
     if not isinstance(value, dict):
         raise StrictRejected
     _validate_owned_tree(value)
     return value
+
+
+def _strict_marker_occurrences(path: Path) -> list[str | None]:
+    try:
+        stat_result = path.stat()
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise StrictRejected from None
+    if not path.is_file() or stat_result.st_size > _MAX_CONFIG_BYTES:
+        raise StrictRejected
+    try:
+        import yaml
+
+        document = yaml.compose(path.read_text(encoding="utf-8"), Loader=yaml.SafeLoader)
+    except Exception:
+        raise StrictRejected from None
+    if document is None:
+        return []
+
+    occurrences: list[str | None] = []
+    seen: set[int] = set()
+    stack: list[tuple[Any, int]] = [(document, 0)]
+    visited = 0
+    while stack:
+        node, depth = stack.pop()
+        visited += 1
+        if visited > _MAX_CONFIG_NODES or depth > _MAX_CONFIG_DEPTH:
+            raise StrictRejected
+        if isinstance(node, (yaml.MappingNode, yaml.SequenceNode)):
+            identity = id(node)
+            if identity in seen:
+                continue
+            seen.add(identity)
+        if isinstance(node, yaml.MappingNode):
+            for key_node, value_node in node.value:
+                if (
+                    isinstance(key_node, yaml.ScalarNode)
+                    and key_node.value == "output_budget_mode"
+                ):
+                    occurrences.append(
+                        value_node.value
+                        if isinstance(value_node, yaml.ScalarNode)
+                        else None
+                    )
+                stack.append((key_node, depth + 1))
+                stack.append((value_node, depth + 1))
+        elif isinstance(node, yaml.SequenceNode):
+            stack.extend((child, depth + 1) for child in node.value)
+    return occurrences
 
 
 def _validate_owned_tree(root: object) -> None:
@@ -154,13 +208,25 @@ def _deep_merge(left: dict[str, Any], right: Mapping[str, Any]) -> dict[str, Any
 
 def _read_strict_probe(argv: Sequence[str], environ: Mapping[str, str]) -> dict[str, Any] | None:
     home = _profile_home(argv, environ)
-    user = _read_yaml_mapping(home / "config.yaml")
-    managed = _read_yaml_mapping(Path("/etc/hermes/config.yaml"))
+    paths = (home / "config.yaml", Path("/etc/hermes/config.yaml"))
+    markers = [marker for path in paths for marker in _strict_marker_occurrences(path)]
+    if len(markers) > 1 or any(marker is None for marker in markers):
+        raise StrictRejected
+
+    user = _read_yaml_mapping(paths[0])
+    managed = _read_yaml_mapping(paths[1])
     config = _deep_merge(user, managed)
     model = config.get("model")
-    if not isinstance(model, dict) or "output_budget_mode" not in model:
+    merged_mode = model.get("output_budget_mode") if isinstance(model, dict) else None
+    strict_selected = markers == ["strict"] or merged_mode == "strict"
+    if not strict_selected:
         return None
-    if model.get("output_budget_mode") != "strict":
+
+    user = _read_yaml_mapping(paths[0], reject_duplicate_keys=True)
+    managed = _read_yaml_mapping(paths[1], reject_duplicate_keys=True)
+    config = _deep_merge(user, managed)
+    model = config.get("model")
+    if not isinstance(model, dict) or model.get("output_budget_mode") != "strict":
         raise StrictRejected
     return config
 
