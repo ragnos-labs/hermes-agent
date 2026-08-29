@@ -344,6 +344,19 @@ def _strict_output_budget(cfg: dict) -> int | None:
     return raw_budget
 
 
+def _validate_strict_prompt(prompt: object) -> str:
+    """Return a canonical strict prompt or fail before runtime setup."""
+    if not isinstance(prompt, str):
+        raise ValueError("strict one-shot prompt must be a string")
+    try:
+        encoded = prompt.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("strict one-shot prompt must contain ASCII only") from exc
+    if len(encoded) > 8000:
+        raise ValueError("strict one-shot prompt must be at most 8000 bytes")
+    return prompt
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -356,13 +369,17 @@ def _run_agent(
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
-    from hermes_cli.models import detect_provider_for_model
-    from hermes_cli.runtime_provider import resolve_runtime_provider
-    from hermes_cli.tools_config import _get_platform_tools
-    from run_agent import AIAgent
-
     cfg = load_config()
     strict_output_budget = _strict_output_budget(cfg)
+    if strict_output_budget is not None:
+        prompt = _validate_strict_prompt(prompt)
+        if toolsets is not None:
+            raise ValueError("strict one-shot mode does not accept toolsets")
+
+    # Keep effectful runtime and agent imports behind strict prompt admission.
+    from hermes_cli.models import detect_provider_for_model
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from run_agent import AIAgent
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -426,9 +443,14 @@ def _run_agent(
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
-    if toolsets_list is None and use_config_toolsets:
-        toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+    if strict_output_budget is not None:
+        toolsets_list = []
+    else:
+        from hermes_cli.tools_config import _get_platform_tools
+
+        toolsets_list = _normalize_toolsets(toolsets)
+        if toolsets_list is None and use_config_toolsets:
+            toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     # Ensure MCP tools are discovered before building the agent.  Oneshot
     # bypasses cli.py's _prepare_agent_startup MCP background path and
@@ -437,14 +459,19 @@ def _run_agent(
     # registered yet.  This helper starts discovery if needed (idempotent) and
     # bounded-waits with the larger single-query bound (default 15s) because
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    if strict_output_budget is None:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
+
+    session_db = (
+        None
+        if strict_output_budget is not None
+        else _create_session_db_for_oneshot()
     )
-
-    session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -454,7 +481,7 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        _fb = None if strict_output_budget is not None else get_fallback_chain(cfg)
 
         agent = AIAgent(
             api_key=runtime.get("api_key"),
@@ -471,6 +498,8 @@ def _run_agent(
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            skip_context_files=(strict_output_budget is not None),
+            skip_memory=(strict_output_budget is not None),
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             skip_background_review=(strict_output_budget is not None),

@@ -121,22 +121,170 @@ class TestHelpers:
                 },
             ),
             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime),
-            patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
-            patch("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"),
-            patch("hermes_cli.oneshot._create_session_db_for_oneshot", return_value=None),
-            patch("hermes_cli.oneshot.get_fallback_chain", return_value=[]),
+            patch("hermes_cli.tools_config._get_platform_tools") as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
+            patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
             patch("run_agent.AIAgent", return_value=fake_agent) as agent_type,
         ):
-            text, result = run_cli_oneshot_agent("hello")
+            strict_prompt = "a" * 8000
+            text, result = run_cli_oneshot_agent(strict_prompt)
 
         assert text == "ok"
         assert result["final_response"] == "ok"
         assert agent_type.call_args.kwargs["max_tokens"] == 2000
         assert agent_type.call_args.kwargs["reasoning_config"] == {"enabled": False}
         assert agent_type.call_args.kwargs["skip_background_review"] is True
+        assert agent_type.call_args.kwargs["enabled_toolsets"] == []
+        assert agent_type.call_args.kwargs["session_db"] is None
+        assert agent_type.call_args.kwargs["fallback_model"] is None
+        assert agent_type.call_args.kwargs["skip_context_files"] is True
+        assert agent_type.call_args.kwargs["skip_memory"] is True
         assert fake_agent._strict_output_token_budget == 2000
         assert fake_agent._strict_output_tokens_reserved == 0
         assert fake_agent._disable_streaming is True
+        fake_agent.run_conversation.assert_called_once_with(strict_prompt)
+        platform_tools.assert_not_called()
+        mcp_discovery.assert_not_called()
+        session_db.assert_not_called()
+        fallback_chain.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("prompt", "message"),
+        [
+            (None, "must be a string"),
+            ("not-ascii-\N{SNOWMAN}", "ASCII only"),
+            ("a" * 8001, "at most 8000 bytes"),
+        ],
+    )
+    def test_cli_oneshot_rejects_invalid_strict_prompt_before_runtime_setup(
+        self, prompt, message
+    ):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as resolve_runtime,
+            patch("hermes_cli.tools_config._get_platform_tools") as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
+            patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
+            patch("run_agent.AIAgent") as agent_type,
+            pytest.raises(ValueError, match=message),
+        ):
+            run_cli_oneshot_agent(prompt)
+
+        resolve_runtime.assert_not_called()
+        platform_tools.assert_not_called()
+        mcp_discovery.assert_not_called()
+        session_db.assert_not_called()
+        fallback_chain.assert_not_called()
+        agent_type.assert_not_called()
+
+    def test_cli_oneshot_ordinary_mode_preserves_stateful_setup(self):
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+        }
+        fake_agent._session_messages = []
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        session = object()
+        fallback = [{"provider": "other", "model": "backup"}]
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"model": {"default": "test-model"}},
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=runtime,
+            ),
+            patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                return_value={"web"},
+            ) as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch(
+                "hermes_cli.oneshot._create_session_db_for_oneshot",
+                return_value=session,
+            ) as session_db,
+            patch(
+                "hermes_cli.oneshot.get_fallback_chain",
+                return_value=fallback,
+            ) as fallback_chain,
+            patch("run_agent.AIAgent", return_value=fake_agent) as agent_type,
+        ):
+            text, result = run_cli_oneshot_agent("hello")
+
+        assert text == "ok"
+        assert result["completed"] is True
+        assert agent_type.call_args.kwargs["enabled_toolsets"] == ["web"]
+        assert agent_type.call_args.kwargs["session_db"] is session
+        assert agent_type.call_args.kwargs["fallback_model"] == fallback
+        assert agent_type.call_args.kwargs["skip_context_files"] is False
+        assert agent_type.call_args.kwargs["skip_memory"] is False
+        assert agent_type.call_args.kwargs["skip_background_review"] is False
+        platform_tools.assert_called_once()
+        mcp_discovery.assert_called_once()
+        session_db.assert_called_once()
+        fallback_chain.assert_called_once()
+
+    def test_cli_oneshot_rejects_strict_toolsets_before_runtime_setup(self):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as resolve_runtime,
+            patch("hermes_cli.tools_config._get_platform_tools") as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
+            patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
+            patch("run_agent.AIAgent") as agent_type,
+            pytest.raises(ValueError, match="does not accept toolsets"),
+        ):
+            run_cli_oneshot_agent("hello", toolsets=["web"])
+
+        resolve_runtime.assert_not_called()
+        platform_tools.assert_not_called()
+        mcp_discovery.assert_not_called()
+        session_db.assert_not_called()
+        fallback_chain.assert_not_called()
+        agent_type.assert_not_called()
 
     def test_cli_oneshot_strict_failure_never_prints_partial_content(
         self, capsys
@@ -182,11 +330,11 @@ class TestHelpers:
         created = []
 
         def build_agent(**kwargs):
-            agent = AIAgent(
-                **kwargs,
-                skip_context_files=True,
-                skip_memory=True,
-            )
+            # Keep this behavioral harness isolated from local context and
+            # memory while preserving the caller's explicit keyword shape.
+            kwargs["skip_context_files"] = True
+            kwargs["skip_memory"] = True
+            agent = AIAgent(**kwargs)
             agent._spawn_background_review = MagicMock()
             agent._save_trajectory = MagicMock()
             agent._cleanup_task_resources = MagicMock()
