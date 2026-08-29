@@ -69,22 +69,47 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
         raise RuntimeError("strict output budget rejects provider request overrides")
 
     cap_keys = {"max_output_tokens", "max_completion_tokens", "max_tokens", "maxTokens"}
+    max_sidecar_depth = 32
+    max_sidecar_containers = 256
     for sidecar_name in ("extra_body", "extra_json"):
         sidecar = api_kwargs.get(sidecar_name)
         if sidecar is None:
             continue
         if not isinstance(sidecar, dict):
             raise RuntimeError("strict output budget rejects non-object request sidecars")
-        pending = [sidecar]
+        pending: list[tuple[Any, int]] = [(sidecar, 0)]
+        seen_containers: set[int] = set()
         while pending:
-            current = pending.pop()
-            for key, value in current.items():
+            current, depth = pending.pop()
+            if depth > max_sidecar_depth:
+                raise RuntimeError("strict output budget rejects over-deep request sidecars")
+            container_id = id(current)
+            if container_id in seen_containers:
+                raise RuntimeError("strict output budget rejects cyclic request sidecars")
+            seen_containers.add(container_id)
+            if len(seen_containers) > max_sidecar_containers:
+                raise RuntimeError("strict output budget rejects oversized request sidecars")
+
+            if isinstance(current, dict):
+                items = current.items()
+            elif isinstance(current, list):
+                items = ((None, value) for value in current)
+            else:  # pragma: no cover - only containers enter the work list
+                raise RuntimeError("strict output budget rejects invalid request sidecars")
+
+            for key, value in items:
                 if key in cap_keys:
                     raise RuntimeError(
                         "strict output budget rejects output caps in request sidecars"
                     )
-                if isinstance(value, dict):
-                    pending.append(value)
+                if isinstance(value, (dict, list)):
+                    pending.append((value, depth + 1))
+                elif value is not None and not isinstance(
+                    value, (str, int, float, bool)
+                ):
+                    raise RuntimeError(
+                        "strict output budget rejects invalid request sidecars"
+                    )
 
     caps: list[int] = []
     for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
@@ -102,11 +127,15 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
         caps.append(raw)
     if len(caps) != 1:
         raise RuntimeError("strict output budget requires exactly one output cap")
+    attempted = vars(agent).get("_strict_provider_attempted", False)
+    if attempted is not False:
+        raise RuntimeError("strict output budget exhausted after one provider attempt")
 
     reserved = int(getattr(agent, "_strict_output_tokens_reserved", 0) or 0)
     remaining = int(budget) - reserved
     if caps[0] > remaining:
         raise RuntimeError("strict output budget exhausted before provider dispatch")
+    agent._strict_provider_attempted = True
     agent._strict_output_tokens_reserved = reserved + caps[0]
 
 

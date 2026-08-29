@@ -3989,14 +3989,16 @@ class TestRunConversation:
         agent.client.chat.completions.create.assert_not_called()
 
     @pytest.mark.parametrize(
-        "sidecar",
+        ("sidecar_name", "sidecar"),
         [
-            {"max_tokens": 5000},
-            {"provider": {"max_completion_tokens": 5000}},
+            ("extra_body", {"max_tokens": 5000}),
+            ("extra_body", {"provider": {"max_completion_tokens": 5000}}),
+            ("extra_body", {"routing": [{"max_tokens": 5000}]}),
+            ("extra_json", {"routing": [{"maxTokens": 5000}]}),
         ],
     )
     def test_strict_oneshot_rejects_sidecar_cap_override_before_dispatch(
-        self, agent, sidecar
+        self, agent, sidecar_name, sidecar
     ):
         self._setup_agent(agent)
         agent.max_tokens = 2000
@@ -4009,7 +4011,7 @@ class TestRunConversation:
                     "model": agent.model,
                     "messages": [],
                     "max_tokens": 2000,
-                    "extra_body": sidecar,
+                    sidecar_name: sidecar,
                 }
             )
 
@@ -4028,6 +4030,132 @@ class TestRunConversation:
         assert result["failed"] is True
         assert agent._strict_output_tokens_reserved == 0
         agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("sidecar_name", "sidecar"),
+        [
+            ("extra_body", []),
+            ("extra_body", "not-an-object"),
+            ("extra_json", []),
+            ("extra_json", "not-an-object"),
+        ],
+    )
+    def test_strict_oneshot_rejects_non_object_sidecars_before_dispatch(
+        self, agent, sidecar_name, sidecar
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        def add_invalid_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    sidecar_name: sidecar,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_invalid_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize("invalid_shape", ["cycle", "overdeep", "oversized"])
+    def test_strict_oneshot_bounds_sidecar_traversal_before_dispatch(
+        self, agent, invalid_shape
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        if invalid_shape == "cycle":
+            sidecar = {}
+            sidecar["loop"] = [sidecar]
+        elif invalid_shape == "overdeep":
+            sidecar = {}
+            cursor = sidecar
+            for _ in range(34):
+                child = {}
+                cursor["child"] = [child]
+                cursor = child
+        else:
+            sidecar = {"items": [{} for _ in range(257)]}
+
+        def add_invalid_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    "extra_body": sidecar,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_invalid_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_latches_after_one_lowered_provider_attempt(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        tool_call = _mock_tool_call(
+            name="web_search", arguments='{"q":"bounded"}', call_id="strict-1"
+        )
+        first = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tool_call]
+        )
+        second = _mock_response(content="must not run", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        def lower_cap(_request, callback, **_kwargs):
+            return callback({"model": agent.model, "messages": [], "max_tokens": 1000})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=lower_cap,
+            ),
+            patch("run_agent.handle_function_call", return_value="bounded result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 1000
+        assert agent._strict_provider_attempted is True
+        assert agent.client.chat.completions.create.call_count == 1
 
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
