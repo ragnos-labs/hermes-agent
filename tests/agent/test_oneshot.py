@@ -21,6 +21,7 @@ from agent.turn_finalizer import finalize_turn
 from hermes_cli.oneshot import _run_agent as run_cli_oneshot_agent
 from hermes_cli.oneshot import _strict_output_budget
 from hermes_cli.oneshot import run_oneshot as run_cli_oneshot
+from hermes_cli.oneshot import run_strict_oneshot
 from run_agent import AIAgent
 
 
@@ -82,6 +83,97 @@ class TestRunOneshot:
 
 
 class TestHelpers:
+    @staticmethod
+    def _strict_direct_config():
+        return {
+            "model": {
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            },
+            "agent": {"system_prompt": "bounded system prompt"},
+        }
+
+    @staticmethod
+    def _strict_direct_route():
+        return {
+            "model": "synthetic-model",
+            "provider": "custom",
+            "base_url": "https://inference.example.invalid/v1",
+            "api_key": "secret-not-for-output",
+        }
+
+    def test_strict_direct_success_is_one_nonstreaming_fixed_cap_call(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].finish_reason = "stop"
+        response.choices[0].message.content = "synthetic result"
+        response.choices[0].message.refusal = None
+        response.choices[0].message.tool_calls = None
+        response.usage.prompt_tokens = 20
+        response.usage.completion_tokens = 4
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=client) as factory:
+            code, text, usage = run_strict_oneshot(
+                "a" * 8000,
+                config=self._strict_direct_config(),
+                route=self._strict_direct_route(),
+            )
+
+        assert (code, text, usage) == (
+            0,
+            "synthetic result",
+            {"input_tokens": 20, "output_tokens": 4},
+        )
+        factory.assert_called_once_with(
+            api_key="secret-not-for-output",
+            base_url="https://inference.example.invalid/v1",
+            max_retries=0,
+            timeout=300.0,
+        )
+        client.chat.completions.create.assert_called_once()
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 2000
+        assert kwargs["stream"] is False
+        assert kwargs["messages"][0] == {
+            "role": "system",
+            "content": "bounded system prompt",
+        }
+        assert kwargs["messages"][1]["content"] == "a" * 8000
+
+    @pytest.mark.parametrize("failure", ["length", "refusal", "tools", "empty", "usage"])
+    def test_strict_direct_failures_are_content_free(self, failure):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        choice = response.choices[0]
+        choice.finish_reason = "stop"
+        choice.message.content = "private partial text"
+        choice.message.refusal = None
+        choice.message.tool_calls = None
+        response.usage.prompt_tokens = 20
+        response.usage.completion_tokens = 4
+        if failure == "length":
+            choice.finish_reason = "length"
+        elif failure == "refusal":
+            choice.message.refusal = "private refusal"
+        elif failure == "tools":
+            choice.message.tool_calls = [MagicMock()]
+        elif failure == "empty":
+            choice.message.content = ""
+        else:
+            response.usage.prompt_tokens = 8001
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=client):
+            assert run_strict_oneshot(
+                "synthetic prompt",
+                config=self._strict_direct_config(),
+                route=self._strict_direct_route(),
+            ) == (2, "", {})
+        client.chat.completions.create.assert_called_once()
+
     def test_strict_output_budget_requires_exact_2000_model_cap(self):
         assert _strict_output_budget(
             {"model": {"output_budget_mode": "strict", "max_tokens": 2000}}

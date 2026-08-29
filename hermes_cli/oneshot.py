@@ -28,8 +28,19 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
 
-from gateway.session_context import declare_stateless_channel
-from hermes_cli.fallback_config import get_fallback_chain
+
+def declare_stateless_channel() -> None:
+    """Lazy ordinary-mode compatibility seam."""
+    from gateway.session_context import declare_stateless_channel as _declare
+
+    _declare()
+
+
+def get_fallback_chain(cfg: dict):
+    """Lazy ordinary-mode compatibility seam."""
+    from hermes_cli.fallback_config import get_fallback_chain as _get
+
+    return _get(cfg)
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -395,6 +406,97 @@ def _validate_strict_prompt(prompt: object) -> str:
     return prompt
 
 
+def _strict_int_field(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def run_strict_oneshot(
+    prompt: str,
+    *,
+    config: dict,
+    route: dict[str, str],
+) -> tuple[int, str, dict[str, int]]:
+    """Perform the admitted strict operation through one owned wire client.
+
+    Admission and credential selection are owned by ``hermes_cli.entrypoint``.
+    This function performs no discovery, fallback, hooks, tools, persistence,
+    logging, retries, continuation, or cost lookup.  Every non-complete result
+    is content-free to its caller.
+    """
+    prompt = _validate_strict_prompt(prompt)
+    if _strict_output_budget(config) != 2000:
+        return 2, "", {}
+    if set(route) != {"model", "provider", "base_url", "api_key"}:
+        return 2, "", {}
+    if route.get("provider") != "custom":
+        return 2, "", {}
+
+    messages: list[dict[str, str]] = []
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict):
+        system_prompt = agent_cfg.get("system_prompt")
+        if system_prompt is not None:
+            if not isinstance(system_prompt, str):
+                return 2, "", {}
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    client = None
+    try:
+        from agent.process_bootstrap import OpenAI
+
+        client = OpenAI(
+            api_key=route["api_key"],
+            base_url=route["base_url"],
+            max_retries=0,
+            timeout=300.0,
+        )
+        response = client.chat.completions.create(
+            model=route["model"],
+            messages=messages,
+            max_tokens=2000,
+            stream=False,
+        )
+        choices = getattr(response, "choices", None)
+        if not isinstance(choices, list) or len(choices) != 1:
+            return 2, "", {}
+        choice = choices[0]
+        if getattr(choice, "finish_reason", None) != "stop":
+            return 2, "", {}
+        message = getattr(choice, "message", None)
+        if message is None or getattr(message, "refusal", None):
+            return 2, "", {}
+        if getattr(message, "tool_calls", None):
+            return 2, "", {}
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            return 2, "", {}
+
+        raw_usage = getattr(response, "usage", None)
+        input_tokens = _strict_int_field(getattr(raw_usage, "prompt_tokens", None))
+        output_tokens = _strict_int_field(getattr(raw_usage, "completion_tokens", None))
+        if input_tokens is None or output_tokens is None:
+            return 2, "", {}
+        if input_tokens > 8000 or output_tokens > 2000:
+            return 2, "", {}
+        clean = content.encode("utf-8", errors="replace").decode("utf-8")
+        return 0, clean, {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    except BaseException:  # no provider, SDK, response, or credential detail escapes
+        return 2, "", {}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -524,7 +626,10 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = None if strict_output_budget is not None else get_fallback_chain(cfg)
+        if strict_output_budget is None:
+            _fb = get_fallback_chain(cfg)
+        else:
+            _fb = None
 
         agent_kwargs = dict(
             api_key=runtime.get("api_key"),

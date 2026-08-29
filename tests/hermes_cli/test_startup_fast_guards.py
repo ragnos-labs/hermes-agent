@@ -20,6 +20,8 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -104,3 +106,158 @@ def test_fast_version_reports_install_method_stamp(tmp_path):
     result = _run_version({"HERMES_HOME": str(home), "TERMUX_VERSION": ""})
     assert result.returncode == 0, result.stderr
     assert "Install method: git" in result.stdout
+
+
+def _strict_config(home: Path, *, provider: str = "custom") -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  output_budget_mode: strict\n"
+        "  max_tokens: 2000\n"
+        f"  provider: {provider}\n"
+        "  default: synthetic-model\n"
+        "  base_url: https://inference.example.invalid/v1\n"
+        "  api_mode: chat_completions\n"
+        "  key_env: STRICT_TEST_KEY\n",
+        encoding="utf-8",
+    )
+
+
+def test_public_console_script_uses_thin_entrypoint():
+    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'hermes = "hermes_cli.entrypoint:main"' in text
+
+
+def test_strict_rejection_stays_before_ordinary_stack(monkeypatch, tmp_path, capsys):
+    from hermes_cli import entrypoint
+
+    home = tmp_path / ".hermes"
+    _strict_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("STRICT_TEST_KEY", raising=False)
+    before = {name for name in sys.modules if name in {"hermes_cli.main", "run_agent", "model_tools"}}
+
+    assert entrypoint.main(["-z", "synthetic prompt"]) == 2
+    assert capsys.readouterr().err == "strict_cli_rejected\n"
+    after = {name for name in sys.modules if name in {"hermes_cli.main", "run_agent", "model_tools"}}
+    assert after == before
+
+
+def test_strict_success_uses_one_admitted_boundary_without_main(
+    monkeypatch, tmp_path, capsys
+):
+    from hermes_cli import entrypoint
+
+    home = tmp_path / ".hermes"
+    _strict_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("STRICT_TEST_KEY", "secret-not-for-output")
+    captured = {}
+
+    def fake_run(prompt, *, config, route):
+        captured.update(prompt=prompt, config=config, route=route)
+        return 0, "synthetic result", {"input_tokens": 12, "output_tokens": 3}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.oneshot",
+        SimpleNamespace(run_strict_oneshot=fake_run),
+    )
+    before_main = sys.modules.get("hermes_cli.main")
+
+    assert entrypoint.main(["--oneshot=synthetic prompt"]) == 0
+    output = capsys.readouterr()
+    assert output.out == "synthetic result\n"
+    assert output.err == ""
+    assert captured["route"]["model"] == "synthetic-model"
+    assert captured["route"]["api_key"] == "secret-not-for-output"
+    assert sys.modules.get("hermes_cli.main") is before_main
+
+
+def test_strict_route_and_cli_overrides_fail_closed(monkeypatch, tmp_path, capsys):
+    from hermes_cli import entrypoint
+
+    home = tmp_path / ".hermes"
+    _strict_config(home, provider="auto")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("STRICT_TEST_KEY", "secret-not-for-output")
+    assert entrypoint.main(["-z", "synthetic prompt"]) == 2
+    assert capsys.readouterr().err == "strict_cli_rejected\n"
+
+    _strict_config(home)
+    assert entrypoint.main(["-z", "synthetic prompt", "--model", "override"]) == 2
+    assert capsys.readouterr().err == "strict_cli_rejected\n"
+
+
+def test_strict_wire_call_is_exactly_one_nonstreaming_request():
+    from hermes_cli.oneshot import run_strict_oneshot
+
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].finish_reason = "stop"
+    response.choices[0].message.content = "synthetic result"
+    response.choices[0].message.refusal = None
+    response.choices[0].message.tool_calls = None
+    response.usage.prompt_tokens = 20
+    response.usage.completion_tokens = 4
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+    config = {
+        "model": {"output_budget_mode": "strict", "max_tokens": 2000},
+        "agent": {"system_prompt": "bounded system prompt"},
+    }
+    route = {
+        "model": "synthetic-model",
+        "provider": "custom",
+        "base_url": "https://inference.example.invalid/v1",
+        "api_key": "secret-not-for-output",
+    }
+
+    with patch("agent.process_bootstrap.OpenAI", return_value=client) as factory:
+        assert run_strict_oneshot("a" * 8000, config=config, route=route) == (
+            0,
+            "synthetic result",
+            {"input_tokens": 20, "output_tokens": 4},
+        )
+
+    factory.assert_called_once_with(
+        api_key="secret-not-for-output",
+        base_url="https://inference.example.invalid/v1",
+        max_retries=0,
+        timeout=300.0,
+    )
+    client.chat.completions.create.assert_called_once()
+    request = client.chat.completions.create.call_args.kwargs
+    assert request["max_tokens"] == 2000
+    assert request["stream"] is False
+    assert request["messages"][1]["content"] == "a" * 8000
+
+
+def test_strict_wire_failure_never_returns_partial_content():
+    from hermes_cli.oneshot import run_strict_oneshot
+
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].finish_reason = "length"
+    response.choices[0].message.content = "private partial text"
+    response.choices[0].message.refusal = None
+    response.choices[0].message.tool_calls = None
+    response.usage.prompt_tokens = 20
+    response.usage.completion_tokens = 2000
+    client = MagicMock()
+    client.chat.completions.create.return_value = response
+    config = {"model": {"output_budget_mode": "strict", "max_tokens": 2000}}
+    route = {
+        "model": "synthetic-model",
+        "provider": "custom",
+        "base_url": "https://inference.example.invalid/v1",
+        "api_key": "secret-not-for-output",
+    }
+
+    with patch("agent.process_bootstrap.OpenAI", return_value=client):
+        assert run_strict_oneshot("synthetic prompt", config=config, route=route) == (
+            2,
+            "",
+            {},
+        )
+    client.chat.completions.create.assert_called_once()
