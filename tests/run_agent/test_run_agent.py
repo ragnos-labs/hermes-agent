@@ -4186,6 +4186,50 @@ class TestRunConversation:
         assert agent._strict_output_tokens_reserved == 0
         physical_call.assert_not_called()
 
+    def test_strict_oneshot_rejects_moa_before_preparation_or_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.api_mode = "chat_completions"
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        with (
+            patch.object(agent.client.chat.completions, "prepare") as prepare,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "stopped before replay" in result["error"]
+        prepare.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_ordinary_moa_still_prepares_and_dispatches(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.api_mode = "chat_completions"
+        agent.client.chat.completions.prepare.return_value = None
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="ordinary moa", finish_reason="stop"
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "ordinary moa"
+        agent.client.chat.completions.prepare.assert_called_once()
+        agent.client.chat.completions.create.assert_called_once()
+
     def test_strict_oneshot_latches_after_one_lowered_provider_attempt(self, agent):
         self._setup_agent(agent)
         agent.max_tokens = 2000

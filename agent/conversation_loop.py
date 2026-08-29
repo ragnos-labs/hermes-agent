@@ -1625,6 +1625,23 @@ def run_conversation(
     # conversations retain their configured compression behavior.
     if getattr(agent, "_strict_output_token_budget", None) is not None:
         agent.compression_enabled = False
+    try:
+        _require_strict_single_attempt_mode(agent)
+        _require_strict_physical_single_attempt_mode(agent)
+    except RuntimeError as exc:
+        # Fail before turn construction, MoA preparation, or any other helper
+        # can issue a model request.  The same guards remain at the final
+        # dispatch boundary to reject a transport mutated later in the turn.
+        error = f"Strict one-shot request stopped before replay: {exc}"
+        return {
+            "final_response": "",
+            "messages": list(conversation_history or []),
+            "completed": False,
+            "api_calls": 0,
+            "error": error,
+            "partial": False,
+            "failed": True,
+        }
 
     if moa_config is None:
         try:
