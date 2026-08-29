@@ -58,6 +58,183 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
 )
+
+
+def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> None:
+    """Fail closed before a strict one-shot request can exceed its aggregate cap."""
+    budget = getattr(agent, "_strict_output_token_budget", None)
+    if budget is None:
+        return
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget != 2000:
+        raise RuntimeError("strict output budget requires exactly 2000 tokens")
+    if getattr(agent, "request_overrides", None):
+        raise RuntimeError("strict output budget rejects provider request overrides")
+
+    cap_keys = {"max_output_tokens", "max_completion_tokens", "max_tokens", "maxTokens"}
+    max_sidecar_depth = 32
+    max_sidecar_containers = 256
+    max_sidecar_members = 1024
+    seen_containers: set[int] = set()
+    visited_members = 0
+    for sidecar_name in ("extra_body", "extra_json"):
+        sidecar = api_kwargs.get(sidecar_name)
+        if sidecar is None:
+            continue
+        if not isinstance(sidecar, dict):
+            raise RuntimeError("strict output budget rejects non-object request sidecars")
+        pending: list[tuple[Any, int]] = [(sidecar, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if depth > max_sidecar_depth:
+                raise RuntimeError("strict output budget rejects over-deep request sidecars")
+            container_id = id(current)
+            if container_id in seen_containers:
+                raise RuntimeError("strict output budget rejects cyclic request sidecars")
+            seen_containers.add(container_id)
+            if len(seen_containers) > max_sidecar_containers:
+                raise RuntimeError("strict output budget rejects oversized request sidecars")
+
+            if isinstance(current, dict):
+                items = current.items()
+            elif isinstance(current, list):
+                items = ((None, value) for value in current)
+            else:  # pragma: no cover - only containers enter the work list
+                raise RuntimeError("strict output budget rejects invalid request sidecars")
+
+            for key, value in items:
+                visited_members += 1
+                if visited_members > max_sidecar_members:
+                    raise RuntimeError(
+                        "strict output budget rejects oversized request sidecars"
+                    )
+                if key in cap_keys:
+                    raise RuntimeError(
+                        "strict output budget rejects output caps in request sidecars"
+                    )
+                if isinstance(value, (dict, list)):
+                    pending.append((value, depth + 1))
+                elif value is not None and not isinstance(
+                    value, (str, int, float, bool)
+                ):
+                    raise RuntimeError(
+                        "strict output budget rejects invalid request sidecars"
+                    )
+
+    caps: list[int] = []
+    for key in (
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
+        "maxTokens",
+    ):
+        if key not in api_kwargs:
+            continue
+        raw = api_kwargs[key]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise RuntimeError("strict output budget requires one positive output cap")
+        caps.append(raw)
+    inference_config = api_kwargs.get("inferenceConfig")
+    if isinstance(inference_config, dict) and "maxTokens" in inference_config:
+        raw = inference_config["maxTokens"]
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise RuntimeError("strict output budget requires one positive output cap")
+        caps.append(raw)
+    if len(caps) != 1:
+        raise RuntimeError("strict output budget requires exactly one output cap")
+    attempted = vars(agent).get("_strict_provider_attempted", False)
+    if attempted is not False:
+        raise RuntimeError("strict output budget exhausted after one provider attempt")
+
+    reserved = int(getattr(agent, "_strict_output_tokens_reserved", 0) or 0)
+    if reserved != 0 or caps[0] != budget:
+        raise RuntimeError(
+            "strict output budget requires the exact configured output cap"
+        )
+    agent._strict_provider_attempted = True
+    agent._strict_output_tokens_reserved = caps[0]
+
+
+def _require_strict_single_attempt_mode(
+    agent: Any, *, moa_config: dict[str, Any] | None = None
+) -> None:
+    """Reject strict modes whose helper can fan out or retry physical calls."""
+    if getattr(agent, "_strict_output_token_budget", None) is None:
+        return
+    if getattr(agent, "provider", None) == "moa" or moa_config is not None:
+        raise RuntimeError("strict output budget does not support MoA fan-out")
+    api_mode = getattr(agent, "api_mode", None)
+    if api_mode not in {"chat_completions", "bedrock_converse"}:
+        raise RuntimeError(
+            f"strict output budget does not support multi-attempt API mode: {api_mode}"
+        )
+
+
+def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
+    """Admit only a transport whose SDK cannot retry behind the latch."""
+    if getattr(agent, "_strict_output_token_budget", None) is None:
+        return
+    if getattr(agent, "api_mode", None) != "chat_completions":
+        raise RuntimeError(
+            "strict output budget supports only chat_completions physical attempts"
+        )
+    provider = str(getattr(agent, "provider", None) or "").lower()
+    base_url = str(getattr(agent, "base_url", None) or "")
+    client_name = type(getattr(agent, "client", None)).__name__
+    if os.getenv("HERMES_KANBAN_TASK", "").strip():
+        raise RuntimeError("strict output budget does not support Kanban workers")
+    if provider in {"nous", "nous-portal", "nousresearch"} or base_url_host_matches(
+        base_url, "inference-api.nousresearch.com"
+    ):
+        raise RuntimeError("strict output budget does not support Nous")
+    if (
+        provider == "copilot-acp"
+        or base_url.lower().startswith(("acp://copilot", "acp+tcp://"))
+        or client_name == "CopilotACPClient"
+    ):
+        raise RuntimeError("strict output budget does not support Copilot ACP")
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+
+    if client_name == "GeminiNativeClient" or (
+        provider == "gemini" and is_native_gemini_base_url(base_url)
+    ):
+        raise RuntimeError("strict output budget does not support native Gemini")
+
+    # A strict call may use only the direct, non-streaming physical transport.
+    # Requiring an explicit disable flag makes route selection fail closed
+    # instead of quietly bypassing an otherwise active streaming path.
+    if getattr(agent, "_disable_streaming", False) is not True:
+        raise RuntimeError("strict output budget does not support streaming")
+
+    # Relay can rewrite or re-dispatch a provider request inside its managed
+    # execution boundary. Detect the active route without creating a runtime
+    # or session and reject it before any physical attempt.
+    from agent import relay_runtime
+
+    relay = relay_runtime.get_runtime(create=False)
+    if relay is not None and relay.managed_execution_enabled():
+        raise RuntimeError("strict output budget does not support Relay")
+
+
+def _strict_terminal_failure(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    api_call_count: int,
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Return a content-free terminal result for a strict physical attempt."""
+    if getattr(agent, "_strict_output_token_budget", None) is None:
+        return None
+    return {
+        "final_response": "",
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "partial": True,
+        "failed": True,
+        "strict_output_budget": True,
+        "error": f"Strict one-shot request failed: {reason}",
+    }
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -90,7 +267,7 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import CostResult, estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -693,16 +870,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not getattr(agent, "_suppress_external_effects", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -710,12 +888,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # _credits_state already exists). For the plain CLI / any path that didn't seed
     # at build, it primes credits state from /api/oauth/account (or a fixture) on the
     # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+    if not getattr(agent, "_suppress_external_effects", False):
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -1522,6 +1701,38 @@ def run_conversation(
         except Exception:
             pass
 
+    # Strict one-shot execution permits exactly one physical model attempt.
+    # Context compression may use a separate summarization LLM, so disable it
+    # before both the preflight and post-tool compression paths can run.  The
+    # strict attribute is attached only to the bounded one-shot agent; normal
+    # conversations retain their configured compression behavior.
+    if getattr(agent, "_strict_output_token_budget", None) is not None:
+        agent.compression_enabled = False
+        _strict_compressor = getattr(agent, "context_compressor", None)
+        if _strict_compressor is not None:
+            # Post-turn micro-compaction is an auxiliary model/write path.
+            # The strict one-shot agent is isolated and disposable, so disable
+            # it for the entire bounded turn before any finalizer can run.
+            _strict_compressor._micro_compact_enabled = False
+    try:
+        _require_strict_single_attempt_mode(agent, moa_config=moa_config)
+        _require_strict_physical_single_attempt_mode(agent)
+    except RuntimeError as exc:
+        # Fail before turn construction, MoA preparation, or any other helper
+        # can issue a model request.  The same guards remain at the final
+        # dispatch boundary to reject a transport mutated later in the turn.
+        error = f"Strict one-shot request stopped before replay: {exc}"
+        return {
+            "final_response": "",
+            "messages": list(conversation_history or []),
+            "completed": False,
+            "api_calls": 0,
+            "error": error,
+            "partial": False,
+            "failed": True,
+            "strict_output_budget": True,
+        }
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -1544,7 +1755,43 @@ def run_conversation(
     # review fork's own copy of this attribute stays None — reviews don't
     # spawn nested reviews), so this is a no-op on every other run_conversation
     # caller (subagents, the review fork itself, etc).
-    _pending_review = getattr(agent, "_background_review_agent", None)
+    _suppress_external_effects = bool(
+        getattr(agent, "_suppress_external_effects", False)
+    )
+    if _suppress_external_effects:
+        # Deep transport helpers report progress through this per-agent method.
+        # In a Kanban process that method also writes heartbeats/comments; the
+        # strict disposable agent therefore replaces only its own bound method
+        # with an inert callback before any turn helper can reach it.
+        agent._touch_activity = lambda *_args, **_kwargs: None
+        for _callback_name in (
+            "tool_progress_callback",
+            "tool_start_callback",
+            "tool_complete_callback",
+            "thinking_callback",
+            "reasoning_callback",
+            "clarify_callback",
+            "read_terminal_callback",
+            "read_preview_callback",
+            "read_window_below_callback",
+            "setup_mcp_callback",
+            "step_callback",
+            "stream_delta_callback",
+            "interim_assistant_callback",
+            "tool_gen_callback",
+            "status_callback",
+            "notice_callback",
+            "notice_clear_callback",
+            "event_callback",
+            "reaction_callback",
+            "background_review_callback",
+        ):
+            setattr(agent, _callback_name, None)
+    _pending_review = (
+        None
+        if _suppress_external_effects
+        else getattr(agent, "_background_review_agent", None)
+    )
     if _pending_review is not None:
         try:
             _pending_review.interrupt("superseded by a new live turn")
@@ -1557,10 +1804,11 @@ def run_conversation(
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
     # was built at agent init (#67821). No-op when .env is unchanged.
-    try:
-        agent._try_refresh_env_client_credentials()
-    except Exception:
-        logger.debug("per-turn env credential refresh failed", exc_info=True)
+    if not _suppress_external_effects:
+        try:
+            agent._try_refresh_env_client_credentials()
+        except Exception:
+            logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -1704,7 +1952,8 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
-        agent._touch_activity(f"starting API call #{api_call_count}")
+        if not _suppress_external_effects:
+            agent._touch_activity(f"starting API call #{api_call_count}")
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -2087,13 +2336,14 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
-        )
+        if not _suppress_external_effects:
+            api_messages = _apply_context_engine_selection(
+                agent,
+                api_messages,
+                messages,
+                _sel_incoming,
+                logger=request_logger,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2588,35 +2838,42 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
+                if _suppress_external_effects:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+                else:
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
+
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                        )
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
 
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    if (
+                        not _suppress_external_effects
+                        and has_hook("pre_api_request")
+                    ):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -2677,7 +2934,9 @@ def run_conversation(
                 except Exception:
                     pass
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                if not agent._suppress_external_effects and env_var_enabled(
+                    "HERMES_DUMP_REQUESTS"
+                ):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it
@@ -2741,6 +3000,8 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    _require_strict_single_attempt_mode(agent, moa_config=moa_config)
+                    _require_strict_physical_single_attempt_mode(agent)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2748,6 +3009,14 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    _reserve_strict_output_budget(agent, next_api_kwargs)
+                    if getattr(agent, "_strict_output_token_budget", None) is not None:
+                        # Strict one-shot mode permits one physical provider
+                        # attempt only. Bypass streaming's internal retries,
+                        # Bedrock's stream-to-converse fallback, and Relay's
+                        # post-validation request rewrite. Any exception is
+                        # terminal in the strict branch below.
+                        return agent._interruptible_api_call(next_api_kwargs)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2775,8 +3044,6 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2787,22 +3054,27 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    if _suppress_external_effects:
+                        response = _perform_api_call(api_kwargs)
+                    else:
+                        from hermes_cli.middleware import run_llm_execution_middleware
+
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -2930,6 +3202,14 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    _strict_failure = _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="invalid provider response",
+                    )
+                    if _strict_failure is not None:
+                        return _strict_failure
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -3157,6 +3437,40 @@ def run_conversation(
                         )
                         finish_reason = "length"
 
+                # Strict chat-completions responses are already normalized at
+                # this point. Reject every non-final, tool-bearing, or empty
+                # result before usage hooks, fallback bookkeeping, or any
+                # other post-response auxiliary path can run.
+                if (
+                    getattr(agent, "_strict_output_token_budget", None) is not None
+                    and finish_reason not in {"content_filter", "length"}
+                ):
+                    _strict_has_text = agent._has_content_after_think_block(
+                        assistant_message.content or ""
+                    )
+                    _strict_provider_data = assistant_message.provider_data or {}
+                    _strict_refusal = _strict_provider_data.get("refusal")
+                    if (
+                        assistant_message.tool_calls
+                        or finish_reason != "stop"
+                        or not _strict_has_text
+                        or (
+                            isinstance(_strict_refusal, str)
+                            and bool(_strict_refusal.strip())
+                        )
+                    ):
+                        return _strict_terminal_failure(
+                            agent,
+                            messages,
+                            api_call_count,
+                            reason=(
+                                "provider refusal"
+                                if isinstance(_strict_refusal, str)
+                                and bool(_strict_refusal.strip())
+                                else "non-terminal or empty provider response"
+                            ),
+                        )
+
                 # ── Content-policy refusal (HTTP 200) ──────────────────
                 # The model — or the provider's safety system — returned a
                 # *successful* response whose stop/finish reason is a refusal:
@@ -3172,6 +3486,14 @@ def run_conversation(
                 # exception-based ``content_policy_blocked`` recovery: try a
                 # configured fallback once, otherwise return the refusal.
                 if finish_reason == "content_filter":
+                    _strict_failure = _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="provider refusal",
+                    )
+                    if _strict_failure is not None:
+                        return _strict_failure
                     _refusal_transport = agent._get_transport()
                     if agent.api_mode == "anthropic_messages":
                         _refusal_result = _refusal_transport.normalize_response(
@@ -3251,7 +3573,8 @@ def run_conversation(
                         f"{_CONTENT_POLICY_RECOVERY_HINT}"
                     )
 
-                    agent._cleanup_task_resources(effective_task_id)
+                    if not _suppress_external_effects:
+                        agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     return _content_policy_blocked_result(
                         messages,
@@ -3261,6 +3584,14 @@ def run_conversation(
                     )
 
                 if finish_reason == "length":
+                    _strict_failure = _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="output ceiling reached",
+                    )
+                    if _strict_failure is not None:
+                        return _strict_failure
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Response truncated — stream "
@@ -3344,7 +3675,8 @@ def run_conversation(
                             "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
-                        agent._cleanup_task_resources(effective_task_id)
+                        if not _suppress_external_effects:
+                            agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _exhaust_response,
@@ -3414,6 +3746,12 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
+                            _strict_length_stop = (
+                                getattr(agent, "_strict_output_token_budget", None)
+                                is not None
+                            )
+                            if _strict_length_stop:
+                                length_continue_retries = 4
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
                             # must not be appended as an interim assistant
@@ -3481,12 +3819,20 @@ def run_conversation(
 
                             partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
                             if partial_response:
-                                agent._vprint(
-                                    f"{agent.log_prefix}⚠️  Response still truncated "
-                                    f"after 4 continuation attempts — keeping the "
-                                    f"partial response received so far.",
-                                    force=True,
-                                )
+                                if _strict_length_stop:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Strict one-shot response "
+                                        f"reached its output ceiling — keeping the partial "
+                                        f"response without continuation.",
+                                        force=True,
+                                    )
+                                else:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Response still truncated "
+                                        f"after 4 continuation attempts — keeping the "
+                                        f"partial response received so far.",
+                                        force=True,
+                                    )
                             # Unanswered continue nudges made every later turn re-truncate.
                             _turn_start = (
                                 current_turn_user_idx + 1
@@ -3511,15 +3857,22 @@ def run_conversation(
                                     "finish_reason": "length",
                                 })
                             agent._session_messages = messages
-                            agent._cleanup_task_resources(effective_task_id)
+                            if not _suppress_external_effects:
+                                agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
-                                "final_response": partial_response or None,
+                                "final_response": "" if _strict_length_stop else partial_response or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response remained truncated after 4 continuation attempts",
+                                "failed": _strict_length_stop,
+                                "strict_output_budget": _strict_length_stop,
+                                "error": (
+                                    "Strict one-shot output ceiling reached; no continuation attempted"
+                                    if _strict_length_stop
+                                    else "Response remained truncated after 4 continuation attempts"
+                                ),
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
@@ -3528,7 +3881,10 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
-                            if truncated_tool_call_retries < 4:
+                            if (
+                                truncated_tool_call_retries < 4
+                                and getattr(agent, "_strict_output_token_budget", None) is None
+                            ):
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
                                     # The stream broke mid tool-call (network /
@@ -3571,7 +3927,8 @@ def run_conversation(
                                     f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
                                 )
-                            agent._cleanup_task_resources(effective_task_id)
+                            if not _suppress_external_effects:
+                                agent._cleanup_task_resources(effective_task_id)
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
@@ -3597,7 +3954,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
                         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
 
-                        agent._cleanup_task_resources(effective_task_id)
+                        if not _suppress_external_effects:
+                            agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
                         return {
@@ -3711,7 +4069,14 @@ def run_conversation(
                     # from the error message), not guessed probe tiers.
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
-                        if getattr(agent.context_compressor, "_context_probe_persistable", False):
+                        if (
+                            not _suppress_external_effects
+                            and getattr(
+                                agent.context_compressor,
+                                "_context_probe_persistable",
+                                False,
+                            )
+                        ):
                             save_context_length(agent.model, agent.base_url, ctx)
                             agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
                         agent.context_compressor._context_probed = False
@@ -3754,13 +4119,25 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
-                        _agg_cost_model,
-                        aggregator_usage,
-                        provider=_agg_cost_provider,
-                        base_url=_agg_cost_base_url,
-                        api_key=getattr(agent, "api_key", ""),
-                    )
+                    if _suppress_external_effects:
+                        # Dynamic pricing helpers may refresh provider model
+                        # metadata over the network. The strict receipt reports
+                        # cost as unavailable rather than fabricating a value or
+                        # issuing a second outbound request.
+                        cost_result = CostResult(
+                            amount_usd=None,
+                            status="unknown",
+                            source="none",
+                            label="n/a",
+                        )
+                    else:
+                        cost_result = estimate_usage_cost(
+                            _agg_cost_model,
+                            aggregator_usage,
+                            provider=_agg_cost_provider,
+                            base_url=_agg_cost_base_url,
+                            api_key=getattr(agent, "api_key", ""),
+                        )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -3873,13 +4250,15 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
-                from agent import relay_llm
+                if not _suppress_external_effects:
+                    from agent import relay_llm
 
-                relay_llm.complete_logical_call(
-                    api_request_id,
-                    outcome="success",
-                )
-                agent._touch_activity(f"API call #{api_call_count} completed")
+                    relay_llm.complete_logical_call(
+                        api_request_id,
+                        outcome="success",
+                    )
+                if not _suppress_external_effects:
+                    agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -3924,6 +4303,20 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if getattr(agent, "_strict_output_token_budget", None) is not None:
+                    _strict_error = "Strict one-shot output budget stopped before replay"
+                    close_interrupted_tool_sequence(messages, _strict_error)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": "",
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "strict_output_budget": True,
+                        "error": _strict_error,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -6179,12 +6572,28 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            if getattr(agent, "_strict_output_token_budget", None) is not None:
+                _strict_has_text = agent._has_content_after_think_block(
+                    assistant_message.content or ""
+                )
+                if (
+                    assistant_message.tool_calls
+                    or finish_reason != "stop"
+                    or not _strict_has_text
+                ):
+                    return _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="non-terminal or empty provider response",
+                    )
+
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                if not _suppress_external_effects and has_hook("post_api_request"):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
@@ -6269,7 +6678,8 @@ def run_conversation(
                     agent._incomplete_scratchpad_retries = 0
                     
                     rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
-                    agent._cleanup_task_resources(effective_task_id)
+                    if not _suppress_external_effects:
+                        agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     
                     return {
@@ -6427,6 +6837,24 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                if getattr(agent, "_strict_output_token_budget", None) is not None:
+                    # The admitted strict one-shot profile is no-tools. Even a
+                    # seemingly local tool can reach an auxiliary model through
+                    # delegation, vision, browser summarization, MCP sampling,
+                    # approval review, or speech rewriting. Stop before every
+                    # tool dispatcher so no child, auxiliary, or tool effect can
+                    # escape the single physical model-attempt latch.
+                    error = "Strict one-shot output ceiling does not permit tool execution"
+                    return {
+                        "final_response": "",
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": error,
+                        "partial": True,
+                        "failed": True,
+                        "strict_output_budget": True,
+                    }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -6581,7 +7009,8 @@ def run_conversation(
                             force=True,
                         )
                         agent._invalid_json_retries = 0
-                        agent._cleanup_task_resources(effective_task_id)
+                        if not _suppress_external_effects:
+                            agent._cleanup_task_resources(effective_task_id)
                         _final_response = "Response truncated due to output length limit"
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
@@ -7459,6 +7888,11 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
+                if getattr(agent, "_strict_output_token_budget", None) is not None:
+                    messages.append(final_msg)
+                    _turn_exit_reason = "strict_text_response"
+                    break
+
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
                 # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
@@ -7726,6 +8160,14 @@ def run_conversation(
                 break
             
         except Exception as e:
+            _strict_failure = _strict_terminal_failure(
+                agent,
+                messages,
+                api_call_count,
+                reason="response processing failure",
+            )
+            if _strict_failure is not None:
+                return _strict_failure
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.

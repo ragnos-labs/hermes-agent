@@ -617,7 +617,13 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
-    _install_safe_stdio()
+    # Strict one-shot sets this per-instance marker before __init__. Ordinary
+    # agents default false; no process-global plugin state is changed.
+    agent._suppress_external_effects = bool(
+        getattr(agent, "_suppress_external_effects", False)
+    )
+    if not agent._suppress_external_effects:
+        _install_safe_stdio()
 
     agent.model = model
     agent.max_iterations = max_iterations
@@ -785,7 +791,8 @@ def init_agent(
     # AIAgent is created for every gateway request, so without the guard
     # each message leaks one OS thread and the process eventually exhausts
     # the system thread limit (RuntimeError: can't start new thread).
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    if not agent._suppress_external_effects and \
+            (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -963,7 +970,7 @@ def init_agent(
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.
-    agent._skip_mcp_refresh = False
+    agent._skip_mcp_refresh = agent._suppress_external_effects
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -990,24 +997,26 @@ def init_agent(
     # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.
-    from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    if not agent._suppress_external_effects:
+        from hermes_logging import setup_logging, setup_verbose_logging
 
-    if agent.verbose_logging:
-        setup_verbose_logging()
-        _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
-    elif agent.quiet_mode:
-        # In quiet mode (CLI default), keep console output clean —
-        # but DO NOT raise per-logger levels. Doing so prevents the
-        # root logger's file handlers (agent.log, errors.log) from
-        # ever seeing the records, because Python checks
-        # logger.isEnabledFor() before handler propagation. We rely
-        # on the fact that hermes_logging.setup_logging() does not
-        # install a console StreamHandler in quiet mode — so INFO
-        # records flow to the file handlers but never reach a
-        # console. Any future noise reduction belongs at the
-        # handler level inside hermes_logging.py, not here.
-        pass
+        setup_logging(hermes_home=_ra()._hermes_home)
+
+        if agent.verbose_logging:
+            setup_verbose_logging()
+            _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
+        elif agent.quiet_mode:
+            # In quiet mode (CLI default), keep console output clean —
+            # but DO NOT raise per-logger levels. Doing so prevents the
+            # root logger's file handlers (agent.log, errors.log) from
+            # ever seeing the records, because Python checks
+            # logger.isEnabledFor() before handler propagation. We rely
+            # on the fact that hermes_logging.setup_logging() does not
+            # install a console StreamHandler in quiet mode — so INFO
+            # records flow to the file handlers but never reach a
+            # console. Any future noise reduction belongs at the
+            # handler level inside hermes_logging.py, not here.
+            pass
     
     # Internal stream callback (set during streaming TTS).
     # Initialized here so _vprint can reference it before run_conversation.
@@ -1480,12 +1489,13 @@ def init_agent(
     # A multiplexed gateway may enter a different HERMES_HOME after
     # ``model_tools`` was first imported. Ensure that profile's keyed plugin
     # manager has discovered its registrations before taking the tool snapshot.
-    try:
-        from hermes_cli.plugins import discover_plugins
+    if not agent._suppress_external_effects:
+        try:
+            from hermes_cli.plugins import discover_plugins
 
-        discover_plugins()
-    except Exception:
-        logger.warning("Plugin discovery failed during agent setup", exc_info=True)
+            discover_plugins()
+        except Exception:
+            logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
@@ -1568,38 +1578,41 @@ def init_agent(
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
     # fallback synchronized because different tool paths still read both.
-    try:
-        from gateway.session_context import set_current_session_id
-
-        set_current_session_id(agent.session_id)
-    except Exception:
-        # Preserve the root-agent legacy fallback, but never let delegated
-        # construction publish a child ID process-wide even if the ContextVar
-        # bridge itself failed to import.
+    if not agent._suppress_external_effects:
         try:
-            from agent.delegation_context import is_delegated_child_context
+            from gateway.session_context import set_current_session_id
 
-            delegated_child = is_delegated_child_context()
+            set_current_session_id(agent.session_id)
         except Exception:
-            delegated_child = False
-        if not delegated_child:
-            os.environ["HERMES_SESSION_ID"] = agent.session_id
+            # Preserve the root-agent legacy fallback, but never let delegated
+            # construction publish a child ID process-wide even if the ContextVar
+            # bridge itself failed to import.
+            try:
+                from agent.delegation_context import is_delegated_child_context
+
+                delegated_child = is_delegated_child_context()
+            except Exception:
+                delegated_child = False
+            if not delegated_child:
+                os.environ["HERMES_SESSION_ID"] = agent.session_id
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if not agent._suppress_external_effects:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
     # reads the JSON files directly.  See run_agent._save_session_log.
     agent._session_json_enabled = False
-    try:
-        from hermes_cli.config import load_config_readonly as _load_sess_cfg
-        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
-    except Exception:
-        pass
+    if not agent._suppress_external_effects:
+        try:
+            from hermes_cli.config import load_config_readonly as _load_sess_cfg
+            _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+            agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        except Exception:
+            pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
     
@@ -1662,7 +1675,7 @@ def init_agent(
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = agent._suppress_external_effects
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1853,8 +1866,9 @@ def init_agent(
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
-    _inject_memory_provider_tools(agent)
+    if not agent._suppress_external_effects:
+        from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
+        _inject_memory_provider_tools(agent)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -1893,7 +1907,11 @@ def init_agent(
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
     # are noisy.
-    agent._environment_probe = bool(_agent_section.get("environment_probe", True))
+    agent._environment_probe = (
+        False
+        if agent._suppress_external_effects
+        else bool(_agent_section.get("environment_probe", True))
+    )
     # Warm the probe off-thread: it shells out to python3/pip (~0.5s of
     # subprocess round-trips) and its result lands in the FIRST system
     # prompt build, which sits on the time-to-first-token critical path.
@@ -2479,10 +2497,14 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
-    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
-        _config_context_length
-    )
-    if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
+    _lmstudio_runtime_context_length = None
+    if not agent._suppress_external_effects:
+        _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+            _config_context_length
+        )
+    if not agent._suppress_external_effects and agent._lmstudio_load_was_unverified(
+        _lmstudio_runtime_context_length
+    ):
         _ra().logger.warning(
             "LM Studio model activation was rejected or completed without a "
             "verifiable active context length; falling back to configured context"
@@ -2502,11 +2524,12 @@ def init_agent(
     _selected_engine = None
     _copy_failed = False
     _engine_name = "compressor"  # default
-    try:
-        _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-    except Exception:
-        pass
+    if not agent._suppress_external_effects:
+        try:
+            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+            _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+        except Exception:
+            pass
 
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
@@ -2739,7 +2762,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not agent._suppress_external_effects
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,

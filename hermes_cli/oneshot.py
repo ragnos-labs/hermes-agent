@@ -28,8 +28,19 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
 
-from gateway.session_context import declare_stateless_channel
-from hermes_cli.fallback_config import get_fallback_chain
+
+def declare_stateless_channel() -> None:
+    """Lazy ordinary-mode compatibility seam."""
+    from gateway.session_context import declare_stateless_channel as _declare
+
+    _declare()
+
+
+def get_fallback_chain(cfg: dict):
+    """Lazy ordinary-mode compatibility seam."""
+    from hermes_cli.fallback_config import get_fallback_chain as _get
+
+    return _get(cfg)
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -190,12 +201,29 @@ def run_oneshot(
 
     Returns the exit code.  The caller owns process termination.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
+    # Strict one-shot admission happens at the public boundary.  Nothing below
+    # this point may resolve providers, discover tools/MCP, create session
+    # state, register a stateless channel, or mutate process environment until
+    # the caller-controlled prompt and toolset request have been rejected or
+    # accepted.
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    try:
+        strict_output_budget = _strict_output_budget(cfg)
+        if strict_output_budget is not None:
+            prompt = _validate_strict_prompt(prompt)
+            if toolsets is not None:
+                raise ValueError("strict one-shot mode does not accept toolsets")
+            if usage_file is not None:
+                raise ValueError("strict one-shot mode does not accept usage_file")
+            if os.getenv("HERMES_KANBAN_TASK", "").strip():
+                raise ValueError(
+                    "strict one-shot mode does not accept HERMES_KANBAN_TASK"
+                )
+    except ValueError as exc:
+        sys.stderr.write(f"hermes -z: {exc}\n")
+        return 2
 
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
@@ -210,37 +238,42 @@ def run_oneshot(
         )
         return 2
 
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
-        return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+    if strict_output_budget is not None:
+        explicit_toolsets = []
+        use_config_toolsets = False
+    else:
+        # Silence every stdlib logger for the duration. AIAgent, tools, and
+        # provider adapters all log to stderr through the root logger.
+        logging.disable(logging.CRITICAL)
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
-    os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+        # Auto-approve any shell / tool approvals. Non-interactive by
+        # definition — a prompt would hang forever.
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
-    # One-shot prints a single final response and exits: there is no later turn
-    # for a detached subagent's completion to re-enter, and nothing here drains
-    # process_registry.completion_queue (only cli.py's interactive process_loop
-    # and the gateway watchers do). Left unbound, async_delivery_supported()
-    # defaults True, delegate_task is forced background, and every subagent
-    # result is discarded. Declaring the channel stateless routes delegate_task
-    # to its inline/synchronous path. See declare_stateless_channel().
-    declare_stateless_channel()
+        # One-shot prints a single final response and exits: there is no later
+        # turn for detached subagent completion to re-enter. Ordinary oneshot
+        # therefore binds the stateless channel; strict mode has no tools.
+        declare_stateless_channel()
 
-    # Redirect stderr AND stdout to devnull for the entire call tree.
-    # We'll print the final response to the real stdout at the end.
+    # Capture stderr and stdout for ordinary one-shot execution. Strict mode
+    # must not replace process-global stdio, even temporarily; its isolated
+    # agent has no print/callback surfaces and writes only the final admitted
+    # response below.
     real_stdout = sys.stdout
     real_stderr = sys.stderr
-    devnull = open(os.devnull, "w", encoding="utf-8")
+    output_sink = None
 
     response: Optional[str] = None
     result: dict = {}
     failure: BaseException | None = None
     try:
-        with redirect_stdout(devnull), redirect_stderr(devnull):
+        if strict_output_budget is not None:
             try:
                 response, result = _run_agent(
                     prompt,
@@ -248,6 +281,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    config=cfg,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -258,11 +292,26 @@ def run_oneshot(
                 # cron / SSH / subprocess context is the worst failure mode.
                 # See #30623.
                 failure = exc
+        else:
+            output_sink = open(os.devnull, "w", encoding="utf-8")
+            with redirect_stdout(output_sink), redirect_stderr(output_sink):
+                try:
+                    response, result = _run_agent(
+                        prompt,
+                        model=model,
+                        provider=provider,
+                        toolsets=explicit_toolsets,
+                        use_config_toolsets=use_config_toolsets,
+                        config=cfg,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    failure = exc
     finally:
-        try:
-            devnull.close()
-        except Exception:
-            pass
+        if output_sink is not None:
+            try:
+                output_sink.close()
+            except Exception:
+                pass
 
     if failure is not None:
         # Re-raise control-flow exceptions so the parent handles them as usual
@@ -276,6 +325,13 @@ def run_oneshot(
         return 1
 
     _write_usage_file(usage_file, result)
+
+    if result.get("strict_output_budget") and (
+        result.get("failed") or result.get("partial") or not result.get("completed", False)
+    ):
+        # Never print provider text from a bounded failure, even if an inner
+        # adapter accidentally returned partial content alongside the failure.
+        return 2
 
     # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
     # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
@@ -319,24 +375,156 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _strict_output_budget(cfg: dict) -> int | None:
+    """Return the one-shot aggregate output budget, when strict mode is enabled."""
+    model_cfg = cfg.get("model") or {}
+    if not isinstance(model_cfg, dict):
+        return None
+    mode = model_cfg.get("output_budget_mode")
+    if mode is None:
+        return None
+    if mode != "strict":
+        raise ValueError("model.output_budget_mode must be 'strict' when set")
+    raw_budget = model_cfg.get("max_tokens")
+    if isinstance(raw_budget, bool) or not isinstance(raw_budget, int) or raw_budget != 2000:
+        raise ValueError(
+            "strict one-shot output budgeting requires model.max_tokens == 2000"
+        )
+    return raw_budget
+
+
+def _validate_strict_prompt(prompt: object) -> str:
+    """Return a canonical strict prompt or fail before runtime setup."""
+    if not isinstance(prompt, str):
+        raise ValueError("strict one-shot prompt must be a string")
+    try:
+        encoded = prompt.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("strict one-shot prompt must contain ASCII only") from exc
+    if len(encoded) > 8000:
+        raise ValueError("strict one-shot prompt must be at most 8000 bytes")
+    return prompt
+
+
+def _strict_int_field(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def run_strict_oneshot(
+    prompt: str,
+    *,
+    config: dict,
+    route: dict[str, str],
+) -> tuple[int, str, dict[str, int]]:
+    """Perform the admitted strict operation through one owned wire client.
+
+    Admission and credential selection are owned by ``hermes_cli.entrypoint``.
+    This function performs no discovery, fallback, hooks, tools, persistence,
+    logging, retries, continuation, or cost lookup.  Every non-complete result
+    is content-free to its caller.
+    """
+    prompt = _validate_strict_prompt(prompt)
+    if _strict_output_budget(config) != 2000:
+        return 2, "", {}
+    if set(route) != {"model", "provider", "base_url", "api_key"}:
+        return 2, "", {}
+    if route.get("provider") != "custom":
+        return 2, "", {}
+
+    messages: list[dict[str, str]] = []
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict):
+        system_prompt = agent_cfg.get("system_prompt")
+        if system_prompt is not None:
+            if not isinstance(system_prompt, str):
+                return 2, "", {}
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    client = None
+    try:
+        from agent.process_bootstrap import OpenAI
+
+        client = OpenAI(
+            api_key=route["api_key"],
+            base_url=route["base_url"],
+            max_retries=0,
+            timeout=300.0,
+        )
+        response = client.chat.completions.create(
+            model=route["model"],
+            messages=messages,
+            max_tokens=2000,
+            stream=False,
+        )
+        choices = getattr(response, "choices", None)
+        if not isinstance(choices, list) or len(choices) != 1:
+            return 2, "", {}
+        choice = choices[0]
+        if getattr(choice, "finish_reason", None) != "stop":
+            return 2, "", {}
+        message = getattr(choice, "message", None)
+        if message is None or getattr(message, "refusal", None):
+            return 2, "", {}
+        if getattr(message, "tool_calls", None):
+            return 2, "", {}
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            return 2, "", {}
+
+        raw_usage = getattr(response, "usage", None)
+        input_tokens = _strict_int_field(getattr(raw_usage, "prompt_tokens", None))
+        output_tokens = _strict_int_field(getattr(raw_usage, "completion_tokens", None))
+        if input_tokens is None or output_tokens is None:
+            return 2, "", {}
+        if input_tokens > 8000 or output_tokens > 2000:
+            return 2, "", {}
+        clean = content.encode("utf-8", errors="replace").decode("utf-8")
+        return 0, clean, {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    except BaseException:  # no provider, SDK, response, or credential detail escapes
+        return 2, "", {}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    config: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
+    cfg = config if config is not None else load_config()
+    strict_output_budget = _strict_output_budget(cfg)
+    if strict_output_budget is not None:
+        prompt = _validate_strict_prompt(prompt)
+        if toolsets is not None:
+            raise ValueError("strict one-shot mode does not accept toolsets")
+        if os.getenv("HERMES_KANBAN_TASK", "").strip():
+            raise ValueError(
+                "strict one-shot mode does not accept HERMES_KANBAN_TASK"
+            )
+
+    # Keep effectful runtime and agent imports behind strict prompt admission.
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
-    from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
-
-    cfg = load_config()
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -400,9 +588,14 @@ def _run_agent(
     # Pull in explicit toolsets when provided; otherwise use whatever the user
     # has enabled for "cli". sorted() gives stable ordering for config-derived
     # sets; explicit values preserve user order.
-    toolsets_list = _normalize_toolsets(toolsets)
-    if toolsets_list is None and use_config_toolsets:
-        toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+    if strict_output_budget is not None:
+        toolsets_list = []
+    else:
+        from hermes_cli.tools_config import _get_platform_tools
+
+        toolsets_list = _normalize_toolsets(toolsets)
+        if toolsets_list is None and use_config_toolsets:
+            toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
     # Ensure MCP tools are discovered before building the agent.  Oneshot
     # bypasses cli.py's _prepare_agent_startup MCP background path and
@@ -411,14 +604,19 @@ def _run_agent(
     # registered yet.  This helper starts discovery if needed (idempotent) and
     # bounded-waits with the larger single-query bound (default 15s) because
     # there is only ONE turn and no between-turns late-binding refresh (#38448).
-    from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+    if strict_output_budget is None:
+        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-    ensure_mcp_discovery_before_agent_build(
-        logger=logging.getLogger(__name__),
-        single_query=True,
+        ensure_mcp_discovery_before_agent_build(
+            logger=logging.getLogger(__name__),
+            single_query=True,
+        )
+
+    session_db = (
+        None
+        if strict_output_budget is not None
+        else _create_session_db_for_oneshot()
     )
-
-    session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -428,21 +626,31 @@ def _run_agent(
         # Read the effective fallback chain from profile config so oneshot
         # workers honour the same merge semantics as interactive CLI and
         # gateway sessions.
-        _fb = get_fallback_chain(cfg)
+        if strict_output_budget is None:
+            _fb = get_fallback_chain(cfg)
+        else:
+            _fb = None
 
-        agent = AIAgent(
+        agent_kwargs = dict(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            max_tokens=strict_output_budget,
+            reasoning_config=(
+                {"enabled": False} if strict_output_budget is not None else None
+            ),
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            skip_context_files=(strict_output_budget is not None),
+            skip_memory=(strict_output_budget is not None),
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            skip_background_review=(strict_output_budget is not None),
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction
@@ -454,8 +662,67 @@ def _run_agent(
             #                (set above); also falls back to deny on non-tty
             #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
             #   - skill secret capture → returns gracefully when no callback set
-            clarify_callback=_oneshot_clarify_callback,
+            clarify_callback=(
+                None
+                if strict_output_budget is not None
+                else _oneshot_clarify_callback
+            ),
         )
+
+        if strict_output_budget is not None and isinstance(AIAgent, type):
+            # The suppression marker must exist before init_agent() executes,
+            # because configured plugin/context-engine construction happens
+            # during initialization.  Constructing this one instance through
+            # the class' normal __new__/__init__ pair keeps the flag per-agent;
+            # it does not mutate AIAgent or any process-global registry.
+            agent = AIAgent.__new__(AIAgent)
+            agent._suppress_external_effects = True
+            AIAgent.__init__(agent, **agent_kwargs)
+        else:
+            agent = AIAgent(**agent_kwargs)
+            if strict_output_budget is not None:
+                # Test doubles may be callable factories rather than classes.
+                # Production AIAgent always takes the pre-init path above.
+                agent._suppress_external_effects = True
+
+        if strict_output_budget is not None:
+            # Consumed at the final dispatch boundary. Ordinary chat, gateway,
+            # and subagent runs never set this one-shot-only contract.
+            agent._strict_output_token_budget = strict_output_budget
+            agent._strict_output_tokens_reserved = 0
+            # The strict transport guard requires streaming to be disabled as
+            # an explicit route property. It must never silently bypass an
+            # otherwise-enabled streaming path at the dispatch boundary.
+            agent._disable_streaming = True
+            agent._skip_mcp_refresh = True
+            agent._persist_disabled = True
+
+            # No callback surface is available in strict mode.  These are all
+            # existing supported per-agent callback attributes; ordinary mode
+            # retains its existing wiring.
+            for callback_name in (
+                "tool_progress_callback",
+                "tool_start_callback",
+                "tool_complete_callback",
+                "thinking_callback",
+                "reasoning_callback",
+                "clarify_callback",
+                "read_terminal_callback",
+                "read_preview_callback",
+                "read_window_below_callback",
+                "setup_mcp_callback",
+                "step_callback",
+                "stream_delta_callback",
+                "interim_assistant_callback",
+                "tool_gen_callback",
+                "status_callback",
+                "notice_callback",
+                "notice_clear_callback",
+                "event_callback",
+                "reaction_callback",
+                "background_review_callback",
+            ):
+                setattr(agent, callback_name, None)
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
@@ -464,12 +731,22 @@ def _run_agent(
         agent.tool_gen_callback = None
 
         result = agent.run_conversation(prompt)
+        if strict_output_budget is not None:
+            result["strict_output_budget"] = True
+            if result.get("failed") or result.get("partial") or not result.get(
+                "completed", False
+            ):
+                # Strict failure receipts never carry provider text and must
+                # be unambiguously non-successful to the process wrapper.
+                result["final_response"] = ""
+                result["failed"] = True
+                return "", result
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
         # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must
         # close the agent explicitly because the hard-exit path skips finalizers.
-        if agent is not None:
+        if agent is not None and strict_output_budget is None:
             try:
                 session_messages = getattr(agent, "_session_messages", None)
                 if isinstance(session_messages, list):

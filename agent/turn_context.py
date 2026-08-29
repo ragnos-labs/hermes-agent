@@ -454,13 +454,22 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    suppress_external_effects = bool(
+        getattr(agent, "_suppress_external_effects", False)
+    )
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
-    install_safe_stdio()
+    # Strict one-shot may not replace process-global stdout/stderr.
+    if not suppress_external_effects:
+        install_safe_stdio()
 
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
     # belong to the canonical child, including observability metadata.
-    recovered_history = recover_rotated_compression_session(agent)
+    recovered_history = (
+        None
+        if suppress_external_effects
+        else recover_rotated_compression_session(agent)
+    )
     if recovered_history is not None:
         conversation_history = recovered_history
 
@@ -473,30 +482,36 @@ def build_turn_context(
     # cache miss. (Issue #45499.)
 
     # Tag log records on this thread with the session ID for ``hermes logs``.
-    set_session_context(agent.session_id)
+    if not suppress_external_effects:
+        set_session_context(agent.session_id)
 
     # Bind the skill write-origin ContextVar for this thread.
-    set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
+    if not suppress_external_effects:
+        set_current_write_origin(
+            getattr(agent, "_memory_write_origin", "assistant_tool")
+        )
 
     # Restore the primary runtime if the previous turn activated fallback.
-    agent._restore_primary_runtime()
+    if not suppress_external_effects:
+        agent._restore_primary_runtime()
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
-    try:
-        from agent.auxiliary_client import set_runtime_main
-        set_runtime_main(
-            getattr(agent, "provider", "") or "",
-            getattr(agent, "model", "") or "",
-            requested_provider=getattr(agent, "requested_provider", "") or "",
-            base_url=getattr(agent, "base_url", "") or "",
-            api_key=getattr(agent, "api_key", "") or "",
-            api_mode=getattr(agent, "api_mode", "") or "",
-            auth_mode=getattr(agent, "auth_mode", "") or "",
-            session_id=getattr(agent, "session_id", "") or "",
-        )
-    except Exception:
-        pass
+    if not suppress_external_effects:
+        try:
+            from agent.auxiliary_client import set_runtime_main
+            set_runtime_main(
+                getattr(agent, "provider", "") or "",
+                getattr(agent, "model", "") or "",
+                requested_provider=getattr(agent, "requested_provider", "") or "",
+                base_url=getattr(agent, "base_url", "") or "",
+                api_key=getattr(agent, "api_key", "") or "",
+                api_mode=getattr(agent, "api_mode", "") or "",
+                auth_mode=getattr(agent, "auth_mode", "") or "",
+                session_id=getattr(agent, "session_id", "") or "",
+            )
+        except Exception:
+            pass
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
@@ -593,15 +608,22 @@ def build_turn_context(
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
-    _preview_text = summarize_user_message_for_log(user_message)
-    _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
-    _msg_preview = _msg_preview.replace("\n", " ")
-    logger.info(
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
-        agent.session_id or "none", agent.model, agent.provider or "unknown",
-        agent.platform or "unknown", len(conversation_history or []),
-        _msg_preview,
-    )
+    if suppress_external_effects:
+        logger.info("strict_turn_started")
+    else:
+        _preview_text = summarize_user_message_for_log(user_message)
+        _msg_preview = (
+            (_preview_text[:80] + "...")
+            if len(_preview_text) > 80
+            else _preview_text
+        )
+        _msg_preview = _msg_preview.replace("\n", " ")
+        logger.info(
+            "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+            agent.session_id or "none", agent.model, agent.provider or "unknown",
+            agent.platform or "unknown", len(conversation_history or []),
+            _msg_preview,
+        )
 
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []
@@ -694,7 +716,11 @@ def build_turn_context(
     # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
     # and notify the host so it can play hearts. Token-free, never touches the
     # conversation, and never fatal — a purely optional UI beat.
-    reaction_callback = getattr(agent, "reaction_callback", None)
+    reaction_callback = (
+        None
+        if suppress_external_effects
+        else getattr(agent, "reaction_callback", None)
+    )
     if reaction_callback is not None:
         try:
             from agent.reactions import detect_reaction
@@ -731,11 +757,12 @@ def build_turn_context(
     # persist lock as CLI close persistence.
     persist_lock = getattr(agent, "_session_persist_lock", None)
     try:
-        if persist_lock is None:
-            agent._ensure_db_session()
-        else:
-            with persist_lock:
+        if not suppress_external_effects:
+            if persist_lock is None:
                 agent._ensure_db_session()
+            else:
+                with persist_lock:
+                    agent._ensure_db_session()
     except Exception:
         logger.warning(
             "Turn-start session row creation failed for session=%s",
@@ -1152,20 +1179,22 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
-            "pre_llm_call",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            user_message=original_user_message,
-            conversation_history=list(messages),
-            is_first_turn=(not bool(conversation_history)),
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
-        )
+        _pre_results = []
+        if not suppress_external_effects:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _pre_results = _invoke_hook(
+                "pre_llm_call",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=original_user_message,
+                conversation_history=list(messages),
+                is_first_turn=(not bool(conversation_history)),
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+                parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+            )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
@@ -1209,7 +1238,11 @@ def build_turn_context(
     # One-shot: staged by the gateway right before this turn, consumed here.
     # Multimodal (list) content can't take the string sidecar — append a
     # durable text part instead of dropping the fact.
-    _gateway_notes = consume_gateway_turn_context_notes(agent)
+    _gateway_notes = (
+        ""
+        if suppress_external_effects
+        else consume_gateway_turn_context_notes(agent)
+    )
     if _gateway_notes:
         _gw_turn_content = (
             messages[current_turn_user_idx].get("content")
@@ -1236,17 +1269,19 @@ def build_turn_context(
     # the tool-level interrupt signal to THIS agent's thread only.
     agent._execution_thread_id = threading.current_thread().ident
 
-    # Clear stale per-thread interrupt state, preserving a pending interrupt.
-    ra()._set_interrupt(False, agent._execution_thread_id)
-    if agent._interrupt_requested:
-        ra()._set_interrupt(True, agent._execution_thread_id)
-        agent._interrupt_thread_signal_pending = False
-    else:
-        agent._interrupt_message = None
-        agent._interrupt_thread_signal_pending = False
+    # Strict one-shot does not mutate the process-global tool interrupt state.
+    if not suppress_external_effects:
+        # Clear stale per-thread interrupt state, preserving a pending interrupt.
+        ra()._set_interrupt(False, agent._execution_thread_id)
+        if agent._interrupt_requested:
+            ra()._set_interrupt(True, agent._execution_thread_id)
+            agent._interrupt_thread_signal_pending = False
+        else:
+            agent._interrupt_message = None
+            agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if not suppress_external_effects and agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1258,7 +1293,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if not suppress_external_effects and agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
@@ -1345,11 +1380,12 @@ def build_turn_context(
         agent._persist_session(messages, conversation_history)
 
     try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
+        if not suppress_external_effects:
+            if persist_lock is None:
                 _ensure_and_persist()
+            else:
+                with persist_lock:
+                    _ensure_and_persist()
     except Exception:
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
@@ -1371,7 +1407,8 @@ def build_turn_context(
     # turn failed before producing one). Fire-and-forget on a daemon thread,
     # a no-op once the session has a title, and shared by every surface
     # because every surface enters the turn through this prologue.
-    _maybe_title_session_at_turn_start(agent, messages)
+    if not suppress_external_effects:
+        _maybe_title_session_at_turn_start(agent, messages)
 
     return TurnContext(
         user_message=user_message,

@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -3888,6 +3889,994 @@ class TestRunConversation:
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
+    def test_strict_oneshot_length_is_terminal_after_one_call(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        agent.stream_delta_callback = lambda _delta: None
+        first = _mock_response(content="Bounded partial", finish_reason="length")
+        second = _mock_response(content="must not run", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_interruptible_streaming_api_call") as streaming_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 1
+        assert result["final_response"] == ""
+        assert result["failed"] is True
+        assert result["strict_output_budget"] is True
+        assert result["error"] == (
+            "Strict one-shot request failed: output ceiling reached"
+        )
+        assert agent.client.chat.completions.create.call_count == 1
+        streaming_call.assert_not_called()
+        assert agent._strict_output_tokens_reserved == 2000
+
+    def test_strict_effect_suppression_allows_only_one_provider_call(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+        agent._suppress_external_effects = True
+        agent._skip_mcp_refresh = True
+        agent._persist_disabled = True
+        agent.skip_context_files = True
+        agent.skip_background_review = True
+        agent._memory_manager = MagicMock()
+        callback_spies = []
+        for callback_name in (
+            "tool_progress_callback",
+            "tool_start_callback",
+            "tool_complete_callback",
+            "thinking_callback",
+            "reasoning_callback",
+            "clarify_callback",
+            "step_callback",
+            "stream_delta_callback",
+            "interim_assistant_callback",
+            "tool_gen_callback",
+            "status_callback",
+            "event_callback",
+            "reaction_callback",
+        ):
+            callback = MagicMock(name=callback_name)
+            callback_spies.append(callback)
+            setattr(agent, callback_name, callback)
+        agent.context_compressor._context_probed = True
+        agent.context_compressor._context_probe_persistable = True
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="strict-response-sentinel",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        )
+
+        with ExitStack() as stack:
+            has_hook = stack.enter_context(patch("hermes_cli.lifecycle.has_hook"))
+            invoke_hook = stack.enter_context(patch("hermes_cli.lifecycle.invoke_hook"))
+            request_mw = stack.enter_context(
+                patch("hermes_cli.middleware.apply_llm_request_middleware")
+            )
+            execution_mw = stack.enter_context(
+                patch("hermes_cli.middleware.run_llm_execution_middleware")
+            )
+            select_context = stack.enter_context(
+                patch("agent.conversation_loop._apply_context_engine_selection")
+            )
+            turn_complete = stack.enter_context(
+                patch("agent.conversation_loop._notify_context_engine_turn_complete")
+            )
+            refresh_credentials = stack.enter_context(
+                patch.object(agent, "_try_refresh_env_client_credentials")
+            )
+            restore_runtime = stack.enter_context(
+                patch.object(agent, "_restore_primary_runtime")
+            )
+            ensure_session = stack.enter_context(
+                patch.object(agent, "_ensure_db_session")
+            )
+            persist_session = stack.enter_context(
+                patch.object(agent, "_persist_session")
+            )
+            save_trajectory = stack.enter_context(
+                patch.object(agent, "_save_trajectory")
+            )
+            cleanup_resources = stack.enter_context(
+                patch.object(agent, "_cleanup_task_resources")
+            )
+            sync_memory = stack.enter_context(
+                patch.object(agent, "_sync_external_memory_for_turn")
+            )
+            background_review = stack.enter_context(
+                patch.object(agent, "_spawn_background_review")
+            )
+            dump_request = stack.enter_context(
+                patch.object(agent, "_dump_api_request_debug")
+            )
+            touch_activity = stack.enter_context(
+                patch.object(agent, "_touch_activity")
+            )
+            estimate_cost = stack.enter_context(
+                patch("agent.conversation_loop.estimate_usage_cost")
+            )
+            save_context_length = stack.enter_context(
+                patch("agent.conversation_loop.save_context_length")
+            )
+            install_safe_stdio = stack.enter_context(
+                patch("agent.conversation_loop._install_safe_stdio")
+            )
+            context_log = stack.enter_context(
+                patch("agent.turn_context.logger.info")
+            )
+            loop_log = stack.enter_context(
+                patch("agent.conversation_loop.logger.info")
+            )
+            stack.enter_context(
+                patch.dict("os.environ", {"HERMES_DUMP_REQUESTS": "1"})
+            )
+            result = agent.run_conversation("strict-prompt-sentinel")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "strict-response-sentinel"
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        has_hook.assert_not_called()
+        invoke_hook.assert_not_called()
+        request_mw.assert_not_called()
+        execution_mw.assert_not_called()
+        select_context.assert_not_called()
+        turn_complete.assert_not_called()
+        refresh_credentials.assert_not_called()
+        restore_runtime.assert_not_called()
+        ensure_session.assert_not_called()
+        persist_session.assert_not_called()
+        save_trajectory.assert_not_called()
+        cleanup_resources.assert_not_called()
+        sync_memory.assert_not_called()
+        background_review.assert_not_called()
+        dump_request.assert_not_called()
+        touch_activity.assert_not_called()
+        estimate_cost.assert_not_called()
+        save_context_length.assert_not_called()
+        install_safe_stdio.assert_not_called()
+        context_log.assert_called_once_with("strict_turn_started")
+        assert any(
+            call.args == ("strict_turn_finished",)
+            for call in loop_log.call_args_list
+        )
+        all_log_calls = context_log.call_args_list + loop_log.call_args_list
+        assert "strict-prompt-sentinel" not in str(all_log_calls)
+        assert "strict-response-sentinel" not in str(all_log_calls)
+        assert agent.session_cost_status == "unknown"
+        assert agent.session_cost_source == "none"
+        agent._memory_manager.on_turn_start.assert_not_called()
+        agent._memory_manager.prefetch_all.assert_not_called()
+        for callback in callback_spies:
+            callback.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            ("nous", "https://example.invalid/v1"),
+            ("nous-portal", "https://example.invalid/v1"),
+            ("nousresearch", "https://example.invalid/v1"),
+            ("custom", "https://inference-api.nousresearch.com/v1"),
+        ],
+    )
+    def test_strict_oneshot_rejects_nous_before_rate_limit_preflight(
+        self, agent, provider, base_url
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+        agent.provider = provider
+        agent.base_url = base_url
+
+        with (
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+            patch("agent.nous_rate_guard.nous_rate_limit_remaining") as rate_remaining,
+            patch("agent.nous_rate_guard.clear_nous_rate_limit") as clear_rate_limit,
+            patch("agent.nous_rate_guard.record_nous_rate_limit") as record_rate_limit,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "Nous" in result["error"]
+        build_turn_context.assert_not_called()
+        rate_remaining.assert_not_called()
+        clear_rate_limit.assert_not_called()
+        record_rate_limit.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_ambient_kanban_before_turn_setup(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+
+        with (
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+            patch.object(agent, "_touch_activity") as touch_activity,
+            patch.dict("os.environ", {"HERMES_KANBAN_TASK": "task-1"}),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "Kanban" in result["error"]
+        build_turn_context.assert_not_called()
+        touch_activity.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_ordinary_mode_preserves_hook_middleware_surfaces(self, agent):
+        self._setup_agent(agent)
+        agent._suppress_external_effects = False
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="ordinary",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        )
+        request_result = SimpleNamespace(
+            payload={"model": agent.model, "messages": []},
+            original_payload={"model": agent.model, "messages": []},
+            trace=[],
+        )
+
+        with (
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook", return_value=[]) as invoke_hook,
+            patch(
+                "hermes_cli.middleware.apply_llm_request_middleware",
+                return_value=request_result,
+            ) as request_mw,
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=lambda request, callback, **_kwargs: callback(request),
+            ) as execution_mw,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "agent.conversation_loop.estimate_usage_cost",
+                return_value=SimpleNamespace(
+                    amount_usd=None,
+                    status="unknown",
+                    source="none",
+                ),
+            ) as estimate_cost,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert request_mw.called
+        assert execution_mw.called
+        estimate_cost.assert_called_once()
+        hook_names = {call.args[0] for call in invoke_hook.call_args_list}
+        assert {
+            "pre_llm_call",
+            "pre_api_request",
+            "post_api_request",
+            "transform_llm_output",
+            "post_llm_call",
+            "on_session_end",
+        }.issubset(hook_names)
+
+    def test_strict_oneshot_rejects_streaming_route_before_turn_setup(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = False
+        agent.stream_delta_callback = lambda _delta: None
+
+        with patch("agent.conversation_loop.build_turn_context") as build_turn_context:
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["final_response"] == ""
+        assert result["api_calls"] == 0
+        assert "streaming" in result["error"]
+        build_turn_context.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_relay_route_before_turn_setup(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        relay = MagicMock()
+        relay.managed_execution_enabled.return_value = True
+
+        with (
+            patch("agent.relay_runtime.get_runtime", return_value=relay),
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["final_response"] == ""
+        assert result["api_calls"] == 0
+        assert "Relay" in result["error"]
+        build_turn_context.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_ordinary_mode_does_not_apply_strict_transport_guards(self, agent):
+        self._setup_agent(agent)
+        agent._disable_streaming = False
+        agent.stream_delta_callback = lambda _delta: None
+        relay = MagicMock()
+        relay.managed_execution_enabled.return_value = True
+        agent._interruptible_streaming_api_call = MagicMock(
+            return_value=_mock_response(content="ordinary", finish_reason="stop")
+        )
+
+        with (
+            patch("agent.relay_runtime.get_runtime", return_value=relay),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "ordinary"
+        agent._interruptible_streaming_api_call.assert_called_once()
+
+    def test_strict_oneshot_rejects_provider_overrides_before_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent.request_overrides = {"max_tokens": 2001}
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "stopped before replay" in result["error"]
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_middleware_cap_inflation(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        def inflate_cap(_request, callback, **_kwargs):
+            return callback({"model": agent.model, "messages": [], "max_tokens": 2001})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=inflate_cap,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize("duplicate_cap", [1999, 2000, 2001])
+    def test_strict_oneshot_rejects_top_level_max_tokens_alias_before_dispatch(
+        self, agent, duplicate_cap
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        def add_duplicate_alias(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    "maxTokens": duplicate_cap,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_duplicate_alias,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["final_response"] == ""
+        assert agent._strict_output_tokens_reserved == 0
+        assert vars(agent).get("_strict_provider_attempted", False) is False
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize("invalid_cap", ["2000", 2000.0, True])
+    def test_strict_oneshot_rejects_non_integer_cap_before_dispatch(
+        self, agent, invalid_cap
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        def replace_cap(_request, callback, **_kwargs):
+            return callback(
+                {"model": agent.model, "messages": [], "max_tokens": invalid_cap}
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=replace_cap,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("sidecar_name", "sidecar"),
+        [
+            ("extra_body", {"max_tokens": 5000}),
+            ("extra_body", {"provider": {"max_completion_tokens": 5000}}),
+            ("extra_body", {"routing": [{"max_tokens": 5000}]}),
+            ("extra_json", {"routing": [{"maxTokens": 5000}]}),
+        ],
+    )
+    def test_strict_oneshot_rejects_sidecar_cap_override_before_dispatch(
+        self, agent, sidecar_name, sidecar
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        def add_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    sidecar_name: sidecar,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("sidecar_name", "sidecar"),
+        [
+            ("extra_body", []),
+            ("extra_body", "not-an-object"),
+            ("extra_json", []),
+            ("extra_json", "not-an-object"),
+        ],
+    )
+    def test_strict_oneshot_rejects_non_object_sidecars_before_dispatch(
+        self, agent, sidecar_name, sidecar
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        def add_invalid_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    sidecar_name: sidecar,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_invalid_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "invalid_shape", ["cycle", "overdeep", "oversized", "wide"]
+    )
+    def test_strict_oneshot_bounds_sidecar_traversal_before_dispatch(
+        self, agent, invalid_shape
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        if invalid_shape == "cycle":
+            sidecar = {}
+            sidecar["loop"] = [sidecar]
+        elif invalid_shape == "overdeep":
+            sidecar = {}
+            cursor = sidecar
+            for _ in range(34):
+                child = {}
+                cursor["child"] = [child]
+                cursor = child
+        elif invalid_shape == "oversized":
+            sidecar = {"items": [{} for _ in range(257)]}
+        else:
+            sidecar = {f"member-{index}": index for index in range(1025)}
+
+        def add_invalid_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    "extra_body": sidecar,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=add_invalid_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_container_shared_across_sidecar_roots(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        shared = {"routing": ["bounded"]}
+
+        def share_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    "extra_body": shared,
+                    "extra_json": shared,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=share_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_bedrock_before_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.api_mode = "bedrock_converse"
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        with (
+            patch.object(agent, "_interruptible_api_call") as physical_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "stopped before replay" in result["error"]
+        assert agent._strict_output_tokens_reserved == 0
+        physical_call.assert_not_called()
+
+    def test_strict_oneshot_rejects_moa_before_preparation_or_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.api_mode = "chat_completions"
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        with (
+            patch.object(agent.client.chat.completions, "prepare") as prepare,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "stopped before replay" in result["error"]
+        prepare.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize("encoded", [False, True])
+    def test_strict_oneshot_rejects_per_turn_moa_before_turn_setup(
+        self, agent, encoded
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        moa_config = {
+            "reference_models": [{"provider": "test", "model": "advisor"}],
+            "aggregator": {"provider": "test", "model": "aggregator"},
+        }
+        prompt = "hello"
+        explicit_config = moa_config
+        if encoded:
+            from hermes_cli.moa_config import encode_moa_turn
+
+            prompt = encode_moa_turn(prompt, moa_config)
+            explicit_config = None
+
+        with (
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+            patch("agent.moa_loop.aggregate_moa_context") as aggregate_moa_context,
+            patch.object(agent.client.chat.completions, "prepare") as prepare,
+        ):
+            result = agent.run_conversation(prompt, moa_config=explicit_config)
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "MoA fan-out" in result["error"]
+        build_turn_context.assert_not_called()
+        aggregate_moa_context.assert_not_called()
+        prepare.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            ("copilot-acp", "acp://copilot"),
+            ("gemini", "https://generativelanguage.googleapis.com/v1beta"),
+        ],
+    )
+    def test_strict_oneshot_rejects_alternate_chat_clients_before_dispatch(
+        self, agent, provider, base_url
+    ):
+        self._setup_agent(agent)
+        agent.provider = provider
+        agent.base_url = base_url
+        agent.api_mode = "chat_completions"
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+
+        with patch("agent.conversation_loop.build_turn_context") as build_turn_context:
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        build_turn_context.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_ordinary_moa_still_prepares_and_dispatches(self, agent):
+        self._setup_agent(agent)
+        agent.provider = "moa"
+        agent.api_mode = "chat_completions"
+        agent.client.chat.completions.prepare.return_value = None
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="ordinary moa", finish_reason="stop"
+        )
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "ordinary moa"
+        agent.client.chat.completions.prepare.assert_called_once()
+        agent.client.chat.completions.create.assert_called_once()
+
+    def test_strict_oneshot_rejects_lowered_provider_cap_without_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        def lower_cap(_request, callback, **_kwargs):
+            return callback({"model": agent.model, "messages": [], "max_tokens": 1000})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=lower_cap,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        assert vars(agent).get("_strict_provider_attempted", False) is False
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_invalid_response_stops_before_fallback_or_backoff(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        agent._fallback_chain = [{"provider": "other", "model": "other"}]
+        agent.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[], usage=None
+        )
+
+        with (
+            patch.object(agent, "_try_activate_fallback") as activate_fallback,
+            patch("agent.conversation_loop.jittered_backoff") as backoff,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["final_response"] == ""
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        activate_fallback.assert_not_called()
+        backoff.assert_not_called()
+
+    def test_strict_mixed_text_and_structured_refusal_is_terminal(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        agent._fallback_chain = [{"provider": "other", "model": "other"}]
+        agent.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="usable-looking text",
+                        tool_calls=None,
+                        reasoning=None,
+                        reasoning_content=None,
+                        refusal="structured refusal",
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            model="test/model",
+            usage=None,
+            id="strict_refusal_1",
+        )
+
+        with (
+            patch.object(agent, "_try_activate_fallback") as activate_fallback,
+            patch.object(agent, "_invoke_api_request_error_hook") as error_hook,
+            patch.object(agent, "_buffer_status") as buffer_status,
+            patch.object(agent, "_emit_status") as emit_status,
+            patch("agent.conversation_loop.jittered_backoff") as backoff,
+            patch.object(agent, "_persist_session") as persist_session,
+            patch.object(agent, "_save_trajectory") as save_trajectory,
+            patch.object(agent, "_cleanup_task_resources") as cleanup_resources,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["partial"] is True
+        assert result["final_response"] == ""
+        assert result["api_calls"] == 1
+        assert result["error"] == "Strict one-shot request failed: provider refusal"
+        assert agent.client.chat.completions.create.call_count == 1
+        activate_fallback.assert_not_called()
+        error_hook.assert_not_called()
+        buffer_status.assert_not_called()
+        emit_status.assert_not_called()
+        backoff.assert_not_called()
+        # The turn's existing pre-dispatch user-message checkpoint is
+        # preserved, but the refusal path must not add a post-response write.
+        persist_session.assert_called_once()
+        save_trajectory.assert_not_called()
+        cleanup_resources.assert_not_called()
+
+    def test_strict_success_disables_post_turn_micro_compaction(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        agent.context_compressor._micro_compact_enabled = True
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="bounded", finish_reason="stop"
+        )
+
+        with (
+            patch.object(agent.context_compressor, "_micro_compact") as micro_compact,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bounded"
+        assert agent.context_compressor._micro_compact_enabled is False
+        micro_compact.assert_not_called()
+
+    def test_strict_oneshot_rejects_delegate_task_without_child_or_tool_effect(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("delegate_task")
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        tool_call = _mock_tool_call(
+            name="delegate_task", arguments='{"goal":"must not run"}', call_id="d1"
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tool_call]
+        )
+
+        with (
+            patch.object(agent, "_dispatch_delegate_task") as dispatch_delegate,
+            patch("run_agent.handle_function_call") as handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 1
+        assert "non-terminal or empty provider response" in result["error"]
+        assert agent.client.chat.completions.create.call_count == 1
+        dispatch_delegate.assert_not_called()
+        handle_function_call.assert_not_called()
+
+    def test_strict_oneshot_disables_compression_before_large_multi_tool_turn(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        agent.context_compressor.last_prompt_tokens = 100_000
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search", arguments='{"q":"bounded one"}', call_id="strict-1"
+            ),
+            _mock_tool_call(
+                name="web_search", arguments='{"q":"bounded two"}', call_id="strict-2"
+            ),
+        ]
+        first = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=tool_calls
+        )
+        second = _mock_response(content="must not run", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch(
+                "run_agent.handle_function_call", return_value="x" * 100_000
+            ) as handle_function_call,
+            patch.object(agent.context_compressor, "should_compress", return_value=True) as should_compress,
+            patch.object(agent.context_compressor, "_generate_summary") as summary_llm,
+            patch.object(agent, "_compress_context") as compress_context,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent.compression_enabled is False
+        assert agent._strict_provider_attempted is True
+        assert agent.client.chat.completions.create.call_count == 1
+        handle_function_call.assert_not_called()
+        should_compress.assert_not_called()
+        compress_context.assert_not_called()
+        summary_llm.assert_not_called()
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
@@ -4058,6 +5047,39 @@ class TestRunConversation:
         # Tool was executed on the retry (good_resp)
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
+
+    def test_strict_oneshot_truncated_tool_call_never_retries_or_executes(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._disable_streaming = True
+        agent._strict_output_tokens_reserved = 0
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc]
+        )
+        agent.client.chat.completions.create.side_effect = [
+            truncated,
+            _mock_response(content="must not run", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call") as handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        handle_function_call.assert_not_called()
 
     def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
         """A network stream stall mid tool-call (PARTIAL_STREAM_STUB_ID) must

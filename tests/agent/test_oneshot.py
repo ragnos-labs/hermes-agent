@@ -1,5 +1,7 @@
 """Tests for agent.oneshot — shared one-off (stateless) LLM requests."""
 
+import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -11,6 +13,16 @@ from agent.oneshot import (
     _strip_code_fence,
     _truncate,
 )
+from agent.conversation_loop import (
+    _require_strict_single_attempt_mode,
+    _reserve_strict_output_budget,
+)
+from agent.turn_finalizer import finalize_turn
+from hermes_cli.oneshot import _run_agent as run_cli_oneshot_agent
+from hermes_cli.oneshot import _strict_output_budget
+from hermes_cli.oneshot import run_oneshot as run_cli_oneshot
+from hermes_cli.oneshot import run_strict_oneshot
+from run_agent import AIAgent
 
 
 class TestRenderTemplate:
@@ -71,6 +83,726 @@ class TestRunOneshot:
 
 
 class TestHelpers:
+    @staticmethod
+    def _strict_direct_config():
+        return {
+            "model": {
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            },
+            "agent": {"system_prompt": "bounded system prompt"},
+        }
+
+    @staticmethod
+    def _strict_direct_route():
+        return {
+            "model": "synthetic-model",
+            "provider": "custom",
+            "base_url": "https://inference.example.invalid/v1",
+            "api_key": "secret-not-for-output",
+        }
+
+    def test_strict_direct_success_is_one_nonstreaming_fixed_cap_call(self):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].finish_reason = "stop"
+        response.choices[0].message.content = "synthetic result"
+        response.choices[0].message.refusal = None
+        response.choices[0].message.tool_calls = None
+        response.usage.prompt_tokens = 20
+        response.usage.completion_tokens = 4
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=client) as factory:
+            code, text, usage = run_strict_oneshot(
+                "a" * 8000,
+                config=self._strict_direct_config(),
+                route=self._strict_direct_route(),
+            )
+
+        assert (code, text, usage) == (
+            0,
+            "synthetic result",
+            {"input_tokens": 20, "output_tokens": 4},
+        )
+        factory.assert_called_once_with(
+            api_key="secret-not-for-output",
+            base_url="https://inference.example.invalid/v1",
+            max_retries=0,
+            timeout=300.0,
+        )
+        client.chat.completions.create.assert_called_once()
+        kwargs = client.chat.completions.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 2000
+        assert kwargs["stream"] is False
+        assert kwargs["messages"][0] == {
+            "role": "system",
+            "content": "bounded system prompt",
+        }
+        assert kwargs["messages"][1]["content"] == "a" * 8000
+
+    @pytest.mark.parametrize("failure", ["length", "refusal", "tools", "empty", "usage"])
+    def test_strict_direct_failures_are_content_free(self, failure):
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        choice = response.choices[0]
+        choice.finish_reason = "stop"
+        choice.message.content = "private partial text"
+        choice.message.refusal = None
+        choice.message.tool_calls = None
+        response.usage.prompt_tokens = 20
+        response.usage.completion_tokens = 4
+        if failure == "length":
+            choice.finish_reason = "length"
+        elif failure == "refusal":
+            choice.message.refusal = "private refusal"
+        elif failure == "tools":
+            choice.message.tool_calls = [MagicMock()]
+        elif failure == "empty":
+            choice.message.content = ""
+        else:
+            response.usage.prompt_tokens = 8001
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=client):
+            assert run_strict_oneshot(
+                "synthetic prompt",
+                config=self._strict_direct_config(),
+                route=self._strict_direct_route(),
+            ) == (2, "", {})
+        client.chat.completions.create.assert_called_once()
+
+    def test_strict_output_budget_requires_exact_2000_model_cap(self):
+        assert _strict_output_budget(
+            {"model": {"output_budget_mode": "strict", "max_tokens": 2000}}
+        ) == 2000
+
+        for invalid_cap in (True, 1999, 2001, 50_000, "2000"):
+            with pytest.raises(ValueError, match="max_tokens == 2000"):
+                _strict_output_budget(
+                    {"model": {"output_budget_mode": "strict", "max_tokens": invalid_cap}}
+                )
+
+    def test_strict_output_budget_is_default_off(self):
+        assert _strict_output_budget({"model": {"max_tokens": 2000}}) is None
+
+    def test_cli_oneshot_propagates_strict_cap_and_disables_reasoning(self):
+        captured_kwargs = {}
+        created = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                assert self._suppress_external_effects is True
+                captured_kwargs.update(kwargs)
+                self._session_messages = []
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
+                created.append(self)
+
+            def run_conversation(self, prompt):
+                self.prompt = prompt
+                return {"final_response": "ok", "completed": True}
+
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime),
+            patch("hermes_cli.tools_config._get_platform_tools") as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
+            patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
+            patch("run_agent.AIAgent", FakeAgent),
+        ):
+            strict_prompt = "a" * 8000
+            text, result = run_cli_oneshot_agent(strict_prompt)
+
+        assert text == "ok"
+        assert result["final_response"] == "ok"
+        assert captured_kwargs["max_tokens"] == 2000
+        assert captured_kwargs["reasoning_config"] == {"enabled": False}
+        assert captured_kwargs["skip_background_review"] is True
+        assert captured_kwargs["enabled_toolsets"] == []
+        assert captured_kwargs["session_db"] is None
+        assert captured_kwargs["fallback_model"] is None
+        assert captured_kwargs["skip_context_files"] is True
+        assert captured_kwargs["skip_memory"] is True
+        assert captured_kwargs["clarify_callback"] is None
+        assert captured_kwargs["max_tokens"] == 2000
+        platform_tools.assert_not_called()
+        mcp_discovery.assert_not_called()
+        session_db.assert_not_called()
+        fallback_chain.assert_not_called()
+        created[0].shutdown_memory_provider.assert_not_called()
+        created[0].close.assert_not_called()
+
+    @pytest.mark.parametrize("prompt", [None, "not-ascii-\N{SNOWMAN}", "a" * 8001])
+    def test_public_cli_rejects_strict_prompt_before_any_effectful_setup(
+        self, prompt, capsys
+    ):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+            patch.dict("os.environ", {}, clear=False),
+        ):
+            status = run_cli_oneshot(prompt)
+
+        assert status == 2
+        assert capsys.readouterr().out == ""
+        toolset_lookup.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_not_called()
+
+    def test_public_cli_rejects_strict_toolsets_before_lookup_or_channel(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+        ):
+            status = run_cli_oneshot("hello", toolsets=["web"])
+
+        assert status == 2
+        toolset_lookup.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_not_called()
+
+    def test_public_cli_strict_success_skips_global_setup(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        stdout_before = sys.stdout
+        stderr_before = sys.stderr
+
+        def strict_run(*_args, **_kwargs):
+            assert sys.stdout is stdout_before
+            assert sys.stderr is stderr_before
+            return "ok", {"final_response": "ok", "completed": True}
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot.logging.disable") as disable_logging,
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot._normalize_toolsets") as normalize_toolsets,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch(
+                "hermes_cli.oneshot._run_agent",
+                side_effect=strict_run,
+            ) as run_agent,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            status = run_cli_oneshot("hello")
+            assert "HERMES_YOLO_MODE" not in os.environ
+            assert "HERMES_ACCEPT_HOOKS" not in os.environ
+
+        assert status == 0
+        disable_logging.assert_not_called()
+        toolset_lookup.assert_not_called()
+        normalize_toolsets.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_called_once()
+
+    def test_public_cli_rejects_strict_usage_file_before_global_setup(self, tmp_path):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        usage_path = tmp_path / "usage.json"
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot.logging.disable") as disable_logging,
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+        ):
+            status = run_cli_oneshot("hello", usage_file=str(usage_path))
+
+        assert status == 2
+        assert not usage_path.exists()
+        disable_logging.assert_not_called()
+        toolset_lookup.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_not_called()
+
+    def test_public_cli_rejects_strict_kanban_before_provider_resolution(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+            patch.dict("os.environ", {"HERMES_KANBAN_TASK": "task-1"}),
+        ):
+            status = run_cli_oneshot("hello")
+
+        assert status == 2
+        run_agent.assert_not_called()
+
+    def test_strict_constructor_skips_plugin_and_configured_context_engines(
+        self, tmp_path
+    ):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            },
+            "context": {"engine": "configured-plugin-engine"},
+            "memory": {"provider": "configured-memory-plugin"},
+            "agent": {"environment_probe": True},
+        }
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=runtime,
+            ),
+            patch("hermes_cli.plugins.discover_plugins") as discover_plugins,
+            patch("hermes_cli.plugins.get_plugin_context_engine") as plugin_context,
+            patch("plugins.context_engine.load_context_engine") as context_loader,
+            patch("plugins.memory.load_memory_provider") as memory_loader,
+            patch("tools.env_probe.warm_environment_probe_async") as env_probe,
+            patch("run_agent._openrouter_prewarm_done") as prewarm_gate,
+            patch("hermes_logging.setup_logging") as setup_logging,
+            patch("agent.agent_init._install_safe_stdio") as install_safe_stdio,
+            patch("gateway.session_context.set_current_session_id") as set_session,
+            patch("agent.agent_init.get_hermes_home", return_value=tmp_path),
+            patch.object(
+                AIAgent, "_ensure_lmstudio_runtime_loaded"
+            ) as lmstudio_preload,
+            patch.object(AIAgent, "_create_openai_client", return_value=MagicMock()),
+            patch.object(
+                AIAgent,
+                "run_conversation",
+                return_value={"final_response": "ok", "completed": True},
+            ) as run_conversation,
+            patch.object(AIAgent, "shutdown_memory_provider") as shutdown_memory,
+            patch.object(AIAgent, "close") as close_agent,
+        ):
+            text, result = run_cli_oneshot_agent("hello")
+
+        assert text == "ok"
+        assert result["completed"] is True
+        discover_plugins.assert_not_called()
+        plugin_context.assert_not_called()
+        context_loader.assert_not_called()
+        memory_loader.assert_not_called()
+        env_probe.assert_not_called()
+        prewarm_gate.is_set.assert_not_called()
+        prewarm_gate.set.assert_not_called()
+        setup_logging.assert_not_called()
+        install_safe_stdio.assert_not_called()
+        set_session.assert_not_called()
+        lmstudio_preload.assert_not_called()
+        shutdown_memory.assert_not_called()
+        close_agent.assert_not_called()
+        assert not (tmp_path / "sessions").exists()
+        run_conversation.assert_called_once_with("hello")
+
+    @pytest.mark.parametrize(
+        ("prompt", "message"),
+        [
+            (None, "must be a string"),
+            ("not-ascii-\N{SNOWMAN}", "ASCII only"),
+            ("a" * 8001, "at most 8000 bytes"),
+        ],
+    )
+    def test_cli_oneshot_rejects_invalid_strict_prompt_before_runtime_setup(
+        self, prompt, message
+    ):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as resolve_runtime,
+            patch("hermes_cli.tools_config._get_platform_tools") as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
+            patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
+            patch("run_agent.AIAgent") as agent_type,
+            pytest.raises(ValueError, match=message),
+        ):
+            run_cli_oneshot_agent(prompt)
+
+        resolve_runtime.assert_not_called()
+        platform_tools.assert_not_called()
+        mcp_discovery.assert_not_called()
+        session_db.assert_not_called()
+        fallback_chain.assert_not_called()
+        agent_type.assert_not_called()
+
+    def test_cli_oneshot_ordinary_mode_preserves_stateful_setup(self):
+        fake_agent = MagicMock()
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+        }
+        fake_agent._session_messages = []
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        session = object()
+        fallback = [{"provider": "other", "model": "backup"}]
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"model": {"default": "test-model"}},
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=runtime,
+            ),
+            patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                return_value={"web"},
+            ) as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch(
+                "hermes_cli.oneshot._create_session_db_for_oneshot",
+                return_value=session,
+            ) as session_db,
+            patch(
+                "hermes_cli.oneshot.get_fallback_chain",
+                return_value=fallback,
+            ) as fallback_chain,
+            patch("run_agent.AIAgent", return_value=fake_agent) as agent_type,
+        ):
+            text, result = run_cli_oneshot_agent("hello")
+
+        assert text == "ok"
+        assert result["completed"] is True
+        assert agent_type.call_args.kwargs["enabled_toolsets"] == ["web"]
+        assert agent_type.call_args.kwargs["session_db"] is session
+        assert agent_type.call_args.kwargs["fallback_model"] == fallback
+        assert agent_type.call_args.kwargs["skip_context_files"] is False
+        assert agent_type.call_args.kwargs["skip_memory"] is False
+        assert agent_type.call_args.kwargs["skip_background_review"] is False
+        platform_tools.assert_called_once()
+        mcp_discovery.assert_called_once()
+        session_db.assert_called_once()
+        fallback_chain.assert_called_once()
+
+    def test_cli_oneshot_rejects_strict_toolsets_before_runtime_setup(self):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as resolve_runtime,
+            patch("hermes_cli.tools_config._get_platform_tools") as platform_tools,
+            patch(
+                "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"
+            ) as mcp_discovery,
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
+            patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
+            patch("run_agent.AIAgent") as agent_type,
+            pytest.raises(ValueError, match="does not accept toolsets"),
+        ):
+            run_cli_oneshot_agent("hello", toolsets=["web"])
+
+        resolve_runtime.assert_not_called()
+        platform_tools.assert_not_called()
+        mcp_discovery.assert_not_called()
+        session_db.assert_not_called()
+        fallback_chain.assert_not_called()
+        agent_type.assert_not_called()
+
+    def test_cli_oneshot_rejects_strict_kanban_before_runtime_setup(self):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as resolve_runtime,
+            patch("run_agent.AIAgent") as agent_type,
+            patch.dict("os.environ", {"HERMES_KANBAN_TASK": "task-1"}),
+            pytest.raises(ValueError, match="HERMES_KANBAN_TASK"),
+        ):
+            run_cli_oneshot_agent("hello")
+
+        resolve_runtime.assert_not_called()
+        agent_type.assert_not_called()
+
+    def test_cli_oneshot_strict_failure_never_prints_partial_content(
+        self, capsys
+    ):
+        with patch(
+            "hermes_cli.oneshot._run_agent",
+            return_value=(
+                "provider text must stay hidden",
+                {
+                    "final_response": "provider text must stay hidden",
+                    "completed": False,
+                    "partial": True,
+                    "failed": True,
+                    "strict_output_budget": True,
+                },
+            ),
+        ):
+            status = run_cli_oneshot("hello")
+
+        captured = capsys.readouterr()
+        assert status == 2
+        assert captured.out == ""
+        assert "provider text must stay hidden" not in captured.err
+
+    @pytest.mark.parametrize(
+        ("strict_mode", "expected_review_calls"),
+        [(True, 0), (False, 1)],
+    )
+    def test_cli_oneshot_background_review_policy_follows_strict_mode(
+        self, strict_mode, expected_review_calls
+    ):
+        model_config = {"default": "test-model", "max_tokens": 2000}
+        if strict_mode:
+            model_config["output_budget_mode"] = "strict"
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        created = []
+
+        def build_agent(**kwargs):
+            # Keep this behavioral harness isolated from local context and
+            # memory while preserving the caller's explicit keyword shape.
+            kwargs["skip_context_files"] = True
+            kwargs["skip_memory"] = True
+            with patch.object(
+                AIAgent, "_create_openai_client", return_value=MagicMock()
+            ):
+                agent = AIAgent(**kwargs)
+            agent._spawn_background_review = MagicMock()
+            agent._save_trajectory = MagicMock()
+            agent._cleanup_task_resources = MagicMock()
+            agent._persist_session = MagicMock()
+            agent._session_messages = []
+            agent._file_mutation_verifier_enabled = lambda: False
+            agent.clear_interrupt = MagicMock()
+            agent._stream_callback = None
+            agent._sync_external_memory_for_turn = MagicMock()
+            agent._skill_nudge_interval = 1
+            agent._iters_since_skill = 1
+            agent.valid_tool_names = {"skill_manage"}
+            agent.iteration_budget = MagicMock()
+            agent.iteration_budget.remaining = 100
+            agent.iteration_budget.used = 1
+            agent.iteration_budget.max_total = 100
+            agent.max_iterations = 50
+            agent._emit_status = MagicMock()
+            agent._safe_print = MagicMock()
+            agent._apply_persist_user_message_override = MagicMock()
+            agent.context_compressor = None
+            agent._turn_preflight_display_snapshot = None
+            agent._turn_received_provider_response = False
+            agent._turn_failed_file_mutations = {}
+            agent._db_flush_scan_prefix = None
+
+            def finish_turn(_prompt):
+                finalize_turn(
+                    agent,
+                    final_response="ok",
+                    api_call_count=1,
+                    interrupted=False,
+                    failed=False,
+                    messages=[{"role": "assistant", "content": "ok"}],
+                    conversation_history=[],
+                    effective_task_id="strict-oneshot",
+                    turn_id="strict-oneshot-turn",
+                    user_message="hello",
+                    original_user_message="hello",
+                    _should_review_memory=False,
+                    _turn_exit_reason="text_response(1)",
+                )
+                return {"final_response": "ok", "completed": True}
+
+            agent.run_conversation = MagicMock(side_effect=finish_turn)
+            agent.shutdown_memory_provider = MagicMock()
+            agent.close = MagicMock()
+            created.append(agent)
+            return agent
+
+        with (
+            patch("hermes_cli.config.load_config", return_value={"model": model_config}),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime),
+            patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+            patch("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build"),
+            patch("hermes_cli.oneshot._create_session_db_for_oneshot", return_value=None),
+            patch("hermes_cli.oneshot.get_fallback_chain", return_value=[]),
+            patch("run_agent.AIAgent", side_effect=build_agent) as agent_type,
+        ):
+            text, result = run_cli_oneshot_agent("hello")
+
+        assert text == "ok"
+        assert result["final_response"] == "ok"
+        assert agent_type.call_args.kwargs["skip_background_review"] is strict_mode
+        assert created[0].skip_background_review is strict_mode
+        assert created[0]._spawn_background_review.call_count == expected_review_calls
+        assert created[0].shutdown_memory_provider.call_count == (0 if strict_mode else 1)
+        assert created[0].close.call_count == (0 if strict_mode else 1)
+
+    def test_strict_output_budget_accepts_bedrock_wire_cap_once(self):
+        agent = MagicMock()
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent.request_overrides = {}
+
+        _reserve_strict_output_budget(
+            agent, {"inferenceConfig": {"maxTokens": 2000}}
+        )
+
+        assert agent._strict_output_tokens_reserved == 2000
+        with pytest.raises(RuntimeError, match="exhausted"):
+            _reserve_strict_output_budget(
+                agent, {"inferenceConfig": {"maxTokens": 1}}
+            )
+
+    @pytest.mark.parametrize("cap", [1, 1999, 2001])
+    def test_strict_output_budget_rejects_non_exact_first_cap(self, cap):
+        agent = MagicMock()
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent.request_overrides = {}
+
+        with pytest.raises(RuntimeError, match="exact configured output cap"):
+            _reserve_strict_output_budget(agent, {"max_tokens": cap})
+
+        assert agent._strict_output_tokens_reserved == 0
+        assert vars(agent).get("_strict_provider_attempted", False) is False
+
+    @pytest.mark.parametrize("budget", [1, 1999, 2001, "2000", True])
+    def test_strict_output_budget_rejects_non_exact_configured_budget(self, budget):
+        agent = MagicMock()
+        agent._strict_output_token_budget = budget
+        agent._strict_output_tokens_reserved = 0
+        agent.request_overrides = {}
+
+        with pytest.raises(RuntimeError, match="requires exactly 2000 tokens"):
+            _reserve_strict_output_budget(agent, {"max_tokens": 2000})
+
+        assert agent._strict_output_tokens_reserved == 0
+        assert vars(agent).get("_strict_provider_attempted", False) is False
+
+    @pytest.mark.parametrize(
+        ("provider", "api_mode"),
+        [
+            ("openai", "codex_responses"),
+            ("anthropic", "anthropic_messages"),
+            ("moa", "chat_completions"),
+        ],
+    )
+    def test_strict_output_budget_rejects_multi_attempt_modes(
+        self, provider, api_mode
+    ):
+        agent = MagicMock()
+        agent._strict_output_token_budget = 2000
+        agent.provider = provider
+        agent.api_mode = api_mode
+
+        with pytest.raises(RuntimeError, match="does not support"):
+            _require_strict_single_attempt_mode(agent)
+
+    @pytest.mark.parametrize("api_mode", ["chat_completions", "bedrock_converse"])
+    def test_strict_output_budget_allows_single_attempt_modes(self, api_mode):
+        agent = MagicMock()
+        agent._strict_output_token_budget = 2000
+        agent.provider = "test"
+        agent.api_mode = api_mode
+
+        _require_strict_single_attempt_mode(agent)
+
     def test_truncate_under_limit_unchanged(self):
         assert _truncate("short", 100) == "short"
 
