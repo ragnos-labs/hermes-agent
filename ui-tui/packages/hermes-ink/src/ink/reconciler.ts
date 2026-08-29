@@ -189,7 +189,7 @@ const reconciler = createReconciler({
       rootNode.onComputeLayout()
     }
 
-    if (process.env.NODE_ENV === 'test') {
+    if (process.env.VITEST || process.env.NODE_ENV === 'test') {
       if (rootNode.childNodes.length === 0 && rootNode.hasRenderedContent) {
         return
       }
