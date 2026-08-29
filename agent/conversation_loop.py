@@ -180,6 +180,12 @@ def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
     provider = str(getattr(agent, "provider", None) or "").lower()
     base_url = str(getattr(agent, "base_url", None) or "")
     client_name = type(getattr(agent, "client", None)).__name__
+    if os.getenv("HERMES_KANBAN_TASK", "").strip():
+        raise RuntimeError("strict output budget does not support Kanban workers")
+    if provider in {"nous", "nous-portal", "nousresearch"} or base_url_host_matches(
+        base_url, "inference-api.nousresearch.com"
+    ):
+        raise RuntimeError("strict output budget does not support Nous")
     if (
         provider == "copilot-acp"
         or base_url.lower().startswith(("acp://copilot", "acp+tcp://"))
@@ -261,7 +267,7 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import CostResult, estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -1753,6 +1759,11 @@ def run_conversation(
         getattr(agent, "_suppress_external_effects", False)
     )
     if _suppress_external_effects:
+        # Deep transport helpers report progress through this per-agent method.
+        # In a Kanban process that method also writes heartbeats/comments; the
+        # strict disposable agent therefore replaces only its own bound method
+        # with an inert callback before any turn helper can reach it.
+        agent._touch_activity = lambda *_args, **_kwargs: None
         for _callback_name in (
             "tool_progress_callback",
             "tool_start_callback",
@@ -1941,7 +1952,8 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
-        agent._touch_activity(f"starting API call #{api_call_count}")
+        if not _suppress_external_effects:
+            agent._touch_activity(f"starting API call #{api_call_count}")
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -4057,7 +4069,14 @@ def run_conversation(
                     # from the error message), not guessed probe tiers.
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
-                        if getattr(agent.context_compressor, "_context_probe_persistable", False):
+                        if (
+                            not _suppress_external_effects
+                            and getattr(
+                                agent.context_compressor,
+                                "_context_probe_persistable",
+                                False,
+                            )
+                        ):
                             save_context_length(agent.model, agent.base_url, ctx)
                             agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
                         agent.context_compressor._context_probed = False
@@ -4100,13 +4119,25 @@ def run_conversation(
                         _agg_cost_model = _agg_slot["model"]
                         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
                         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
-                        _agg_cost_model,
-                        aggregator_usage,
-                        provider=_agg_cost_provider,
-                        base_url=_agg_cost_base_url,
-                        api_key=getattr(agent, "api_key", ""),
-                    )
+                    if _suppress_external_effects:
+                        # Dynamic pricing helpers may refresh provider model
+                        # metadata over the network. The strict receipt reports
+                        # cost as unavailable rather than fabricating a value or
+                        # issuing a second outbound request.
+                        cost_result = CostResult(
+                            amount_usd=None,
+                            status="unknown",
+                            source="none",
+                            label="n/a",
+                        )
+                    else:
+                        cost_result = estimate_usage_cost(
+                            _agg_cost_model,
+                            aggregator_usage,
+                            provider=_agg_cost_provider,
+                            base_url=_agg_cost_base_url,
+                            api_key=getattr(agent, "api_key", ""),
+                        )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -4219,13 +4250,15 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
-                from agent import relay_llm
+                if not _suppress_external_effects:
+                    from agent import relay_llm
 
-                relay_llm.complete_logical_call(
-                    api_request_id,
-                    outcome="success",
-                )
-                agent._touch_activity(f"API call #{api_call_count} completed")
+                    relay_llm.complete_logical_call(
+                        api_request_id,
+                        outcome="success",
+                    )
+                if not _suppress_external_effects:
+                    agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
             except InterruptedError:

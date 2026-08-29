@@ -462,7 +462,9 @@ def finalize_turn(
         agent.session_id or "none",
     )
 
-    if _last_msg_role == "tool" and not interrupted:
+    if suppress_external_effects:
+        logger.info("strict_turn_finished")
+    elif _last_msg_role == "tool" and not interrupted:
         # Agent was mid-work — this is the "just stops" case.
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "

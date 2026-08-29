@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -3951,32 +3952,81 @@ class TestRunConversation:
             callback = MagicMock(name=callback_name)
             callback_spies.append(callback)
             setattr(agent, callback_name, callback)
+        agent.context_compressor._context_probed = True
+        agent.context_compressor._context_probe_persistable = True
         agent.client.chat.completions.create.return_value = _mock_response(
-            content="bounded", finish_reason="stop"
+            content="strict-response-sentinel",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
         )
 
-        with (
-            patch("hermes_cli.lifecycle.has_hook") as has_hook,
-            patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
-            patch("hermes_cli.middleware.apply_llm_request_middleware") as request_mw,
-            patch("hermes_cli.middleware.run_llm_execution_middleware") as execution_mw,
-            patch("agent.conversation_loop._apply_context_engine_selection") as select_context,
-            patch("agent.conversation_loop._notify_context_engine_turn_complete") as turn_complete,
-            patch.object(agent, "_try_refresh_env_client_credentials") as refresh_credentials,
-            patch.object(agent, "_restore_primary_runtime") as restore_runtime,
-            patch.object(agent, "_ensure_db_session") as ensure_session,
-            patch.object(agent, "_persist_session") as persist_session,
-            patch.object(agent, "_save_trajectory") as save_trajectory,
-            patch.object(agent, "_cleanup_task_resources") as cleanup_resources,
-            patch.object(agent, "_sync_external_memory_for_turn") as sync_memory,
-            patch.object(agent, "_spawn_background_review") as background_review,
-            patch.object(agent, "_dump_api_request_debug") as dump_request,
-            patch.dict("os.environ", {"HERMES_DUMP_REQUESTS": "1"}),
-        ):
-            result = agent.run_conversation("hello")
+        with ExitStack() as stack:
+            has_hook = stack.enter_context(patch("hermes_cli.lifecycle.has_hook"))
+            invoke_hook = stack.enter_context(patch("hermes_cli.lifecycle.invoke_hook"))
+            request_mw = stack.enter_context(
+                patch("hermes_cli.middleware.apply_llm_request_middleware")
+            )
+            execution_mw = stack.enter_context(
+                patch("hermes_cli.middleware.run_llm_execution_middleware")
+            )
+            select_context = stack.enter_context(
+                patch("agent.conversation_loop._apply_context_engine_selection")
+            )
+            turn_complete = stack.enter_context(
+                patch("agent.conversation_loop._notify_context_engine_turn_complete")
+            )
+            refresh_credentials = stack.enter_context(
+                patch.object(agent, "_try_refresh_env_client_credentials")
+            )
+            restore_runtime = stack.enter_context(
+                patch.object(agent, "_restore_primary_runtime")
+            )
+            ensure_session = stack.enter_context(
+                patch.object(agent, "_ensure_db_session")
+            )
+            persist_session = stack.enter_context(
+                patch.object(agent, "_persist_session")
+            )
+            save_trajectory = stack.enter_context(
+                patch.object(agent, "_save_trajectory")
+            )
+            cleanup_resources = stack.enter_context(
+                patch.object(agent, "_cleanup_task_resources")
+            )
+            sync_memory = stack.enter_context(
+                patch.object(agent, "_sync_external_memory_for_turn")
+            )
+            background_review = stack.enter_context(
+                patch.object(agent, "_spawn_background_review")
+            )
+            dump_request = stack.enter_context(
+                patch.object(agent, "_dump_api_request_debug")
+            )
+            touch_activity = stack.enter_context(
+                patch.object(agent, "_touch_activity")
+            )
+            estimate_cost = stack.enter_context(
+                patch("agent.conversation_loop.estimate_usage_cost")
+            )
+            save_context_length = stack.enter_context(
+                patch("agent.conversation_loop.save_context_length")
+            )
+            install_safe_stdio = stack.enter_context(
+                patch("agent.conversation_loop._install_safe_stdio")
+            )
+            context_log = stack.enter_context(
+                patch("agent.turn_context.logger.info")
+            )
+            loop_log = stack.enter_context(
+                patch("agent.conversation_loop.logger.info")
+            )
+            stack.enter_context(
+                patch.dict("os.environ", {"HERMES_DUMP_REQUESTS": "1"})
+            )
+            result = agent.run_conversation("strict-prompt-sentinel")
 
         assert result["completed"] is True
-        assert result["final_response"] == "bounded"
+        assert result["final_response"] == "strict-response-sentinel"
         assert result["api_calls"] == 1
         assert agent.client.chat.completions.create.call_count == 1
         has_hook.assert_not_called()
@@ -3994,16 +4044,90 @@ class TestRunConversation:
         sync_memory.assert_not_called()
         background_review.assert_not_called()
         dump_request.assert_not_called()
+        touch_activity.assert_not_called()
+        estimate_cost.assert_not_called()
+        save_context_length.assert_not_called()
+        install_safe_stdio.assert_not_called()
+        context_log.assert_called_once_with("strict_turn_started")
+        assert any(
+            call.args == ("strict_turn_finished",)
+            for call in loop_log.call_args_list
+        )
+        all_log_calls = context_log.call_args_list + loop_log.call_args_list
+        assert "strict-prompt-sentinel" not in str(all_log_calls)
+        assert "strict-response-sentinel" not in str(all_log_calls)
+        assert agent.session_cost_status == "unknown"
+        assert agent.session_cost_source == "none"
         agent._memory_manager.on_turn_start.assert_not_called()
         agent._memory_manager.prefetch_all.assert_not_called()
         for callback in callback_spies:
             callback.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            ("nous", "https://example.invalid/v1"),
+            ("nous-portal", "https://example.invalid/v1"),
+            ("nousresearch", "https://example.invalid/v1"),
+            ("custom", "https://inference-api.nousresearch.com/v1"),
+        ],
+    )
+    def test_strict_oneshot_rejects_nous_before_rate_limit_preflight(
+        self, agent, provider, base_url
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+        agent.provider = provider
+        agent.base_url = base_url
+
+        with (
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+            patch("agent.nous_rate_guard.nous_rate_limit_remaining") as rate_remaining,
+            patch("agent.nous_rate_guard.clear_nous_rate_limit") as clear_rate_limit,
+            patch("agent.nous_rate_guard.record_nous_rate_limit") as record_rate_limit,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "Nous" in result["error"]
+        build_turn_context.assert_not_called()
+        rate_remaining.assert_not_called()
+        clear_rate_limit.assert_not_called()
+        record_rate_limit.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_ambient_kanban_before_turn_setup(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+
+        with (
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+            patch.object(agent, "_touch_activity") as touch_activity,
+            patch.dict("os.environ", {"HERMES_KANBAN_TASK": "task-1"}),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "Kanban" in result["error"]
+        build_turn_context.assert_not_called()
+        touch_activity.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_ordinary_mode_preserves_hook_middleware_surfaces(self, agent):
         self._setup_agent(agent)
         agent._suppress_external_effects = False
         agent.client.chat.completions.create.return_value = _mock_response(
-            content="ordinary", finish_reason="stop"
+            content="ordinary",
+            finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
         )
         request_result = SimpleNamespace(
             payload={"model": agent.model, "messages": []},
@@ -4025,12 +4149,21 @@ class TestRunConversation:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch(
+                "agent.conversation_loop.estimate_usage_cost",
+                return_value=SimpleNamespace(
+                    amount_usd=None,
+                    status="unknown",
+                    source="none",
+                ),
+            ) as estimate_cost,
         ):
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
         assert request_mw.called
         assert execution_mw.called
+        estimate_cost.assert_called_once()
         hook_names = {call.args[0] for call in invoke_hook.call_args_list}
         assert {
             "pre_llm_call",

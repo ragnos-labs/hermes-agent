@@ -454,11 +454,13 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
-    # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
-    install_safe_stdio()
     suppress_external_effects = bool(
         getattr(agent, "_suppress_external_effects", False)
     )
+    # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
+    # Strict one-shot may not replace process-global stdout/stderr.
+    if not suppress_external_effects:
+        install_safe_stdio()
 
     # Recover a session rotated by another path before binding log/turn ids or
     # copying client-supplied history. Everything in this turn must consistently
@@ -606,15 +608,22 @@ def build_turn_context(
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
-    _preview_text = summarize_user_message_for_log(user_message)
-    _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
-    _msg_preview = _msg_preview.replace("\n", " ")
-    logger.info(
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
-        agent.session_id or "none", agent.model, agent.provider or "unknown",
-        agent.platform or "unknown", len(conversation_history or []),
-        _msg_preview,
-    )
+    if suppress_external_effects:
+        logger.info("strict_turn_started")
+    else:
+        _preview_text = summarize_user_message_for_log(user_message)
+        _msg_preview = (
+            (_preview_text[:80] + "...")
+            if len(_preview_text) > 80
+            else _preview_text
+        )
+        _msg_preview = _msg_preview.replace("\n", " ")
+        logger.info(
+            "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+            agent.session_id or "none", agent.model, agent.provider or "unknown",
+            agent.platform or "unknown", len(conversation_history or []),
+            _msg_preview,
+        )
 
     # Initialize conversation (copy to avoid mutating the caller's list).
     messages = list(conversation_history) if conversation_history else []

@@ -617,13 +617,13 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
-    _install_safe_stdio()
-
     # Strict one-shot sets this per-instance marker before __init__. Ordinary
     # agents default false; no process-global plugin state is changed.
     agent._suppress_external_effects = bool(
         getattr(agent, "_suppress_external_effects", False)
     )
+    if not agent._suppress_external_effects:
+        _install_safe_stdio()
 
     agent.model = model
     agent.max_iterations = max_iterations

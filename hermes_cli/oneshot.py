@@ -21,7 +21,6 @@ Env var fallbacks (used when the corresponding arg is not passed):
 
 from __future__ import annotations
 
-import io
 import logging
 import os
 import sys
@@ -207,6 +206,10 @@ def run_oneshot(
                 raise ValueError("strict one-shot mode does not accept toolsets")
             if usage_file is not None:
                 raise ValueError("strict one-shot mode does not accept usage_file")
+            if os.getenv("HERMES_KANBAN_TASK", "").strip():
+                raise ValueError(
+                    "strict one-shot mode does not accept HERMES_KANBAN_TASK"
+                )
     except ValueError as exc:
         sys.stderr.write(f"hermes -z: {exc}\n")
         return 2
@@ -247,22 +250,19 @@ def run_oneshot(
         # therefore binds the stateless channel; strict mode has no tools.
         declare_stateless_channel()
 
-    # Capture stderr and stdout for the entire call tree. Strict mode uses an
-    # in-memory sink so it does not open or write a filesystem target.
-    # We'll print the final response to the real stdout at the end.
+    # Capture stderr and stdout for ordinary one-shot execution. Strict mode
+    # must not replace process-global stdio, even temporarily; its isolated
+    # agent has no print/callback surfaces and writes only the final admitted
+    # response below.
     real_stdout = sys.stdout
     real_stderr = sys.stderr
-    output_sink = (
-        io.StringIO()
-        if strict_output_budget is not None
-        else open(os.devnull, "w", encoding="utf-8")
-    )
+    output_sink = None
 
     response: Optional[str] = None
     result: dict = {}
     failure: BaseException | None = None
     try:
-        with redirect_stdout(output_sink), redirect_stderr(output_sink):
+        if strict_output_budget is not None:
             try:
                 response, result = _run_agent(
                     prompt,
@@ -281,11 +281,26 @@ def run_oneshot(
                 # cron / SSH / subprocess context is the worst failure mode.
                 # See #30623.
                 failure = exc
+        else:
+            output_sink = open(os.devnull, "w", encoding="utf-8")
+            with redirect_stdout(output_sink), redirect_stderr(output_sink):
+                try:
+                    response, result = _run_agent(
+                        prompt,
+                        model=model,
+                        provider=provider,
+                        toolsets=explicit_toolsets,
+                        use_config_toolsets=use_config_toolsets,
+                        config=cfg,
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    failure = exc
     finally:
-        try:
-            output_sink.close()
-        except Exception:
-            pass
+        if output_sink is not None:
+            try:
+                output_sink.close()
+            except Exception:
+                pass
 
     if failure is not None:
         # Re-raise control-flow exceptions so the parent handles them as usual
@@ -399,6 +414,10 @@ def _run_agent(
         prompt = _validate_strict_prompt(prompt)
         if toolsets is not None:
             raise ValueError("strict one-shot mode does not accept toolsets")
+        if os.getenv("HERMES_KANBAN_TASK", "").strip():
+            raise ValueError(
+                "strict one-shot mode does not accept HERMES_KANBAN_TASK"
+            )
 
     # Keep effectful runtime and agent imports behind strict prompt admission.
     from hermes_cli.models import detect_provider_for_model

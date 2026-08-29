@@ -1,6 +1,7 @@
 """Tests for agent.oneshot — shared one-off (stateless) LLM requests."""
 
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -217,6 +218,14 @@ class TestHelpers:
                 "max_tokens": 2000,
             }
         }
+        stdout_before = sys.stdout
+        stderr_before = sys.stderr
+
+        def strict_run(*_args, **_kwargs):
+            assert sys.stdout is stdout_before
+            assert sys.stderr is stderr_before
+            return "ok", {"final_response": "ok", "completed": True}
+
         with (
             patch("hermes_cli.config.load_config", return_value=strict_cfg),
             patch("hermes_cli.oneshot.logging.disable") as disable_logging,
@@ -225,7 +234,7 @@ class TestHelpers:
             patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
             patch(
                 "hermes_cli.oneshot._run_agent",
-                return_value=("ok", {"final_response": "ok", "completed": True}),
+                side_effect=strict_run,
             ) as run_agent,
             patch.dict("os.environ", {}, clear=True),
         ):
@@ -265,6 +274,24 @@ class TestHelpers:
         declare_channel.assert_not_called()
         run_agent.assert_not_called()
 
+    def test_public_cli_rejects_strict_kanban_before_provider_resolution(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+            patch.dict("os.environ", {"HERMES_KANBAN_TASK": "task-1"}),
+        ):
+            status = run_cli_oneshot("hello")
+
+        assert status == 2
+        run_agent.assert_not_called()
+
     def test_strict_constructor_skips_plugin_and_configured_context_engines(
         self, tmp_path
     ):
@@ -299,6 +326,7 @@ class TestHelpers:
             patch("tools.env_probe.warm_environment_probe_async") as env_probe,
             patch("run_agent._openrouter_prewarm_done") as prewarm_gate,
             patch("hermes_logging.setup_logging") as setup_logging,
+            patch("agent.agent_init._install_safe_stdio") as install_safe_stdio,
             patch("gateway.session_context.set_current_session_id") as set_session,
             patch("agent.agent_init.get_hermes_home", return_value=tmp_path),
             patch.object(
@@ -325,6 +353,7 @@ class TestHelpers:
         prewarm_gate.is_set.assert_not_called()
         prewarm_gate.set.assert_not_called()
         setup_logging.assert_not_called()
+        install_safe_stdio.assert_not_called()
         set_session.assert_not_called()
         lmstudio_preload.assert_not_called()
         shutdown_memory.assert_not_called()
@@ -465,6 +494,30 @@ class TestHelpers:
         mcp_discovery.assert_not_called()
         session_db.assert_not_called()
         fallback_chain.assert_not_called()
+        agent_type.assert_not_called()
+
+    def test_cli_oneshot_rejects_strict_kanban_before_runtime_setup(self):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "model": {
+                        "default": "test-model",
+                        "output_budget_mode": "strict",
+                        "max_tokens": 2000,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider"
+            ) as resolve_runtime,
+            patch("run_agent.AIAgent") as agent_type,
+            patch.dict("os.environ", {"HERMES_KANBAN_TASK": "task-1"}),
+            pytest.raises(ValueError, match="HERMES_KANBAN_TASK"),
+        ):
+            run_cli_oneshot_agent("hello")
+
+        resolve_runtime.assert_not_called()
         agent_type.assert_not_called()
 
     def test_cli_oneshot_strict_failure_never_prints_partial_content(
