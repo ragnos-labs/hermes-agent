@@ -1,5 +1,14 @@
 name: GHCR Execution Read Release
 
+run-name: >-
+  ${{ inputs.release_mode == 'maintenance_launcher'
+      && format('hermes-maintenance-launcher-{0}', github.run_id)
+      || inputs.release_mode == 'maintenance_child'
+      && format('hermes-maintenance-child-{0}', inputs.launch_digest)
+      || github.event_name == 'pull_request'
+      && format('ghcr-execution-read-pr-{0}', github.event.pull_request.number)
+      || format('ghcr-execution-read-{0}', inputs.release_tag) }}
+
 # Fork-owned publication for the dependency-owned execution-read contract.
 # Pull requests only validate: they have read-only permissions and never log in
 # to a registry. Publishing is limited to an exact workflow_dispatch of this
@@ -16,6 +25,15 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
+      release_mode:
+        description: Internal release phase. Leave ordinary for normal protected-main publication.
+        required: true
+        default: ordinary
+        type: choice
+        options:
+          - ordinary
+          - maintenance_launcher
+          - maintenance_child
       source_sha:
         description: Exact 40-character source commit to package.
         required: true
@@ -32,6 +50,22 @@ on:
         description: Intent only, not approval. Type publish ghcr.io/ragnos-labs/hermes-agent:<release_tag>.
         required: true
         type: string
+      parent_run_id:
+        description: Internal maintenance child binding; launcher supplies this value.
+        required: false
+        type: string
+      parent_workflow_sha:
+        description: Internal maintenance child binding; launcher supplies this value.
+        required: false
+        type: string
+      launch_digest:
+        description: Internal maintenance child binding; launcher supplies this value.
+        required: false
+        type: string
+      launch_nonce:
+        description: Exact one-use 64-hex maintenance launcher nonce.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -39,7 +73,12 @@ permissions:
 concurrency:
   # Every dispatch can address the same immutable sha-SOURCE_SHA tag even when
   # the approved CalVer tags differ, so publication is globally serialized.
-  group: ${{ github.event_name == 'workflow_dispatch' && 'ghcr-execution-read-publication' || format('ghcr-execution-read-pr-{0}', github.event.pull_request.number) }}
+  group: >-
+    ${{ inputs.release_mode == 'maintenance_launcher'
+        && format('ghcr-execution-read-launcher-{0}', github.run_id)
+        || github.event_name == 'workflow_dispatch'
+        && 'ghcr-execution-read-publication'
+        || format('ghcr-execution-read-pr-{0}', github.event.pull_request.number) }}
   cancel-in-progress: false
 
 env:
@@ -51,12 +90,391 @@ env:
   SCHEMA_SHA256: 7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
   ACTION_SCHEMA_PATH: hermes_cli/execution_contract_schemas/hermes.execution.action.v1.schema.json
   ACTION_SCHEMA_SHA256: bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b
+  MAINTENANCE_SOURCE_SHA: 05b7574da33459304109582f23e70b155d13a6dc
+  MAINTENANCE_SOURCE_TREE: 427f75a3c9e237ef8d19a608bf4e5b1d5bcb9f24
+  MAINTENANCE_RELEASE_TAG: v2026.8.22-ragnos.1
+  MAINTENANCE_READ_SCHEMA_SHA256: 7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3
+  MAINTENANCE_ACTION_SCHEMA_SHA256: d7ff28de7a04b015005e8ef39df78a06766db6426ae91792c3d5f39a61966870
+  MAINTENANCE_MAX_ACTIONS_STORAGE_BYTES: "26214400"
+  MAINTENANCE_PROJECTED_MAX_MINUTES: "290"
+  MAINTENANCE_PROJECTED_COST_CENTS: "2"
+  MAINTENANCE_HARD_COST_CENTS: "500"
 
 jobs:
-  resolve:
-    name: Resolve exact source and publication intent
+  launcher:
+    name: Launch one exact maintenance child
+    if: github.event_name == 'workflow_dispatch' && inputs.release_mode == 'maintenance_launcher'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Validate launcher and dispatch child exactly once
+        id: dispatch
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_CONFIRM: ${{ inputs.confirm_publish }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_LAUNCH_NONCE: ${{ inputs.launch_nonce }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2153
+          set -euo pipefail
+          [ "$REPOSITORY" = "ragnos-labs/hermes-agent" ]
+          [ "$REPOSITORY_VISIBILITY" = "public" ]
+          [ "$ACTOR" = "ragnos-dev" ]
+          [ "$EVENT_REF" = "refs/heads/main" ]
+          [ "$EVENT_SHA" = "$WORKFLOW_SHA" ]
+          [ "$RUN_ATTEMPT" = "1" ]
+          [[ "$INPUT_LAUNCH_NONCE" =~ ^[0-9a-f]{64}$ ]]
+          # Fixed timeout graph: launcher 5; child admission/resolve/policy/conformance 45;
+          # 2x build 100; authorize/lock/preflight 25; 2x publish 80;
+          # manifest 25; maintenance-only signing 10. Public standard runners
+          # have zero compute charge; conservatively price retained artifacts at
+          # USD $0.008/GiB-day and round upward to whole cents.
+          projected_minutes=$((5 + 5 + 5 + 5 + 30 + 2 * 50 + 5 + 10 + 10 + 2 * 40 + 25 + 10))
+          projected_compute_cents=0
+          projected_storage_cents=$(((MAINTENANCE_MAX_ACTIONS_STORAGE_BYTES * 89 * 8 + 10737418240 - 1) / 10737418240))
+          projected_cost_cents=$((projected_compute_cents + projected_storage_cents))
+          [ "$projected_minutes" = "$MAINTENANCE_PROJECTED_MAX_MINUTES" ]
+          [ "$projected_cost_cents" = "$MAINTENANCE_PROJECTED_COST_CENTS" ]
+          [ "$projected_cost_cents" -lt "$MAINTENANCE_HARD_COST_CENTS" ]
+          [ "$INPUT_SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+          [ "$INPUT_SOURCE_REF" = "refs/tags/${MAINTENANCE_RELEASE_TAG}" ]
+          [ "$INPUT_RELEASE_TAG" = "$MAINTENANCE_RELEASE_TAG" ]
+          [ "$INPUT_CONFIRM" = "publish ${IMAGE_NAME}:${MAINTENANCE_RELEASE_TAG}" ]
+          [ "$WORKFLOW_REF" = "ragnos-labs/hermes-agent/.github/workflows/ghcr-execution-read-release.yml@refs/heads/main" ]
+          [ "$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq .object.sha)" = "$WORKFLOW_SHA" ]
+
+          prior_runs="$RUNNER_TEMP/maintenance-prior-runs.json"
+          gh api --paginate --slurp \
+            "repos/${REPOSITORY}/actions/workflows/ghcr-execution-read-release.yml/runs?event=workflow_dispatch&branch=main&per_page=100" \
+            > "$prior_runs"
+          PRIOR_RUNS="$prior_runs" CURRENT_RUN_ID="$RUN_ID" python3 - <<'PY'
+          import json
+          import os
+
+          pages = json.load(open(os.environ["PRIOR_RUNS"], encoding="utf-8"))
+          runs = [run for page in pages for run in page.get("workflow_runs", [])]
+          maintenance = [
+              run for run in runs
+              if run.get("display_title", "").startswith("hermes-maintenance-launcher-")
+              or run.get("display_title", "").startswith("hermes-maintenance-child-")
+          ]
+          assert len(maintenance) == 1, maintenance
+          assert str(maintenance[0]["id"]) == os.environ["CURRENT_RUN_ID"], maintenance[0]
+          PY
+
+          launch_digest="$(printf '%s\n' \
+            "parent_run_id=${RUN_ID}" \
+            "workflow_sha=${WORKFLOW_SHA}" \
+            "source_sha=${MAINTENANCE_SOURCE_SHA}" \
+            "source_tree=${MAINTENANCE_SOURCE_TREE}" \
+            "release_tag=${MAINTENANCE_RELEASE_TAG}" \
+            "read_schema=${MAINTENANCE_READ_SCHEMA_SHA256}" \
+            "action_schema=${MAINTENANCE_ACTION_SCHEMA_SHA256}" \
+            "launch_nonce=${INPUT_LAUNCH_NONCE}" \
+            | sha256sum | cut -d' ' -f1)"
+          [[ "$launch_digest" =~ ^[0-9a-f]{64}$ ]]
+
+          request="$RUNNER_TEMP/maintenance-child-dispatch.json"
+          response="$RUNNER_TEMP/maintenance-child-dispatch-response.json"
+          jq -n \
+            --arg ref main \
+            --arg mode maintenance_child \
+            --arg source_sha "$MAINTENANCE_SOURCE_SHA" \
+            --arg source_ref "refs/tags/${MAINTENANCE_RELEASE_TAG}" \
+            --arg release_tag "$MAINTENANCE_RELEASE_TAG" \
+            --arg confirm "publish ${IMAGE_NAME}:${MAINTENANCE_RELEASE_TAG}" \
+            --arg parent_run_id "$RUN_ID" \
+            --arg parent_workflow_sha "$WORKFLOW_SHA" \
+            --arg launch_digest "$launch_digest" \
+            --arg launch_nonce "$INPUT_LAUNCH_NONCE" \
+            '{ref: $ref, inputs: {
+              release_mode: $mode,
+              source_sha: $source_sha,
+              source_ref: $source_ref,
+              release_tag: $release_tag,
+              confirm_publish: $confirm,
+              parent_run_id: $parent_run_id,
+              parent_workflow_sha: $parent_workflow_sha,
+              launch_digest: $launch_digest,
+              launch_nonce: $launch_nonce
+            }}' > "$request"
+          # One physical dispatch attempt. An ambiguous response is a terminal hold.
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --data-binary "@${request}" \
+            "https://api.github.com/repos/${REPOSITORY}/actions/workflows/ghcr-execution-read-release.yml/dispatches" \
+            > "$response"
+          jq -e '.workflow_run_id | type == "number" and . > 0' "$response" >/dev/null
+          child_run_id="$(jq -r .workflow_run_id "$response")"
+          child_run="$RUNNER_TEMP/maintenance-child-run.json"
+          for poll in $(seq 1 6); do
+            if gh api "repos/${REPOSITORY}/actions/runs/${child_run_id}" > "$child_run"; then
+              break
+            fi
+            [ "$poll" -lt 6 ] || {
+              echo "::error::Returned child run identity could not be read back."
+              exit 1
+            }
+            sleep 5
+          done
+          jq -e --arg id "$child_run_id" --arg sha "$WORKFLOW_SHA" \
+            '(.id | tostring) == $id
+             and .event == "workflow_dispatch"
+             and .run_attempt == 1
+             and .head_branch == "main"
+             and .head_sha == $sha
+             and (.actor.login | type == "string" and length > 0)
+             and (.actor.id | type == "number")
+             and .actor.type == "Bot"
+             and (.triggering_actor.login | type == "string" and length > 0)
+             and (.triggering_actor.id | type == "number")' "$child_run" >/dev/null
+          receipt="$RUNNER_TEMP/maintenance-launch-binding.json"
+          jq -n \
+            --arg child_run_id "$child_run_id" \
+            --arg launch_digest "$launch_digest" \
+            --arg launch_nonce "$INPUT_LAUNCH_NONCE" \
+            --arg parent_run_id "$RUN_ID" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            --slurpfile child_run "$child_run" \
+            '{receipt_version:"hermes.execution.read.maintenance-launch-binding.v1",
+              parent_run_id:$parent_run_id,child_run_id:$child_run_id,
+              workflow_sha:$workflow_sha,launch_digest:$launch_digest,launch_nonce:$launch_nonce,
+              child_identity:{actor:$child_run[0].actor,triggering_actor:$child_run[0].triggering_actor}}' \
+            > "$receipt"
+          echo "child_run_id=$child_run_id" >> "$GITHUB_OUTPUT"
+          echo "launch_digest=$launch_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce launcher binding artifact cap
+        run: |
+          set -euo pipefail
+          [ "$(stat -c %s "$RUNNER_TEMP/maintenance-launch-binding.json")" -le 65536 ]
+
+      - name: Upload immutable launcher-to-child binding
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-maintenance-launch-binding-${{ github.run_id }}
+          path: ${{ runner.temp }}/maintenance-launch-binding.json
+          if-no-files-found: error
+          retention-days: 89
+
+  child-admission:
+    name: Admit exact maintenance child
+    if: github.event_name == 'workflow_dispatch' && inputs.release_mode == 'maintenance_child'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      admitted: ${{ steps.admission.outputs.admitted }}
+      launch_digest: ${{ steps.admission.outputs.launch_digest }}
+      receipt_sha256: ${{ steps.admission.outputs.receipt_sha256 }}
+    steps:
+      - name: Verify parent, binding artifact, and child identity
+        id: admission
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          INPUT_LAUNCH_DIGEST: ${{ inputs.launch_digest }}
+          INPUT_LAUNCH_NONCE: ${{ inputs.launch_nonce }}
+          INPUT_PARENT_RUN_ID: ${{ inputs.parent_run_id }}
+          INPUT_PARENT_WORKFLOW_SHA: ${{ inputs.parent_workflow_sha }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ "$REPOSITORY" = "ragnos-labs/hermes-agent" ]
+          [ "$REPOSITORY_VISIBILITY" = "public" ]
+          [ "$EVENT_REF" = "refs/heads/main" ]
+          [ "$EVENT_SHA" = "$WORKFLOW_SHA" ]
+          [ "$REF_PROTECTED" = "true" ]
+          [ "$WORKFLOW_RUN_ATTEMPT" = "1" ]
+          [ "$WORKFLOW_REF" = "ragnos-labs/hermes-agent/.github/workflows/ghcr-execution-read-release.yml@refs/heads/main" ]
+          [ "$INPUT_SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+          [ "$INPUT_SOURCE_REF" = "refs/tags/${MAINTENANCE_RELEASE_TAG}" ]
+          [ "$INPUT_RELEASE_TAG" = "$MAINTENANCE_RELEASE_TAG" ]
+          [[ "$INPUT_PARENT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [ "$INPUT_PARENT_WORKFLOW_SHA" = "$WORKFLOW_SHA" ]
+          [[ "$INPUT_LAUNCH_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$INPUT_LAUNCH_NONCE" =~ ^[0-9a-f]{64}$ ]]
+          expected_launch_digest="$(printf '%s\n' \
+            "parent_run_id=${INPUT_PARENT_RUN_ID}" \
+            "workflow_sha=${WORKFLOW_SHA}" \
+            "source_sha=${MAINTENANCE_SOURCE_SHA}" \
+            "source_tree=${MAINTENANCE_SOURCE_TREE}" \
+            "release_tag=${MAINTENANCE_RELEASE_TAG}" \
+            "read_schema=${MAINTENANCE_READ_SCHEMA_SHA256}" \
+            "action_schema=${MAINTENANCE_ACTION_SCHEMA_SHA256}" \
+            "launch_nonce=${INPUT_LAUNCH_NONCE}" \
+            | sha256sum | cut -d' ' -f1)"
+          [ "$INPUT_LAUNCH_DIGEST" = "$expected_launch_digest" ]
+
+          parent_json="$RUNNER_TEMP/maintenance-parent.json"
+          for poll in $(seq 1 12); do
+            gh api "repos/${REPOSITORY}/actions/runs/${INPUT_PARENT_RUN_ID}" > "$parent_json"
+            [ "$(jq -r '.conclusion // ""' "$parent_json")" = success ] && break
+            [ "$poll" -lt 12 ] || {
+              echo "::error::Launcher did not reach successful completion before child admission."
+              exit 1
+            }
+            sleep 5
+          done
+          jq -e \
+            --arg actor ragnos-dev \
+            --arg head_sha "$WORKFLOW_SHA" \
+            --arg workflow_path ".github/workflows/ghcr-execution-read-release.yml" \
+            '.event == "workflow_dispatch"
+             and .actor.login == $actor
+             and .triggering_actor.login == $actor
+             and .run_attempt == 1
+             and .head_branch == "main"
+             and .head_sha == $head_sha
+             and (.path | startswith($workflow_path))
+             and .status == "completed"
+             and .conclusion == "success"' \
+            "$parent_json" >/dev/null
+
+          binding_dir="$RUNNER_TEMP/maintenance-launch-binding"
+          mkdir -p "$binding_dir"
+          gh run download "$INPUT_PARENT_RUN_ID" --repo "$REPOSITORY" \
+            --name "hermes-maintenance-launch-binding-${INPUT_PARENT_RUN_ID}" \
+            --dir "$binding_dir"
+          binding="$binding_dir/maintenance-launch-binding.json"
+          jq -e \
+            --arg actor "$ACTOR" \
+            --arg child_run_id "$WORKFLOW_RUN_ID" \
+            --arg launch_digest "$INPUT_LAUNCH_DIGEST" \
+            --arg launch_nonce "$INPUT_LAUNCH_NONCE" \
+            --arg parent_run_id "$INPUT_PARENT_RUN_ID" \
+            --arg triggering_actor "$TRIGGERING_ACTOR" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            '.receipt_version == "hermes.execution.read.maintenance-launch-binding.v1"
+             and .parent_run_id == $parent_run_id
+             and .child_run_id == $child_run_id
+             and .workflow_sha == $workflow_sha
+             and .launch_digest == $launch_digest
+             and .launch_nonce == $launch_nonce
+             and .child_identity.actor.login == $actor
+             and .child_identity.actor.type == "Bot"
+             and .child_identity.triggering_actor.login == $triggering_actor
+             and (.child_identity.triggering_actor.type | type == "string" and length > 0)' "$binding" >/dev/null
+
+          current_child="$RUNNER_TEMP/maintenance-current-child.json"
+          gh api "repos/${REPOSITORY}/actions/runs/${WORKFLOW_RUN_ID}" > "$current_child"
+          jq -e \
+            --arg actor "$ACTOR" \
+            --arg triggering_actor "$TRIGGERING_ACTOR" \
+            --arg head_sha "$WORKFLOW_SHA" \
+            --argjson binding_actor_id "$(jq '.child_identity.actor.id' "$binding")" \
+            --argjson binding_triggering_actor_id "$(jq '.child_identity.triggering_actor.id' "$binding")" \
+            --arg binding_actor_type "$(jq -r '.child_identity.actor.type' "$binding")" \
+            --arg binding_triggering_actor_type "$(jq -r '.child_identity.triggering_actor.type' "$binding")" \
+            '.event == "workflow_dispatch"
+             and .actor.type == "Bot"
+             and .actor.type == $binding_actor_type
+             and .triggering_actor.type == $binding_triggering_actor_type
+             and .actor.login == $actor
+             and .triggering_actor.login == $triggering_actor
+             and .actor.id == $binding_actor_id
+             and .triggering_actor.id == $binding_triggering_actor_id
+             and .run_attempt == 1
+             and .head_branch == "main"
+             and .head_sha == $head_sha' \
+            "$current_child" >/dev/null
+
+          child_runs="$RUNNER_TEMP/maintenance-child-runs.json"
+          gh api --paginate \
+            "repos/${REPOSITORY}/actions/workflows/ghcr-execution-read-release.yml/runs?event=workflow_dispatch&branch=main&per_page=100" \
+            > "$child_runs"
+          CHILD_RUNS="$child_runs" CHILD_TITLE="hermes-maintenance-child-${INPUT_LAUNCH_DIGEST}" \
+          CURRENT_RUN_ID="$WORKFLOW_RUN_ID" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          runs = []
+          decoder = json.JSONDecoder()
+          text = Path(os.environ["CHILD_RUNS"]).read_text(encoding="utf-8")
+          index = 0
+          while index < len(text):
+              while index < len(text) and text[index].isspace():
+                  index += 1
+              if index == len(text):
+                  break
+              value, index = decoder.raw_decode(text, index)
+              runs.extend(value.get("workflow_runs", []))
+          maintenance_children = [
+              run for run in runs
+              if run.get("display_title", "").startswith("hermes-maintenance-child-")
+          ]
+          matches = [
+              run for run in maintenance_children
+              if run.get("display_title") == os.environ["CHILD_TITLE"]
+              and run.get("event") == "workflow_dispatch"
+              and run.get("actor", {}).get("type") == "Bot"
+              and run.get("run_attempt") == 1
+          ]
+          assert len(maintenance_children) == 1, maintenance_children
+          assert len(matches) == 1, matches
+          assert str(matches[0]["id"]) == os.environ["CURRENT_RUN_ID"], matches[0]
+          PY
+
+          receipt="$RUNNER_TEMP/maintenance-child-admission.json"
+          binding_sha256="$(sha256sum "$binding" | cut -d' ' -f1)"
+          jq -n \
+            --arg binding_sha256 "$binding_sha256" \
+            --arg launch_digest "$INPUT_LAUNCH_DIGEST" \
+            --arg run_id "$WORKFLOW_RUN_ID" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            '{receipt_version:"hermes.execution.read.maintenance-child-admission.v1",
+              status:"admitted",run_id:$run_id,workflow_sha:$workflow_sha,
+              launch_digest:$launch_digest,binding_sha256:$binding_sha256}' > "$receipt"
+          receipt_sha256="$(sha256sum "$receipt" | cut -d' ' -f1)"
+          {
+            echo "admitted=true"
+            echo "launch_digest=$INPUT_LAUNCH_DIGEST"
+            echo "receipt_sha256=$receipt_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+  resolve:
+    name: Resolve exact source and publication intent
+    if: >-
+      always()
+      && (github.event_name != 'workflow_dispatch' || inputs.release_mode != 'maintenance_launcher')
+      && (github.event_name != 'workflow_dispatch' || inputs.release_mode != 'maintenance_child' || needs.child-admission.result == 'success')
+    needs: [child-admission]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       publish: ${{ steps.source.outputs.publish }}
       source_sha: ${{ steps.source.outputs.source_sha }}
@@ -67,6 +485,10 @@ jobs:
       workflow_sha: ${{ steps.source.outputs.workflow_sha }}
       workflow_run_id: ${{ steps.source.outputs.workflow_run_id }}
       workflow_run_attempt: ${{ steps.source.outputs.workflow_run_attempt }}
+      maintenance: ${{ steps.source.outputs.maintenance }}
+      source_tree: ${{ steps.source.outputs.source_tree }}
+      schema_sha256: ${{ steps.source.outputs.schema_sha256 }}
+      action_schema_sha256: ${{ steps.source.outputs.action_schema_sha256 }}
     steps:
       - name: Validate event inputs
         id: source
@@ -87,10 +509,26 @@ jobs:
           INPUT_SOURCE_REF: ${{ inputs.source_ref }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           INPUT_CONFIRM: ${{ inputs.confirm_publish }}
+          INPUT_RELEASE_MODE: ${{ inputs.release_mode }}
+          INPUT_PARENT_RUN_ID: ${{ inputs.parent_run_id }}
+          INPUT_PARENT_WORKFLOW_SHA: ${{ inputs.parent_workflow_sha }}
+          INPUT_LAUNCH_DIGEST: ${{ inputs.launch_digest }}
+          INPUT_LAUNCH_NONCE: ${{ inputs.launch_nonce }}
+          CHILD_ADMITTED: ${{ needs.child-admission.outputs.admitted }}
+          CHILD_ADMISSION_LAUNCH_DIGEST: ${{ needs.child-admission.outputs.launch_digest }}
+          CHILD_ADMISSION_RECEIPT_SHA256: ${{ needs.child-admission.outputs.receipt_sha256 }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          DEFAULT_SCHEMA_SHA256: ${{ env.SCHEMA_SHA256 }}
+          DEFAULT_ACTION_SCHEMA_SHA256: ${{ env.ACTION_SCHEMA_SHA256 }}
         run: |
+          # shellcheck disable=SC2153
           set -euo pipefail
 
           publish=false
+          maintenance=false
+          source_tree=""
+          schema_sha256="$DEFAULT_SCHEMA_SHA256"
+          action_schema_sha256="$DEFAULT_ACTION_SCHEMA_SHA256"
           release_tag=""
           case "$EVENT_NAME" in
             pull_request)
@@ -131,6 +569,44 @@ jobs:
                 echo "::error::refs/heads/main is not protected by repository controls."
                 exit 1
               }
+              [ "$WORKFLOW_RUN_ATTEMPT" = "1" ] || {
+                echo "::error::Release workflow reruns are prohibited."
+                exit 1
+              }
+              [ "$REPOSITORY_VISIBILITY" = "public" ] || {
+                echo "::error::The bounded release requires a public repository and standard included runners."
+                exit 1
+              }
+              if [ "$INPUT_RELEASE_MODE" = "maintenance_child" ]; then
+                maintenance=true
+                source_tree="$MAINTENANCE_SOURCE_TREE"
+                schema_sha256="$MAINTENANCE_READ_SCHEMA_SHA256"
+                action_schema_sha256="$MAINTENANCE_ACTION_SCHEMA_SHA256"
+                [ "$source_sha" = "$MAINTENANCE_SOURCE_SHA" ]
+                [ "$source_ref" = "refs/tags/${MAINTENANCE_RELEASE_TAG}" ]
+                [ "$release_tag" = "$MAINTENANCE_RELEASE_TAG" ]
+                [[ "$INPUT_PARENT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+                [ "$INPUT_PARENT_WORKFLOW_SHA" = "$WORKFLOW_SHA" ]
+                [[ "$INPUT_LAUNCH_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+                [[ "$INPUT_LAUNCH_NONCE" =~ ^[0-9a-f]{64}$ ]]
+                expected_launch_digest="$(printf '%s\n' \
+                  "parent_run_id=${INPUT_PARENT_RUN_ID}" \
+                  "workflow_sha=${WORKFLOW_SHA}" \
+                  "source_sha=${MAINTENANCE_SOURCE_SHA}" \
+                  "source_tree=${MAINTENANCE_SOURCE_TREE}" \
+                  "release_tag=${MAINTENANCE_RELEASE_TAG}" \
+                  "read_schema=${MAINTENANCE_READ_SCHEMA_SHA256}" \
+                  "action_schema=${MAINTENANCE_ACTION_SCHEMA_SHA256}" \
+                  "launch_nonce=${INPUT_LAUNCH_NONCE}" \
+                  | sha256sum | cut -d' ' -f1)"
+                [ "$INPUT_LAUNCH_DIGEST" = "$expected_launch_digest" ]
+                [ "$CHILD_ADMITTED" = "true" ]
+                [ "$CHILD_ADMISSION_LAUNCH_DIGEST" = "$INPUT_LAUNCH_DIGEST" ]
+                [[ "$CHILD_ADMISSION_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              elif [ "$INPUT_RELEASE_MODE" != "ordinary" ]; then
+                echo "::error::Unsupported release mode."
+                exit 1
+              fi
               expected_confirmation="publish ghcr.io/ragnos-labs/hermes-agent:${release_tag}"
               [ "$INPUT_CONFIRM" = "$expected_confirmation" ] || {
                 echo "::error::Intent confirmation must exactly match: $expected_confirmation"
@@ -169,6 +645,10 @@ jobs:
             echo "workflow_sha=$WORKFLOW_SHA"
             echo "workflow_run_id=$WORKFLOW_RUN_ID"
             echo "workflow_run_attempt=$WORKFLOW_RUN_ATTEMPT"
+            echo "maintenance=$maintenance"
+            echo "source_tree=$source_tree"
+            echo "schema_sha256=$schema_sha256"
+            echo "action_schema_sha256=$action_schema_sha256"
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out audited workflow revision
@@ -185,6 +665,7 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
+          # shellcheck disable=SC2153
           set -euo pipefail
           git fetch --force --no-tags origin refs/heads/main
           [ "$(git rev-parse 'HEAD^{commit}')" = "$WORKFLOW_SHA" ]
@@ -329,11 +810,11 @@ jobs:
           RELEASE_OPERATOR = "ragnos-dev"
 
 
-          def accepted(*, environment_name, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
+          def accepted(*, maintenance, environment_name, reviewers, prevent_self_review, can_admins_bypass, policy, custom_names=()):
               dedicated_environment = environment_name == RELEASE_ENVIRONMENT
               operator_review = (
                   reviewers == [{"type": "User", "login": RELEASE_OPERATOR}]
-                  and prevent_self_review is False
+                  and prevent_self_review is maintenance
               )
               no_admin_bypass = can_admins_bypass is False
               main_only = (
@@ -344,9 +825,10 @@ jobs:
 
 
           protected = dict(
+              maintenance=True,
               environment_name=RELEASE_ENVIRONMENT,
               reviewers=[{"type": "User", "login": RELEASE_OPERATOR}],
-              prevent_self_review=False,
+              prevent_self_review=True,
               can_admins_bypass=False,
               policy="protected_branches",
           )
@@ -356,12 +838,14 @@ jobs:
           }
           assert accepted(**protected)
           assert accepted(**custom_main)
+          assert accepted(**(protected | {"maintenance": False, "prevent_self_review": False}))
           assert not accepted(**(protected | {"can_admins_bypass": True}))
           assert not accepted(**(protected | {"reviewers": []}))
           assert not accepted(**(protected | {"reviewers": [{"type": "User", "login": "independent-maintainer"}]}))
           assert not accepted(**(protected | {"reviewers": protected["reviewers"] + [{"type": "User", "login": "backup-operator"}]}))
           assert not accepted(**(protected | {"reviewers": protected["reviewers"] + [{"type": "Team", "login": "release-operators"}]}))
-          assert not accepted(**(protected | {"prevent_self_review": True}))
+          assert not accepted(**(protected | {"maintenance": True, "prevent_self_review": False}))
+          assert not accepted(**(protected | {"maintenance": False, "prevent_self_review": True}))
           assert not accepted(**(protected | {"policy": None}))
           assert not accepted(**(protected | {"environment_name": "gh-image"}))
           assert not accepted(**(custom_main | {"custom_names": ["release-copy"]}))
@@ -631,6 +1115,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      SCHEMA_SHA256: ${{ needs.resolve.outputs.schema_sha256 }}
+      ACTION_SCHEMA_SHA256: ${{ needs.resolve.outputs.action_schema_sha256 }}
     steps:
       - name: Check out exact source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -642,21 +1129,31 @@ jobs:
       - name: Prove source ref, commit, tree, contract, and schema
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
-          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          RELEASE_SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          SOURCE_TREE: ${{ needs.resolve.outputs.source_tree }}
+          MAINTENANCE: ${{ needs.resolve.outputs.maintenance }}
         run: |
           set -euo pipefail
-          git fetch --force --no-tags origin "$SOURCE_REF"
-          resolved_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
           checked_out_sha="$(git rev-parse 'HEAD^{commit}')"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
-          [ "$resolved_sha" = "$SOURCE_SHA" ] || {
-            echo "::error::Source ref moved: $SOURCE_REF resolves to $resolved_sha, expected $SOURCE_SHA."
-            exit 1
-          }
+          if [ "$MAINTENANCE" != true ]; then
+            git fetch --force --no-tags origin "$RELEASE_SOURCE_REF"
+            resolved_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+            [ "$resolved_sha" = "$SOURCE_SHA" ] || {
+              echo "::error::Source ref moved: $RELEASE_SOURCE_REF resolves to $resolved_sha, expected $SOURCE_SHA."
+              exit 1
+            }
+          fi
           [ "$checked_out_sha" = "$SOURCE_SHA" ] || {
             echo "::error::Checkout mismatch: got $checked_out_sha, expected $SOURCE_SHA."
             exit 1
           }
+          if [ -n "$SOURCE_TREE" ]; then
+            [ "$source_tree" = "$SOURCE_TREE" ] || {
+              echo "::error::Source tree mismatch: got $source_tree, expected $SOURCE_TREE."
+              exit 1
+            }
+          fi
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
           printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
           python3 - <<'PY'
@@ -673,7 +1170,7 @@ jobs:
           PY
           {
             echo "### Exact source proof"
-            echo "- ref: \`$SOURCE_REF\`"
+            echo "- ref: \`$RELEASE_SOURCE_REF\`"
             echo "- commit: \`$SOURCE_SHA\`"
             echo "- tree: \`$source_tree\`"
             echo "- contract: \`$CONTRACT_VERSION\`"
@@ -724,7 +1221,24 @@ jobs:
     timeout-minutes: 50
     permissions:
       contents: read
+    env:
+      SCHEMA_SHA256: ${{ needs.resolve.outputs.schema_sha256 }}
+      ACTION_SCHEMA_SHA256: ${{ needs.resolve.outputs.action_schema_sha256 }}
     steps:
+      - name: Verify exact native build runner
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_OS" = "Linux" ]
+          case "$EXPECTED_ARCH" in
+            amd64) [ "$RUNNER_ARCH" = "X64" ] ;;
+            arm64) [ "$RUNNER_ARCH" = "ARM64" ] ;;
+            *) exit 1 ;;
+          esac
+
       - name: Check out exact source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -735,12 +1249,19 @@ jobs:
       - name: Prove source and schema before build
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
-          SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          RELEASE_SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
+          SOURCE_TREE: ${{ needs.resolve.outputs.source_tree }}
+          MAINTENANCE: ${{ needs.resolve.outputs.maintenance }}
         run: |
           set -euo pipefail
-          git fetch --force --no-tags origin "$SOURCE_REF"
-          [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
+          if [ "$MAINTENANCE" != true ]; then
+            git fetch --force --no-tags origin "$RELEASE_SOURCE_REF"
+            [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$SOURCE_SHA" ]
+          fi
           [ "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA" ]
+          if [ -n "$SOURCE_TREE" ]; then
+            [ "$(git rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE" ]
+          fi
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
           printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
 
@@ -768,7 +1289,7 @@ jobs:
           build-args: |
             HERMES_GIT_SHA=${{ needs.resolve.outputs.source_sha }}
           cache-from: ${{ matrix.cache-from }}
-          cache-to: ${{ github.event_name != 'pull_request' && matrix.cache-to || '' }}
+          cache-to: ${{ github.event_name != 'pull_request' && needs.resolve.outputs.maintenance != 'true' && matrix.cache-to || '' }}
 
       - name: Prove native image revision and packaged contract
         env:
@@ -805,7 +1326,7 @@ jobs:
           )
 
           expected_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
-          expected_action_sha = "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
+          expected_action_sha = os.environ["ACTION_SCHEMA_SHA256"]
           expected_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
           schema_path = files("hermes_cli").joinpath(
               "execution_contract_schemas/hermes.execution.read.v1.schema.json"
@@ -841,13 +1362,18 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      approval_digest: ${{ steps.approval.outputs.approval_digest }}
     steps:
       - name: Require protected release approval and main-only deployment
+        id: approval
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ENVIRONMENT: hermes-execution-read-release
           REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_TREE: ${{ needs.resolve.outputs.source_tree }}
+          MAINTENANCE: ${{ needs.resolve.outputs.maintenance }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
         run: |
           set -euo pipefail
@@ -877,19 +1403,24 @@ jobs:
             echo "::error::main moved after the audited workflow revision; dispatch is stale."
             exit 1
           }
-          comparison_status="$(gh api "repos/${REPOSITORY}/compare/${SOURCE_SHA}...${WORKFLOW_SHA}" --jq '.status')" || {
-            record_authorization_failure "source_ancestry_unavailable"
-            echo "::error::Could not prove source ancestry against the audited workflow revision."
-            exit 1
-          }
-          [[ "$comparison_status" =~ ^(ahead|identical)$ ]] || {
-            record_authorization_failure "source_not_ancestor_of_workflow"
-            echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
-            exit 1
-          }
+          if [ "$MAINTENANCE" = true ]; then
+            [ "$SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+            [ "$SOURCE_TREE" = "$MAINTENANCE_SOURCE_TREE" ]
+          else
+            comparison_status="$(gh api "repos/${REPOSITORY}/compare/${SOURCE_SHA}...${WORKFLOW_SHA}" --jq '.status')" || {
+              record_authorization_failure "source_ancestry_unavailable"
+              echo "::error::Could not prove source ancestry against the audited workflow revision."
+              exit 1
+            }
+            [[ "$comparison_status" =~ ^(ahead|identical)$ ]] || {
+              record_authorization_failure "source_not_ancestor_of_workflow"
+              echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
+              exit 1
+            }
+          fi
           environment_json="$RUNNER_TEMP/release-environment.json"
           gh api "repos/${REPOSITORY}/environments/${RELEASE_ENVIRONMENT}" > "$environment_json"
-          python3 - "$environment_json" <<'PY'
+          MAINTENANCE="$MAINTENANCE" python3 - "$environment_json" <<'PY'
           import json
           import os
           import sys
@@ -897,6 +1428,7 @@ jobs:
           environment = json.load(open(sys.argv[1], encoding="utf-8"))
           release_environment = os.environ["RELEASE_ENVIRONMENT"]
           release_operator = "ragnos-dev"
+          maintenance = os.environ["MAINTENANCE"] == "true"
           assert environment.get("name") == release_environment, (
               "GitHub returned the wrong release environment"
           )
@@ -910,10 +1442,10 @@ jobs:
               len(reviewers) == 1
               and reviewers[0].get("type") == "User"
               and reviewers[0].get("reviewer", {}).get("login") == release_operator
-              and reviewer_rules[0].get("prevent_self_review") is False
+              and reviewer_rules[0].get("prevent_self_review") is maintenance
           ), (
-              f"{release_environment} must require the RAGnos release operator "
-              "and permit its bounded approval"
+              f"{release_environment} must require Hunter's ragnos-dev account "
+              f"with self-review prevention {'enabled' if maintenance else 'disabled'}"
           )
           assert environment.get("can_admins_bypass") is False, (
               f"{release_environment} must disable administrator protection-rule bypass"
@@ -935,8 +1467,67 @@ jobs:
             }
           fi
 
+          if [ "$MAINTENANCE" = true ]; then
+            approvals="$RUNNER_TEMP/release-approvals.json"
+            gh api "repos/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals" > "$approvals"
+            approval_digest="$(APPROVALS="$approvals" python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          approvals = json.load(open(os.environ["APPROVALS"], encoding="utf-8"))
+          expected = []
+          for approval in approvals:
+              environments = approval.get("environments", [])
+              if (
+                  approval.get("state") == "approved"
+                  and approval.get("user", {}).get("login") == "ragnos-dev"
+                  and approval.get("user", {}).get("id") == 214172043
+                  and len(environments) == 1
+                  and environments[0].get("id") == 19967279515
+                  and environments[0].get("name") == "hermes-execution-read-release"
+              ):
+                  match = re.fullmatch(
+                      r"approve hermes-maintenance-gates sha256:([0-9a-f]{64})",
+                      approval.get("comment") or "",
+                  )
+                  if match:
+                      expected.append(match.group(1))
+          assert len(expected) == 1, expected
+          print(expected[0])
+          PY
+            )"
+            [[ "$approval_digest" =~ ^[0-9a-f]{64}$ ]]
+            APPROVAL_DIGEST="$approval_digest" AUTHORIZATION_RECEIPT="$authorization_receipt" \
+            SOURCE_SHA="$SOURCE_SHA" WORKFLOW_SHA="$WORKFLOW_SHA" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path(os.environ["AUTHORIZATION_RECEIPT"]).write_text(json.dumps({
+              "receipt_version": "hermes.execution.read.authorization-receipt.v1",
+              "status": "approved",
+              "environment": {"id": 19967279515, "name": "hermes-execution-read-release"},
+              "reviewer": {"id": 214172043, "login": "ragnos-dev"},
+              "gate_packet_sha256": os.environ["APPROVAL_DIGEST"],
+              "source_sha": os.environ["SOURCE_SHA"],
+              "workflow_sha": os.environ["WORKFLOW_SHA"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+            echo "approval_digest=$approval_digest" >> "$GITHUB_OUTPUT"
+          fi
+
           echo "External hold passed: ${RELEASE_ENVIRONMENT} operator approval and main deployment restriction are present."
           echo "CalVer tag protection and GHCR package-writer restriction remain pilot-owned external gates."
+
+      - name: Enforce authorization artifact cap
+        if: always()
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/authorization-receipt.json"
+          [ ! -e "$candidate" ] || [ "$(stat -c %s "$candidate")" -le 262144 ]
 
       - name: Upload authorization failure receipt
         if: always()
@@ -945,17 +1536,188 @@ jobs:
           name: ghcr-execution-read-authorization-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/authorization-receipt.json
           if-no-files-found: ignore
-          retention-days: 90
+          retention-days: 89
+
+  release-lock:
+    name: Create exact maintenance release lock
+    if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.maintenance == 'true' && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, authorize]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+      packages: read
+    outputs:
+      tag_sha: ${{ steps.lock.outputs.tag_sha }}
+      receipt_sha256: ${{ steps.lock.outputs.receipt_sha256 }}
+    steps:
+      - name: Re-prove collision, ACL, ruleset, and create the tag once
+        id: lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_TREE: ${{ needs.resolve.outputs.source_tree }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve.outputs.workflow_run_id }}
+          WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+          MAINTENANCE: ${{ needs.resolve.outputs.maintenance }}
+          APPROVAL_DIGEST: ${{ needs.authorize.outputs.approval_digest }}
+        run: |
+          set -euo pipefail
+          [ "$SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+          [ "$SOURCE_TREE" = "$MAINTENANCE_SOURCE_TREE" ]
+          [ "$RELEASE_TAG" = "$MAINTENANCE_RELEASE_TAG" ]
+          [ "$WORKFLOW_RUN_ATTEMPT" = "1" ]
+          [[ "$APPROVAL_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          [ "$(gh api "repos/${REPOSITORY}/git/ref/heads/main" --jq .object.sha)" = "$WORKFLOW_SHA" ]
+
+          package_json="$RUNNER_TEMP/maintenance-package.json"
+          active_versions="$RUNNER_TEMP/maintenance-active-versions.json"
+          deleted_versions="$RUNNER_TEMP/maintenance-deleted-versions.json"
+          rulesets="$RUNNER_TEMP/maintenance-rulesets.json"
+          tag_probe="$RUNNER_TEMP/maintenance-tag-probe.json"
+          tag_create="$RUNNER_TEMP/maintenance-tag-create.json"
+          receipt="$RUNNER_TEMP/maintenance-release-lock.json"
+
+          gh api "orgs/ragnos-labs/packages/container/hermes-agent" > "$package_json"
+          jq -e '.package_type == "container"
+                 and .name == "hermes-agent"
+                 and .visibility == "public"
+                 and .repository.full_name == "ragnos-labs/hermes-agent"' \
+            "$package_json" >/dev/null
+          gh api --paginate --slurp \
+            "orgs/ragnos-labs/packages/container/hermes-agent/versions?state=active&per_page=100" \
+            > "$active_versions"
+          gh api --paginate --slurp \
+            "orgs/ragnos-labs/packages/container/hermes-agent/versions?state=deleted&per_page=100" \
+            > "$deleted_versions"
+          ACTIVE_VERSIONS="$active_versions" DELETED_VERSIONS="$deleted_versions" \
+          RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
+          import json
+          import os
+
+          def versions(name):
+              pages = json.load(open(os.environ[name], encoding="utf-8"))
+              return [item for page in pages for item in page]
+
+          for state in ("ACTIVE_VERSIONS", "DELETED_VERSIONS"):
+              for version in versions(state):
+                  tags = version.get("metadata", {}).get("container", {}).get("tags", [])
+                  assert os.environ["RELEASE_TAG"] not in tags, (state, version.get("id"))
+          PY
+
+          tag_status="$(curl --silent --show-error --output "$tag_probe" --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          [ "$tag_status" = "404" ] || {
+            echo "::error::The protected release tag is not absent (HTTP ${tag_status})."
+            exit 1
+          }
+
+          gh api --paginate --slurp "repos/${REPOSITORY}/rulesets?includes_parents=true&per_page=100" > "$rulesets"
+          RULESETS="$rulesets" REPOSITORY="$REPOSITORY" GH_TOKEN="$GH_TOKEN" \
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          pages = json.load(open(os.environ["RULESETS"], encoding="utf-8"))
+          summaries = [item for page in pages for item in page]
+          accepted = []
+          for summary in summaries:
+              if summary.get("id") != 20903555:
+                  continue
+              if summary.get("enforcement") != "active" or summary.get("target") != "tag":
+                  continue
+              result = subprocess.run(
+                  ["gh", "api", f"repos/{os.environ['REPOSITORY']}/rulesets/{summary['id']}"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  env={"GH_TOKEN": os.environ["GH_TOKEN"]},
+              )
+              rule = json.loads(result.stdout)
+              include = rule.get("conditions", {}).get("ref_name", {}).get("include", [])
+              types = {item.get("type") for item in rule.get("rules", [])}
+              if (
+                  "refs/tags/v20*" in include
+                  and "deletion" in types
+                  and "update" in types
+                  and "creation" not in types
+              ):
+                  accepted.append(rule["id"])
+          assert accepted == [20903555], accepted
+          PY
+
+          jq -n --arg ref "refs/tags/${RELEASE_TAG}" --arg sha "$SOURCE_SHA" \
+            '{ref: $ref, sha: $sha}' > "$RUNNER_TEMP/maintenance-create-ref-request.json"
+          # Atomic create-only lock. Never retry, update, move, or delete this ref.
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            --data-binary "@$RUNNER_TEMP/maintenance-create-ref-request.json" \
+            "https://api.github.com/repos/${REPOSITORY}/git/refs" > "$tag_create"
+          jq -e --arg ref "refs/tags/${RELEASE_TAG}" --arg sha "$SOURCE_SHA" \
+            '.ref == $ref and .object.type == "commit" and .object.sha == $sha' "$tag_create" >/dev/null
+          [ "$(gh api "repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq .object.sha)" = "$SOURCE_SHA" ]
+
+          jq -n \
+            --arg release_tag "$RELEASE_TAG" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_tree "$SOURCE_TREE" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            --arg run_id "$WORKFLOW_RUN_ID" \
+            --arg run_attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --arg approval_digest "$APPROVAL_DIGEST" \
+            '{receipt_version:"hermes.execution.read.github-release-lock.v1",
+              status:"created", release_tag:$release_tag,
+              source:{sha:$source_sha,tree:$source_tree},
+              workflow:{sha:$workflow_sha,run_id:$run_id,run_attempt:$run_attempt},
+              collision:{git_ref:"absent",active_versions:"absent",deleted_versions:"absent"},
+              package_link:{linked_repository:"ragnos-labs/hermes-agent",visibility:"public"},
+              privileged_review:{environment:"hermes-execution-read-release",receipt_digest:$approval_digest,
+                covers:["organization_audit_180d","package_acl","workflow_writer","tag_ruleset"]},
+              recovery:{state:"immutable_tag_created",instruction:"Never move or delete the tag; reconcile partial registry state before any successor."}}' \
+            > "$receipt"
+          receipt_sha256="$(sha256sum "$receipt" | cut -d' ' -f1)"
+          echo "tag_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "receipt_sha256=$receipt_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce release-lock artifact cap
+        if: always()
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/maintenance-release-lock.json"
+          [ ! -e "$candidate" ] || [ "$(stat -c %s "$candidate")" -le 262144 ]
+
+      - name: Upload maintenance release-lock receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghcr-execution-read-release-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/maintenance-release-lock.json
+          if-no-files-found: ignore
+          retention-days: 89
 
   registry-preflight:
     name: Authenticated destination preflight
-    if: needs.resolve.outputs.publish == 'true' && github.repository == 'ragnos-labs/hermes-agent'
-    needs: [resolve, authorize]
+    if: always() && needs.resolve.outputs.publish == 'true' && needs.authorize.result == 'success' && (needs.resolve.outputs.maintenance != 'true' || needs.release-lock.result == 'success') && github.repository == 'ragnos-labs/hermes-agent'
+    needs: [resolve, authorize, release-lock]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       packages: read
+    env:
+      SCHEMA_SHA256: ${{ needs.resolve.outputs.schema_sha256 }}
+      ACTION_SCHEMA_SHA256: ${{ needs.resolve.outputs.action_schema_sha256 }}
     outputs:
       rebuild: ${{ steps.preflight.outputs.rebuild }}
       sha_state: ${{ steps.preflight.outputs.sha_state }}
@@ -1112,10 +1874,15 @@ jobs:
             record_preflight_failure source_tag_moved moved_tag
             exit 1
           }
-          git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
-            record_preflight_failure source_not_ancestor_of_workflow invalid_ancestry
-            exit 1
-          }
+          if [ "$MAINTENANCE" = true ]; then
+            [ "$SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+            [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$MAINTENANCE_SOURCE_TREE" ]
+          else
+            git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
+              record_preflight_failure source_not_ancestor_of_workflow invalid_ancestry
+              exit 1
+            }
+          fi
 
           sha_ref="${IMAGE_NAME}:sha-${SOURCE_SHA}"
           release_ref="${IMAGE_NAME}:${RELEASE_TAG}"
@@ -1167,7 +1934,7 @@ jobs:
                   and annotations.get("io.ragnos.hermes.execution.contract") == "hermes.execution.read.v1"
                   and annotations.get("io.ragnos.hermes.execution.schema-sha256") == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
                   and annotations.get("io.ragnos.hermes.execution.action-contract") == "hermes.execution.action.v1"
-                  and annotations.get("io.ragnos.hermes.execution.action-schema-sha256") == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
+                  and annotations.get("io.ragnos.hermes.execution.action-schema-sha256") == os.environ["ACTION_SCHEMA_SHA256"]
                   and annotations.get("io.ragnos.hermes.execution.action-source-sha") == os.environ["SOURCE_SHA"]
               )
               digest = Path(os.environ[f"{prefix}_DIGEST_PATH"]).read_text(encoding="utf-8").strip()
@@ -1207,6 +1974,13 @@ jobs:
               raise SystemExit("; ".join(errors))
           PY
 
+      - name: Enforce preflight artifact cap
+        if: always()
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/ghcr-execution-read-preflight.json"
+          [ ! -e "$candidate" ] || [ "$(stat -c %s "$candidate")" -le 524288 ]
+
       - name: Upload current-attempt preflight receipt
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1214,7 +1988,7 @@ jobs:
           name: ghcr-execution-read-preflight-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ghcr-execution-read-preflight.json
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 89
 
   publish:
     name: Publish untagged digest (${{ matrix.arch }})
@@ -1239,7 +2013,24 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      SCHEMA_SHA256: ${{ needs.resolve.outputs.schema_sha256 }}
+      ACTION_SCHEMA_SHA256: ${{ needs.resolve.outputs.action_schema_sha256 }}
     steps:
+      - name: Verify exact publication runner
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_OS" = "Linux" ]
+          case "$EXPECTED_ARCH" in
+            amd64) [ "$RUNNER_ARCH" = "X64" ] ;;
+            arm64) [ "$RUNNER_ARCH" = "ARM64" ] ;;
+            *) exit 1 ;;
+          esac
+
       - name: Check out exact approved source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1298,11 +2089,16 @@ jobs:
             record_arch_failure source_checkout_mismatch
             exit 1
           }
-          git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
-            record_arch_failure source_not_ancestor_of_workflow
-            echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main; no digest may be pushed."
-            exit 1
-          }
+          if [ "$MAINTENANCE" = true ]; then
+            [ "$SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+            [ "$(git rev-parse 'HEAD^{tree}')" = "$MAINTENANCE_SOURCE_TREE" ]
+          else
+            git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
+              record_arch_failure source_not_ancestor_of_workflow
+              echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main; no digest may be pushed."
+              exit 1
+            }
+          fi
           printf '%s  %s\n' "$SCHEMA_SHA256" "$SCHEMA_PATH" | sha256sum -c -
           printf '%s  %s\n' "$ACTION_SCHEMA_SHA256" "$ACTION_SCHEMA_PATH" | sha256sum -c -
 
@@ -1337,7 +2133,7 @@ jobs:
           provenance: mode=max
           sbom: true
           cache-from: ${{ matrix.cache-from }}
-          cache-to: ${{ matrix.cache-to }}
+          cache-to: ${{ needs.resolve.outputs.maintenance == 'true' && '' || matrix.cache-to }}
 
       - name: Initialize pushed-digest recovery evidence
         env:
@@ -1442,7 +2238,7 @@ jobs:
           )
 
           expected_schema_sha = "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
-          expected_action_schema_sha = "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
+          expected_action_schema_sha = os.environ["ACTION_SCHEMA_SHA256"]
           embedded_source = Path("/opt/hermes/.hermes_build_sha").read_text().strip()
           packaged_schema = files("hermes_cli").joinpath(
               "execution_contract_schemas/hermes.execution.read.v1.schema.json"
@@ -1539,6 +2335,13 @@ jobs:
           print(json.dumps(receipt, indent=2, sort_keys=True))
           PY
 
+      - name: Enforce per-architecture artifact cap
+        if: always()
+        run: |
+          set -euo pipefail
+          candidate="$RUNNER_TEMP/publication-evidence/${{ matrix.arch }}"
+          [ ! -e "$candidate" ] || [ "$(du -sb "$candidate" | cut -f1)" -le 10485760 ]
+
       - name: Upload durable architecture proof
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1546,7 +2349,7 @@ jobs:
           name: ghcr-execution-read-proof-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publication-evidence/${{ matrix.arch }}
           if-no-files-found: ignore
-          retention-days: 90
+          retention-days: 89
 
   manifest:
     name: Publish immutable SHA and approved release tag
@@ -1557,6 +2360,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+      receipt_digest: ${{ steps.receipt.outputs.digest }}
+      action_receipt_digest: ${{ steps.action-receipt.outputs.digest }}
+    env:
+      SCHEMA_SHA256: ${{ needs.resolve.outputs.schema_sha256 }}
+      ACTION_SCHEMA_SHA256: ${{ needs.resolve.outputs.action_schema_sha256 }}
     steps:
       - name: Download current-attempt authenticated preflight receipt
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -1646,9 +2456,9 @@ jobs:
           receipt["recovery"] = {
               "state": "ready_for_finalization" if ready else "orphan_children",
               "instruction": (
-                  "Re-run the same globally serialized dispatch after repairing the failed architecture; no destination tag was created."
+                  "Preserve the orphan child evidence and stop for a separately admitted successor; no second dispatch is authorized."
                   if missing else
-                  "Finalize only from exact preflight or current-attempt child digests; reconcile any ambiguous delivery before rerun."
+                  "Finalize only from exact preflight or current-attempt child digests; any ambiguous delivery is terminal pending fresh governance."
               ),
           }
           Path(os.environ["RECEIPT_PATH"]).write_text(
@@ -1714,10 +2524,13 @@ jobs:
         env:
           REBUILD: ${{ needs.registry-preflight.outputs.rebuild }}
           RECEIPT_PATH: ${{ runner.temp }}/ghcr-execution-read-receipt.json
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           SOURCE_REF: ${{ needs.resolve.outputs.source_ref }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           WORKFLOW_SHA: ${{ needs.resolve.outputs.workflow_sha }}
+          MAINTENANCE: ${{ needs.resolve.outputs.maintenance }}
         run: |
           set -euo pipefail
           [ "$IMAGE_NAME" = "ghcr.io/ragnos-labs/hermes-agent" ]
@@ -1753,7 +2566,7 @@ jobs:
               record_failure \
                 "workflow_revision_stale" \
                 "main_moved" \
-                "No further image tag mutation is allowed. Re-dispatch the audited workflow revision from current protected main."
+                "No further image tag mutation is allowed. Stop for fresh governance against current protected main."
               echo "::error::main moved to $current_main; audited workflow revision is $WORKFLOW_SHA."
               exit 1
             }
@@ -1761,7 +2574,7 @@ jobs:
               record_failure \
                 "source_tag_unavailable" \
                 "moved_or_missing_tag" \
-                "No image tag was created. Restore or re-authorize the exact protected CalVer source tag before rerun."
+                "No image tag was created. Stop and reconcile the exact protected CalVer source tag."
               echo "::error::CalVer source tag is unavailable: $SOURCE_REF"
               exit 1
             fi
@@ -1774,14 +2587,19 @@ jobs:
               echo "::error::CalVer source tag moved to $resolved_sha; expected $SOURCE_SHA."
               exit 1
             }
-            git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
-              record_failure \
-                "source_not_ancestor_of_workflow" \
-                "invalid_ancestry" \
-                "No further image tag mutation is allowed. SOURCE_SHA must be an ancestor of WORKFLOW_SHA/current protected main."
-              echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
-              exit 1
-            }
+            if [ "$MAINTENANCE" = true ]; then
+              [ "$SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+              [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$MAINTENANCE_SOURCE_TREE" ]
+            else
+              git merge-base --is-ancestor "$SOURCE_SHA" "$WORKFLOW_SHA" || {
+                record_failure \
+                  "source_not_ancestor_of_workflow" \
+                  "invalid_ancestry" \
+                  "No further image tag mutation is allowed. SOURCE_SHA must be an ancestor of WORKFLOW_SHA/current protected main."
+                echo "::error::SOURCE_SHA is not an ancestor of WORKFLOW_SHA/current main."
+                exit 1
+              }
+            fi
           }
 
           inspect_ref() {
@@ -1911,7 +2729,7 @@ jobs:
               receipt["index_digest"] = os.environ["DELIVERY_ACTUAL_DIGEST"]
           receipt["recovery"] = {
               "state": os.environ["DELIVERY_STATE"],
-              "instruction": "Do not retry blindly. Reinspect both destination tags and reconcile this receipt before another globally serialized dispatch.",
+              "instruction": "Do not retry. Reinspect both destination tags and stop for fresh governance.",
           }
           path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
@@ -1929,6 +2747,42 @@ jobs:
               reconcile_delivery_failure "$operation" "$target_ref" "$expected_digest" "$rc"
               return "$rc"
             fi
+          }
+
+          recheck_maintenance_candidate_absence() {
+            [ "$MAINTENANCE" = true ] || return 0
+            local active_versions="$RUNNER_TEMP/maintenance-action-time-active-versions.json"
+            local deleted_versions="$RUNNER_TEMP/maintenance-action-time-deleted-versions.json"
+            # Last GET-only package inventory reads before the first manifest
+            # tag mutation. API, pagination, shape, or collision ambiguity is
+            # terminal for this sole attempt.
+            gh api --paginate --slurp \
+              "orgs/ragnos-labs/packages/container/hermes-agent/versions?state=active&per_page=100" \
+              > "$active_versions"
+            gh api --paginate --slurp \
+              "orgs/ragnos-labs/packages/container/hermes-agent/versions?state=deleted&per_page=100" \
+              > "$deleted_versions"
+            ACTIVE_VERSIONS="$active_versions" DELETED_VERSIONS="$deleted_versions" \
+            RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
+          import json
+          import os
+
+          def versions(name):
+              pages = json.load(open(os.environ[name], encoding="utf-8"))
+              assert isinstance(pages, list)
+              values = []
+              for page in pages:
+                  assert isinstance(page, list)
+                  values.extend(page)
+              return values
+
+          for state in ("ACTIVE_VERSIONS", "DELETED_VERSIONS"):
+              for version in versions(state):
+                  assert isinstance(version, dict)
+                  tags = version.get("metadata", {}).get("container", {}).get("tags", [])
+                  assert isinstance(tags, list)
+                  assert os.environ["RELEASE_TAG"] not in tags, (state, version.get("id"))
+          PY
           }
 
           prove_source_tag
@@ -2036,7 +2890,7 @@ jobs:
                   and annotations.get("io.ragnos.hermes.execution.action-contract")
                   == "hermes.execution.action.v1"
                   and annotations.get("io.ragnos.hermes.execution.action-schema-sha256")
-                  == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
+                  == os.environ["ACTION_SCHEMA_SHA256"]
                   and annotations.get("io.ragnos.hermes.execution.action-source-sha")
                   == os.environ["SOURCE_SHA"]
               )
@@ -2089,6 +2943,7 @@ jobs:
             prove_source_tag
             assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
             assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
+            recheck_maintenance_candidate_absence
             create_tag create_sha_from_children "$sha_ref" "" \
               --annotation "index:org.opencontainers.image.revision=${SOURCE_SHA}" \
               --annotation "index:io.ragnos.hermes.execution.contract=${CONTRACT_VERSION}" \
@@ -2102,6 +2957,7 @@ jobs:
             prove_source_tag
             assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
             assert_ref_unchanged "$sha_ref" "$sha_state" "$sha_preflight_digest"
+            recheck_maintenance_candidate_absence
             create_tag create_sha_from_release "$sha_ref" "$release_preflight_digest" \
               --tag "$sha_ref" "${IMAGE_NAME}@${release_preflight_digest}"
           else
@@ -2113,7 +2969,7 @@ jobs:
             exit 1
           }
           [ "$(<"$RUNNER_TEMP/verified-sha.state")" = present ] || {
-            record_failure sha_tag_absent sha_delivery_absent "SHA tag is absent after finalization; reconcile the current-attempt child digests before rerun."
+            record_failure sha_tag_absent sha_delivery_absent "SHA tag is absent after finalization; preserve evidence and stop for fresh governance."
             exit 1
           }
           sha_digest="$(<"$RUNNER_TEMP/verified-sha.digest")"
@@ -2155,7 +3011,7 @@ jobs:
               and annotations.get("io.ragnos.hermes.execution.action-contract")
               == "hermes.execution.action.v1"
               and annotations.get("io.ragnos.hermes.execution.action-schema-sha256")
-              == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
+              == os.environ["ACTION_SCHEMA_SHA256"]
               and annotations.get("io.ragnos.hermes.execution.action-source-sha")
               == os.environ["SOURCE_SHA"]
           )
@@ -2180,7 +3036,7 @@ jobs:
           receipt["index_digest"] = os.environ["SHA_DIGEST"]
           receipt["recovery"] = {
               "state": "resume_release_tag",
-              "instruction": "If the release tag is absent, rerun the same destination release_tag; the matching SHA tag is preserved and reused.",
+              "instruction": "If the release tag is absent, preserve the matching SHA tag and stop for fresh governance.",
           }
           path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
@@ -2189,6 +3045,7 @@ jobs:
             prove_source_tag
             assert_ref_unchanged "$sha_ref" "matching" "$sha_digest"
             assert_ref_unchanged "$release_ref" "$release_state" "$release_preflight_digest"
+            recheck_maintenance_candidate_absence
             create_tag create_release_from_sha "$release_ref" "$sha_digest" \
               --tag "$release_ref" "${IMAGE_NAME}@${sha_digest}"
           fi
@@ -2198,7 +3055,7 @@ jobs:
             exit 1
           }
           [ "$(<"$RUNNER_TEMP/final-release.state")" = present ] || {
-            record_failure release_tag_absent release_delivery_absent "Release tag is absent after finalization; preserve the verified SHA tag and reconcile before rerun."
+            record_failure release_tag_absent release_delivery_absent "Release tag is absent after finalization; preserve the verified SHA tag and stop for fresh governance."
             exit 1
           }
           final_release_digest="$(<"$RUNNER_TEMP/final-release.digest")"
@@ -2244,7 +3101,7 @@ jobs:
           assert annotations["io.ragnos.hermes.execution.contract"] == "hermes.execution.read.v1"
           assert annotations["io.ragnos.hermes.execution.schema-sha256"] == "7b2c4569d52a048c31a5a42861817b748e5742ce6cac6eafba1d41dc090340c3"
           assert annotations["io.ragnos.hermes.execution.action-contract"] == "hermes.execution.action.v1"
-          assert annotations["io.ragnos.hermes.execution.action-schema-sha256"] == "bcbc0d307b9c605a722c6ea805ef27741a35c4c75d07c32c645d0507c3bf9e9b"
+          assert annotations["io.ragnos.hermes.execution.action-schema-sha256"] == os.environ["ACTION_SCHEMA_SHA256"]
           assert annotations["io.ragnos.hermes.execution.action-source-sha"] == os.environ["SOURCE_SHA"]
 
           receipt_path = Path(os.environ["RECEIPT_PATH"])
@@ -2257,7 +3114,7 @@ jobs:
           }
           receipt["recovery"] = {
               "state": "complete",
-              "instruction": "No reconciliation required. Future identical dispatches are read-only idempotent reruns.",
+              "instruction": "No reconciliation required. This one authorized release attempt is terminal.",
           }
           receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           print(json.dumps(receipt, indent=2, sort_keys=True))
@@ -2298,25 +3155,14 @@ jobs:
           mkdir -p "$receipt_dir" "$verify_dir"
           cp "$RECEIPT_PATH" "$receipt_dir/receipt.json"
           cd "$receipt_dir"
-          receipt_digest=""
-          for attempt in 1 2 3; do
-            set +e
-            receipt_digest="$(timeout 120 oras attach \
-              --artifact-type application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json \
-              --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
-              --annotation "io.ragnos.hermes.release-tag=${RELEASE_TAG}" \
-              --annotation "io.ragnos.hermes.workflow-revision=${WORKFLOW_SHA}" \
-              --format go-template --template '{{.digest}}' \
-              "${IMAGE_NAME}@${subject_digest}" \
-              receipt.json:application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json)"
-            rc=$?
-            set -e
-            if [ "$rc" -eq 0 ] && [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              break
-            fi
-            receipt_digest=""
-            sleep "$attempt"
-          done
+          receipt_digest="$(timeout 120 oras attach \
+            --artifact-type application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "io.ragnos.hermes.release-tag=${RELEASE_TAG}" \
+            --annotation "io.ragnos.hermes.workflow-revision=${WORKFLOW_SHA}" \
+            --format go-template --template '{{.digest}}' \
+            "${IMAGE_NAME}@${subject_digest}" \
+            receipt.json:application/vnd.ragnos.hermes.execution.read.release-receipt.v1+json)"
           [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
             echo "::error::Authoritative receipt could not be attached durably after bounded retry."
             exit 1
@@ -2404,28 +3250,17 @@ jobs:
           mkdir -p "$receipt_dir" "$verify_dir"
           cp "$RECEIPT_PATH" "$receipt_dir/receipt.json"
           cd "$receipt_dir"
-          receipt_digest=""
-          for attempt in 1 2 3; do
-            set +e
-            receipt_digest="$(timeout 120 oras attach \
-              --artifact-type application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json \
-              --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
-              --annotation "io.ragnos.hermes.execution.action-contract=${ACTION_CONTRACT_VERSION}" \
-              --annotation "io.ragnos.hermes.execution.action-schema-sha256=${ACTION_SCHEMA_SHA256}" \
-              --annotation "io.ragnos.hermes.execution.action-source-sha=${SOURCE_SHA}" \
-              --annotation "io.ragnos.hermes.release-tag=${RELEASE_TAG}" \
-              --annotation "io.ragnos.hermes.workflow-revision=${WORKFLOW_SHA}" \
-              --format go-template --template '{{.digest}}' \
-              "${IMAGE_NAME}@${INDEX_DIGEST}" \
-              receipt.json:application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json)"
-            rc=$?
-            set -e
-            if [ "$rc" -eq 0 ] && [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              break
-            fi
-            receipt_digest=""
-            sleep "$attempt"
-          done
+          receipt_digest="$(timeout 120 oras attach \
+            --artifact-type application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "io.ragnos.hermes.execution.action-contract=${ACTION_CONTRACT_VERSION}" \
+            --annotation "io.ragnos.hermes.execution.action-schema-sha256=${ACTION_SCHEMA_SHA256}" \
+            --annotation "io.ragnos.hermes.execution.action-source-sha=${SOURCE_SHA}" \
+            --annotation "io.ragnos.hermes.release-tag=${RELEASE_TAG}" \
+            --annotation "io.ragnos.hermes.workflow-revision=${WORKFLOW_SHA}" \
+            --format go-template --template '{{.digest}}' \
+            "${IMAGE_NAME}@${INDEX_DIGEST}" \
+            receipt.json:application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json)"
           [[ "$receipt_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
             echo "::error::Authoritative action receipt could not be attached durably after bounded retry."
             exit 1
@@ -2454,6 +3289,28 @@ jobs:
             echo "- action receipt subject: \`${IMAGE_NAME}@${INDEX_DIGEST}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Enforce final aggregate artifact cap
+        if: always()
+        run: |
+          set -euo pipefail
+          action_bytes=0
+          read_bytes=0
+          for candidate in \
+            "$RUNNER_TEMP/ghcr-execution-action-receipt.json" \
+            "$RUNNER_TEMP/ghcr-execution-action-receipt-oci-manifest.json"; do
+            [ ! -e "$candidate" ] || action_bytes=$((action_bytes + $(stat -c %s "$candidate")))
+          done
+          for candidate in \
+            "$RUNNER_TEMP/ghcr-execution-read-receipt.json" \
+            "$RUNNER_TEMP/ghcr-execution-read-receipt-oci-manifest.json"; do
+            [ ! -e "$candidate" ] || read_bytes=$((read_bytes + $(stat -c %s "$candidate")))
+          done
+          [ "$action_bytes" -le 1048576 ]
+          [ "$read_bytes" -le 1048576 ]
+          # Static upload ceilings include the 64 KiB launcher binding and the
+          # separately gated 1 MiB Sigstore verification artifact.
+          [ $((65536 + 262144 + 262144 + 524288 + 2 * 10485760 + 1048576 + 1048576 + 1048576)) -lt "$MAINTENANCE_MAX_ACTIONS_STORAGE_BYTES" ]
+
       - name: Upload durable machine-readable action receipt
         if: steps.action-receipt.outputs.digest != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -2463,7 +3320,7 @@ jobs:
             ${{ runner.temp }}/ghcr-execution-action-receipt.json
             ${{ runner.temp }}/ghcr-execution-action-receipt-oci-manifest.json
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 89
 
       - name: Upload durable machine-readable receipt
         if: always()
@@ -2474,10 +3331,143 @@ jobs:
             ${{ runner.temp }}/ghcr-execution-read-receipt.json
             ${{ runner.temp }}/ghcr-execution-read-receipt-oci-manifest.json
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 89
 
       - name: Fail closed when an architecture proof is missing
         if: always() && steps.children.outputs.ready != 'true'
         run: |
           echo "::error::Both verified architecture proofs are required; recovery receipt was uploaded."
           exit 1
+
+  sign:
+    name: Sign and verify the immutable maintenance index
+    if: >-
+      needs.resolve.outputs.maintenance == 'true'
+      && needs.authorize.result == 'success'
+      && needs.release-lock.result == 'success'
+      && needs.manifest.result == 'success'
+      && needs.manifest.outputs.digest != ''
+    needs: [resolve, authorize, release-lock, manifest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Verify pinned signing runner
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          [ "$RUNNER_OS" = "Linux" ]
+          [ "$RUNNER_ARCH" = "X64" ]
+
+      - name: Rebind exact maintenance subject
+        env:
+          APPROVAL_DIGEST: ${{ needs.authorize.outputs.approval_digest }}
+          INDEX_DIGEST: ${{ needs.manifest.outputs.digest }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_TREE: ${{ needs.resolve.outputs.source_tree }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve.outputs.workflow_run_attempt }}
+        run: |
+          set -euo pipefail
+          [ "$SOURCE_SHA" = "$MAINTENANCE_SOURCE_SHA" ]
+          [ "$SOURCE_TREE" = "$MAINTENANCE_SOURCE_TREE" ]
+          [ "$RELEASE_TAG" = "$MAINTENANCE_RELEASE_TAG" ]
+          [ "$WORKFLOW_RUN_ATTEMPT" = "1" ]
+          [[ "$INDEX_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$APPROVAL_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+
+      - name: Log in to fork-owned GHCR for signature publication
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: v3.1.3
+
+      - name: Publish one keyless signature and verify Fulcio and Rekor proof
+        env:
+          APPROVAL_DIGEST: ${{ needs.authorize.outputs.approval_digest }}
+          INDEX_DIGEST: ${{ needs.manifest.outputs.digest }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SOURCE_TREE: ${{ needs.resolve.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          identity="https://github.com/ragnos-labs/hermes-agent/.github/workflows/ghcr-execution-read-release.yml@refs/heads/main"
+          issuer="https://token.actions.githubusercontent.com"
+          subject="${IMAGE_NAME}@${INDEX_DIGEST}"
+          bundle="$RUNNER_TEMP/hermes-maintenance-cosign-bundle.json"
+          verified="$RUNNER_TEMP/hermes-maintenance-cosign-verify.json"
+          tool_receipt="$RUNNER_TEMP/hermes-maintenance-signature-receipt.json"
+
+          cosign version --json > "$RUNNER_TEMP/cosign-version.json"
+          jq -e '.gitVersion == "v3.1.3"' "$RUNNER_TEMP/cosign-version.json" >/dev/null
+          cosign_sha256="$(sha256sum "$(command -v cosign)" | cut -d' ' -f1)"
+          [ "$cosign_sha256" = "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71" ]
+
+          # Exactly one signing request. Any ambiguous result is terminal and
+          # never retried by this workflow.
+          cosign sign --yes --bundle "$bundle" "$subject"
+          cosign verify \
+            --bundle "$bundle" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            --output json \
+            "$subject" > "$verified"
+
+          jq -e '
+            (.verificationMaterial.tlogEntries // []) | length > 0
+            and all(.[]; .inclusionProof != null and .logIndex != null)
+          ' "$bundle" >/dev/null
+          jq -e 'type == "array" and length == 1' "$verified" >/dev/null
+
+          jq -n \
+            --arg approval_digest "$APPROVAL_DIGEST" \
+            --arg cosign_action "7e8b541eb2e61bf99390e1afd4be13a184e9ebc5" \
+            --arg cosign_binary_sha256 "$cosign_sha256" \
+            --arg cosign_version "v3.1.3" \
+            --arg identity "$identity" \
+            --arg issuer "$issuer" \
+            --arg index_digest "$INDEX_DIGEST" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_tree "$SOURCE_TREE" \
+            '{receipt_version:"hermes.execution.read.maintenance-signature-receipt.v1",
+              status:"verified",source_sha:$source_sha,source_tree:$source_tree,
+              index_digest:$index_digest,approval_digest:$approval_digest,
+              certificate_identity:$identity,certificate_oidc_issuer:$issuer,
+              transparency_log:"rekor-public",
+              tool:{version:$cosign_version,action_revision:$cosign_action,
+                    binary_sha256:$cosign_binary_sha256}}' > "$tool_receipt"
+
+      - name: Enforce signature evidence and aggregate upload caps
+        run: |
+          set -euo pipefail
+          signature_bytes=0
+          for candidate in \
+            "$RUNNER_TEMP/hermes-maintenance-cosign-bundle.json" \
+            "$RUNNER_TEMP/hermes-maintenance-cosign-verify.json" \
+            "$RUNNER_TEMP/hermes-maintenance-signature-receipt.json"; do
+            [ -f "$candidate" ]
+            signature_bytes=$((signature_bytes + $(stat -c %s "$candidate")))
+          done
+          [ "$signature_bytes" -le 1048576 ]
+          [ $((65536 + 262144 + 262144 + 524288 + 2 * 10485760 + 1048576 + 1048576 + 1048576)) -lt "$MAINTENANCE_MAX_ACTIONS_STORAGE_BYTES" ]
+
+      - name: Upload verified maintenance signature evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-maintenance-signature-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hermes-maintenance-cosign-bundle.json
+            ${{ runner.temp }}/hermes-maintenance-cosign-verify.json
+            ${{ runner.temp }}/hermes-maintenance-signature-receipt.json
+          if-no-files-found: error
+          retention-days: 89
