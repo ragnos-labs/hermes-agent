@@ -264,6 +264,48 @@ def test_strict_root_allowlist_rejects_effect_fields_before_effects(
         assert called == []
 
 
+def test_strict_yaml_rejects_duplicate_keys_before_effects(
+    monkeypatch, tmp_path, capsys
+):
+    from hermes_cli import entrypoint
+
+    duplicate_suffixes = (
+        "  default: conflicting-model\n",
+        "  provider: auto\n",
+        "  tools: []\n  tools: [delegate_task]\n",
+        "agent: {}\nagent: {}\n",
+        "model:\n  output_budget_mode: strict\n",
+    )
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("STRICT_TEST_KEY", "secret-not-for-output")
+
+    for suffix in duplicate_suffixes:
+        _strict_config(home)
+        with (home / "config.yaml").open("a", encoding="utf-8") as stream:
+            stream.write(suffix)
+        called = []
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.oneshot",
+            SimpleNamespace(run_strict_oneshot=lambda *args, **kwargs: called.append(True)),
+        )
+        before = {
+            name
+            for name in sys.modules
+            if name in {"hermes_cli.main", "openai", "run_agent", "model_tools"}
+        }
+        assert entrypoint.main(["-z", "synthetic prompt"]) == 2
+        assert capsys.readouterr().err == "strict_config_rejected\n"
+        assert called == []
+        after = {
+            name
+            for name in sys.modules
+            if name in {"hermes_cli.main", "openai", "run_agent", "model_tools"}
+        }
+        assert after == before
+
+
 def test_strict_wire_call_is_exactly_one_nonstreaming_request():
     from hermes_cli.oneshot import run_strict_oneshot
 

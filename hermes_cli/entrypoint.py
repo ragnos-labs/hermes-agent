@@ -89,7 +89,26 @@ def _read_yaml_mapping(path: Path) -> dict[str, Any]:
     try:
         import yaml
 
-        value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        class _StrictMappingLoader(yaml.SafeLoader):
+            def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+                if not isinstance(node, yaml.MappingNode):
+                    raise StrictRejected
+                self.flatten_mapping(node)
+                mapping: dict[Any, Any] = {}
+                for key_node, value_node in node.value:
+                    key = self.construct_object(key_node, deep=deep)
+                    try:
+                        duplicate = key in mapping
+                    except TypeError:
+                        raise StrictRejected from None
+                    if duplicate:
+                        raise StrictRejected
+                    mapping[key] = self.construct_object(value_node, deep=deep)
+                return mapping
+
+        value = yaml.load(
+            path.read_text(encoding="utf-8"), Loader=_StrictMappingLoader
+        ) or {}
     except Exception:
         raise StrictRejected from None
     if not isinstance(value, dict):
