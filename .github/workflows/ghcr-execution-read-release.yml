@@ -1312,6 +1312,7 @@ jobs:
           [ "$action_source_sha" = "$SOURCE_SHA" ]
           docker run --rm -i \
             -e EXPECTED_SOURCE_SHA="$SOURCE_SHA" \
+            -e ACTION_SCHEMA_SHA256="$ACTION_SCHEMA_SHA256" \
             --entrypoint /opt/hermes/.venv/bin/python "$image" - <<'PY'
           import hashlib
           import os
