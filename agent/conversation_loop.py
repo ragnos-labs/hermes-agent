@@ -146,11 +146,13 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
     agent._strict_output_tokens_reserved = reserved + caps[0]
 
 
-def _require_strict_single_attempt_mode(agent: Any) -> None:
+def _require_strict_single_attempt_mode(
+    agent: Any, *, moa_config: dict[str, Any] | None = None
+) -> None:
     """Reject strict modes whose helper can fan out or retry physical calls."""
     if getattr(agent, "_strict_output_token_budget", None) is None:
         return
-    if getattr(agent, "provider", None) == "moa":
+    if getattr(agent, "provider", None) == "moa" or moa_config is not None:
         raise RuntimeError("strict output budget does not support MoA fan-out")
     api_mode = getattr(agent, "api_mode", None)
     if api_mode not in {"chat_completions", "bedrock_converse"}:
@@ -167,6 +169,21 @@ def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
         raise RuntimeError(
             "strict output budget supports only chat_completions physical attempts"
         )
+    provider = str(getattr(agent, "provider", None) or "").lower()
+    base_url = str(getattr(agent, "base_url", None) or "")
+    client_name = type(getattr(agent, "client", None)).__name__
+    if (
+        provider == "copilot-acp"
+        or base_url.lower().startswith(("acp://copilot", "acp+tcp://"))
+        or client_name == "CopilotACPClient"
+    ):
+        raise RuntimeError("strict output budget does not support Copilot ACP")
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+
+    if client_name == "GeminiNativeClient" or (
+        provider == "gemini" and is_native_gemini_base_url(base_url)
+    ):
+        raise RuntimeError("strict output budget does not support native Gemini")
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -1618,6 +1635,19 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if moa_config is None:
+        try:
+            from hermes_cli.moa_config import decode_moa_turn
+
+            _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
+            if _decoded_moa_config is not None:
+                user_message = _decoded_message
+                moa_config = _decoded_moa_config
+                if persist_user_message is None:
+                    persist_user_message = _decoded_message
+        except Exception:
+            pass
+
     # Strict one-shot execution permits exactly one physical model attempt.
     # Context compression may use a separate summarization LLM, so disable it
     # before both the preflight and post-tool compression paths can run.  The
@@ -1626,7 +1656,7 @@ def run_conversation(
     if getattr(agent, "_strict_output_token_budget", None) is not None:
         agent.compression_enabled = False
     try:
-        _require_strict_single_attempt_mode(agent)
+        _require_strict_single_attempt_mode(agent, moa_config=moa_config)
         _require_strict_physical_single_attempt_mode(agent)
     except RuntimeError as exc:
         # Fail before turn construction, MoA preparation, or any other helper
@@ -1642,19 +1672,6 @@ def run_conversation(
             "partial": False,
             "failed": True,
         }
-
-    if moa_config is None:
-        try:
-            from hermes_cli.moa_config import decode_moa_turn
-
-            _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
-            if _decoded_moa_config is not None:
-                user_message = _decoded_message
-                moa_config = _decoded_moa_config
-                if persist_user_message is None:
-                    persist_user_message = _decoded_message
-        except Exception:
-            pass
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -2875,7 +2892,7 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    _require_strict_single_attempt_mode(agent)
+                    _require_strict_single_attempt_mode(agent, moa_config=moa_config)
                     _require_strict_physical_single_attempt_mode(agent)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -6605,6 +6622,23 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                if getattr(agent, "_strict_output_token_budget", None) is not None:
+                    # The admitted strict one-shot profile is no-tools. Even a
+                    # seemingly local tool can reach an auxiliary model through
+                    # delegation, vision, browser summarization, MCP sampling,
+                    # approval review, or speech rewriting. Stop before every
+                    # tool dispatcher so no child, auxiliary, or tool effect can
+                    # escape the single physical model-attempt latch.
+                    error = "Strict one-shot output ceiling does not permit tool execution"
+                    return {
+                        "final_response": assistant_message.content or "",
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": error,
+                        "partial": True,
+                        "failed": True,
+                    }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 

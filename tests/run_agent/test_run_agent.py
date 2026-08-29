@@ -4209,6 +4209,69 @@ class TestRunConversation:
         prepare.assert_not_called()
         agent.client.chat.completions.create.assert_not_called()
 
+    @pytest.mark.parametrize("encoded", [False, True])
+    def test_strict_oneshot_rejects_per_turn_moa_before_turn_setup(
+        self, agent, encoded
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        moa_config = {
+            "reference_models": [{"provider": "test", "model": "advisor"}],
+            "aggregator": {"provider": "test", "model": "aggregator"},
+        }
+        prompt = "hello"
+        explicit_config = moa_config
+        if encoded:
+            from hermes_cli.moa_config import encode_moa_turn
+
+            prompt = encode_moa_turn(prompt, moa_config)
+            explicit_config = None
+
+        with (
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+            patch("agent.moa_loop.aggregate_moa_context") as aggregate_moa_context,
+            patch.object(agent.client.chat.completions, "prepare") as prepare,
+        ):
+            result = agent.run_conversation(prompt, moa_config=explicit_config)
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert "MoA fan-out" in result["error"]
+        build_turn_context.assert_not_called()
+        aggregate_moa_context.assert_not_called()
+        prepare.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [
+            ("copilot-acp", "acp://copilot"),
+            ("gemini", "https://generativelanguage.googleapis.com/v1beta"),
+        ],
+    )
+    def test_strict_oneshot_rejects_alternate_chat_clients_before_dispatch(
+        self, agent, provider, base_url
+    ):
+        self._setup_agent(agent)
+        agent.provider = provider
+        agent.base_url = base_url
+        agent.api_mode = "chat_completions"
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        with patch("agent.conversation_loop.build_turn_context") as build_turn_context:
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        build_turn_context.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_ordinary_moa_still_prepares_and_dispatches(self, agent):
         self._setup_agent(agent)
         agent.provider = "moa"
@@ -4265,6 +4328,38 @@ class TestRunConversation:
         assert agent._strict_provider_attempted is True
         assert agent.client.chat.completions.create.call_count == 1
 
+    def test_strict_oneshot_rejects_delegate_task_without_child_or_tool_effect(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("delegate_task")
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        tool_call = _mock_tool_call(
+            name="delegate_task", arguments='{"goal":"must not run"}', call_id="d1"
+        )
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tool_call]
+        )
+
+        with (
+            patch.object(agent, "_dispatch_delegate_task") as dispatch_delegate,
+            patch("run_agent.handle_function_call") as handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["api_calls"] == 1
+        assert "does not permit tool execution" in result["error"]
+        assert agent.client.chat.completions.create.call_count == 1
+        dispatch_delegate.assert_not_called()
+        handle_function_call.assert_not_called()
+
     def test_strict_oneshot_disables_compression_before_large_multi_tool_turn(
         self, agent
     ):
@@ -4306,7 +4401,7 @@ class TestRunConversation:
         assert agent.compression_enabled is False
         assert agent._strict_provider_attempted is True
         assert agent.client.chat.completions.create.call_count == 1
-        assert handle_function_call.call_count == 2
+        handle_function_call.assert_not_called()
         should_compress.assert_not_called()
         compress_context.assert_not_called()
         summary_llm.assert_not_called()
