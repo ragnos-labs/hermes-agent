@@ -212,14 +212,7 @@ def _read_strict_probe(argv: Sequence[str], environ: Mapping[str, str]) -> dict[
     markers = [marker for path in paths for marker in _strict_marker_occurrences(path)]
     if len(markers) > 1 or any(marker is None for marker in markers):
         raise StrictRejected
-
-    user = _read_yaml_mapping(paths[0])
-    managed = _read_yaml_mapping(paths[1])
-    config = _deep_merge(user, managed)
-    model = config.get("model")
-    merged_mode = model.get("output_budget_mode") if isinstance(model, dict) else None
-    strict_selected = markers == ["strict"] or merged_mode == "strict"
-    if not strict_selected:
+    if markers != ["strict"]:
         return None
 
     user = _read_yaml_mapping(paths[0], reject_duplicate_keys=True)

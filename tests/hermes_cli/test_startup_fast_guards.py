@@ -344,6 +344,34 @@ def test_nonstrict_duplicate_keys_delegate_to_ordinary_entrypoint(
     assert after == before
 
 
+def test_nonstrict_yaml_aliases_delegate_to_ordinary_entrypoint(
+    monkeypatch, tmp_path
+):
+    from hermes_cli import entrypoint
+
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  default: ordinary-model\n"
+        "auxiliary:\n"
+        "  first: &common\n"
+        "    enabled: true\n"
+        "  second: *common\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    delegated = []
+    monkeypatch.setattr(
+        entrypoint,
+        "_dispatch_ordinary",
+        lambda: delegated.append(True) or 73,
+    )
+
+    assert entrypoint.main(["-z", "ordinary prompt"]) == 73
+    assert delegated == [True]
+
+
 def test_strict_wire_call_is_exactly_one_nonstreaming_request():
     from hermes_cli.oneshot import run_strict_oneshot
 
