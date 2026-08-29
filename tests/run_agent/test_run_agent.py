@@ -3910,6 +3910,9 @@ class TestRunConversation:
         assert result["partial"] is True
         assert result["api_calls"] == 1
         assert result["final_response"] == "Bounded partial"
+        assert result["error"] == (
+            "Strict one-shot output ceiling reached; no continuation attempted"
+        )
         assert agent.client.chat.completions.create.call_count == 1
         streaming_call.assert_not_called()
         assert agent._strict_output_tokens_reserved == 2000
@@ -4074,7 +4077,9 @@ class TestRunConversation:
         assert agent._strict_output_tokens_reserved == 0
         agent.client.chat.completions.create.assert_not_called()
 
-    @pytest.mark.parametrize("invalid_shape", ["cycle", "overdeep", "oversized"])
+    @pytest.mark.parametrize(
+        "invalid_shape", ["cycle", "overdeep", "oversized", "wide"]
+    )
     def test_strict_oneshot_bounds_sidecar_traversal_before_dispatch(
         self, agent, invalid_shape
     ):
@@ -4093,8 +4098,10 @@ class TestRunConversation:
                 child = {}
                 cursor["child"] = [child]
                 cursor = child
-        else:
+        elif invalid_shape == "oversized":
             sidecar = {"items": [{} for _ in range(257)]}
+        else:
+            sidecar = {f"member-{index}": index for index in range(1025)}
 
         def add_invalid_sidecar(_request, callback, **_kwargs):
             return callback(
@@ -4121,6 +4128,63 @@ class TestRunConversation:
         assert result["failed"] is True
         assert agent._strict_output_tokens_reserved == 0
         agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_container_shared_across_sidecar_roots(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        shared = {"routing": ["bounded"]}
+
+        def share_sidecar(_request, callback, **_kwargs):
+            return callback(
+                {
+                    "model": agent.model,
+                    "messages": [],
+                    "max_tokens": 2000,
+                    "extra_body": shared,
+                    "extra_json": shared,
+                }
+            )
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=share_sidecar,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_bedrock_before_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.api_mode = "bedrock_converse"
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        with (
+            patch.object(agent, "_interruptible_api_call") as physical_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "stopped before replay" in result["error"]
+        assert agent._strict_output_tokens_reserved == 0
+        physical_call.assert_not_called()
 
     def test_strict_oneshot_latches_after_one_lowered_provider_attempt(self, agent):
         self._setup_agent(agent)

@@ -71,6 +71,9 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
     cap_keys = {"max_output_tokens", "max_completion_tokens", "max_tokens", "maxTokens"}
     max_sidecar_depth = 32
     max_sidecar_containers = 256
+    max_sidecar_members = 1024
+    seen_containers: set[int] = set()
+    visited_members = 0
     for sidecar_name in ("extra_body", "extra_json"):
         sidecar = api_kwargs.get(sidecar_name)
         if sidecar is None:
@@ -78,7 +81,6 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
         if not isinstance(sidecar, dict):
             raise RuntimeError("strict output budget rejects non-object request sidecars")
         pending: list[tuple[Any, int]] = [(sidecar, 0)]
-        seen_containers: set[int] = set()
         while pending:
             current, depth = pending.pop()
             if depth > max_sidecar_depth:
@@ -98,6 +100,11 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
                 raise RuntimeError("strict output budget rejects invalid request sidecars")
 
             for key, value in items:
+                visited_members += 1
+                if visited_members > max_sidecar_members:
+                    raise RuntimeError(
+                        "strict output budget rejects oversized request sidecars"
+                    )
                 if key in cap_keys:
                     raise RuntimeError(
                         "strict output budget rejects output caps in request sidecars"
@@ -149,6 +156,16 @@ def _require_strict_single_attempt_mode(agent: Any) -> None:
     if api_mode not in {"chat_completions", "bedrock_converse"}:
         raise RuntimeError(
             f"strict output budget does not support multi-attempt API mode: {api_mode}"
+        )
+
+
+def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
+    """Admit only a transport whose SDK cannot retry behind the latch."""
+    if getattr(agent, "_strict_output_token_budget", None) is None:
+        return
+    if getattr(agent, "api_mode", None) != "chat_completions":
+        raise RuntimeError(
+            "strict output budget supports only chat_completions physical attempts"
         )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
@@ -2834,6 +2851,7 @@ def run_conversation(
 
                 def _perform_api_call(next_api_kwargs):
                     _require_strict_single_attempt_mode(agent)
+                    _require_strict_physical_single_attempt_mode(agent)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3515,7 +3533,11 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
-                            if getattr(agent, "_strict_output_token_budget", None) is not None:
+                            _strict_length_stop = (
+                                getattr(agent, "_strict_output_token_budget", None)
+                                is not None
+                            )
+                            if _strict_length_stop:
                                 length_continue_retries = 4
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
@@ -3584,12 +3606,20 @@ def run_conversation(
 
                             partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
                             if partial_response:
-                                agent._vprint(
-                                    f"{agent.log_prefix}⚠️  Response still truncated "
-                                    f"after 4 continuation attempts — keeping the "
-                                    f"partial response received so far.",
-                                    force=True,
-                                )
+                                if _strict_length_stop:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Strict one-shot response "
+                                        f"reached its output ceiling — keeping the partial "
+                                        f"response without continuation.",
+                                        force=True,
+                                    )
+                                else:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Response still truncated "
+                                        f"after 4 continuation attempts — keeping the "
+                                        f"partial response received so far.",
+                                        force=True,
+                                    )
                             # Unanswered continue nudges made every later turn re-truncate.
                             _turn_start = (
                                 current_turn_user_idx + 1
@@ -3622,7 +3652,11 @@ def run_conversation(
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response remained truncated after 4 continuation attempts",
+                                "error": (
+                                    "Strict one-shot output ceiling reached; no continuation attempted"
+                                    if _strict_length_stop
+                                    else "Response remained truncated after 4 continuation attempts"
+                                ),
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
