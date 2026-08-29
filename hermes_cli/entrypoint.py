@@ -20,6 +20,20 @@ _ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _MAX_CONFIG_BYTES = 1_000_000
 _MAX_CONFIG_NODES = 4096
 _MAX_CONFIG_DEPTH = 32
+_STRICT_ROOT_FIELDS = frozenset({"model", "agent"})
+_STRICT_MODEL_FIELDS = frozenset(
+    {
+        "output_budget_mode",
+        "max_tokens",
+        "provider",
+        "default",
+        "model",
+        "base_url",
+        "api_mode",
+        "key_env",
+    }
+)
+_STRICT_AGENT_FIELDS = frozenset({"system_prompt"})
 
 
 class StrictRejected(Exception):
@@ -175,27 +189,32 @@ def _parse_strict_args(argv: Sequence[str]) -> str:
 
 
 def _admit_static_route(config: Mapping[str, Any], environ: Mapping[str, str]) -> dict[str, str]:
+    if set(config) - _STRICT_ROOT_FIELDS:
+        raise StrictRejected
     model = config.get("model")
     if not isinstance(model, Mapping):
         raise StrictRejected
+    if set(model) - _STRICT_MODEL_FIELDS:
+        raise StrictRejected
+    identities = [key for key in ("default", "model") if key in model]
+    if len(identities) != 1:
+        raise StrictRejected
+    agent = config.get("agent")
+    if agent is not None:
+        if not isinstance(agent, Mapping) or set(agent) - _STRICT_AGENT_FIELDS:
+            raise StrictRejected
+        if "system_prompt" in agent and not isinstance(agent["system_prompt"], str):
+            raise StrictRejected
     if isinstance(model.get("max_tokens"), bool) or model.get("max_tokens") != 2000:
         raise StrictRejected
-    forbidden_roots = {
-        "model_aliases", "custom_providers", "fallback_model", "fallbacks",
-        "credential_pool", "oauth", "relay", "moa", "mcp_servers", "plugins",
-    }
-    if forbidden_roots.intersection(config):
-        raise StrictRejected
     provider = model.get("provider")
-    name = model.get("default") or model.get("model")
+    name = model[identities[0]]
     base_url = model.get("base_url")
     api_mode = model.get("api_mode")
     key_env = model.get("key_env")
     if provider != "custom" or api_mode != "chat_completions":
         raise StrictRejected
     if not all(isinstance(value, str) and value.strip() for value in (name, base_url, key_env)):
-        raise StrictRejected
-    if model.get("api_key") is not None or model.get("api_key_env") is not None:
         raise StrictRejected
     parsed = urlparse(str(base_url))
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:

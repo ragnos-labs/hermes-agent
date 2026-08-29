@@ -189,6 +189,81 @@ def test_strict_route_and_cli_overrides_fail_closed(monkeypatch, tmp_path, capsy
     assert capsys.readouterr().err == "strict_cli_rejected\n"
 
 
+def test_strict_route_allowlist_rejects_unknown_or_ambiguous_fields_before_effects(
+    monkeypatch, tmp_path, capsys
+):
+    from hermes_cli import entrypoint
+
+    cases = {
+        "conflicting-identities": "  model: conflicting-model\n",
+        "credential-pool": "  credential_pool: [pool-a]\n",
+        "oauth": "  oauth: true\n",
+        "alias": "  alias: synthetic-alias\n",
+        "autodetect": "  autodetect: true\n",
+        "refresh": "  refresh: true\n",
+        "model-tools": "  tools: [delegate_task]\n",
+        "model-sidecar": "  extra_body: {}\n",
+        "unknown-model-field": "  future_route: rejected\n",
+    }
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("STRICT_TEST_KEY", "secret-not-for-output")
+
+    for suffix in cases.values():
+        _strict_config(home)
+        with (home / "config.yaml").open("a", encoding="utf-8") as stream:
+            stream.write(suffix)
+        called = []
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.oneshot",
+            SimpleNamespace(run_strict_oneshot=lambda *args, **kwargs: called.append(True)),
+        )
+        before = {
+            name
+            for name in sys.modules
+            if name in {"hermes_cli.main", "openai", "run_agent", "model_tools"}
+        }
+        assert entrypoint.main(["-z", "synthetic prompt"]) == 2
+        assert capsys.readouterr().err == "strict_cli_rejected\n"
+        assert called == []
+        after = {
+            name
+            for name in sys.modules
+            if name in {"hermes_cli.main", "openai", "run_agent", "model_tools"}
+        }
+        assert after == before
+
+
+def test_strict_root_allowlist_rejects_effect_fields_before_effects(
+    monkeypatch, tmp_path, capsys
+):
+    from hermes_cli import entrypoint
+
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("STRICT_TEST_KEY", "secret-not-for-output")
+
+    for suffix in (
+        "toolsets: [browser]\n",
+        "hooks: {pre_llm_call: enabled}\n",
+        "fallback_model: synthetic-fallback\n",
+        "unknown_effect: true\n",
+    ):
+        _strict_config(home)
+        with (home / "config.yaml").open("a", encoding="utf-8") as stream:
+            stream.write(suffix)
+        called = []
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.oneshot",
+            SimpleNamespace(run_strict_oneshot=lambda *args, **kwargs: called.append(True)),
+        )
+        assert entrypoint.main(["-z", "synthetic prompt"]) == 2
+        assert capsys.readouterr().err == "strict_cli_rejected\n"
+        assert called == []
+
+
 def test_strict_wire_call_is_exactly_one_nonstreaming_request():
     from hermes_cli.oneshot import run_strict_oneshot
 
