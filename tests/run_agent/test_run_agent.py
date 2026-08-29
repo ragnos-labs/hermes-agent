@@ -3920,6 +3920,124 @@ class TestRunConversation:
         streaming_call.assert_not_called()
         assert agent._strict_output_tokens_reserved == 2000
 
+    def test_strict_effect_suppression_allows_only_one_provider_call(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+        agent._suppress_external_effects = True
+        agent._skip_mcp_refresh = True
+        agent._persist_disabled = True
+        agent.skip_context_files = True
+        agent.skip_background_review = True
+        agent._memory_manager = MagicMock()
+        callback_spies = []
+        for callback_name in (
+            "tool_progress_callback",
+            "tool_start_callback",
+            "tool_complete_callback",
+            "thinking_callback",
+            "reasoning_callback",
+            "clarify_callback",
+            "step_callback",
+            "stream_delta_callback",
+            "interim_assistant_callback",
+            "tool_gen_callback",
+            "status_callback",
+            "event_callback",
+            "reaction_callback",
+        ):
+            callback = MagicMock(name=callback_name)
+            callback_spies.append(callback)
+            setattr(agent, callback_name, callback)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="bounded", finish_reason="stop"
+        )
+
+        with (
+            patch("hermes_cli.lifecycle.has_hook") as has_hook,
+            patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+            patch("hermes_cli.middleware.apply_llm_request_middleware") as request_mw,
+            patch("hermes_cli.middleware.run_llm_execution_middleware") as execution_mw,
+            patch("agent.conversation_loop._apply_context_engine_selection") as select_context,
+            patch("agent.conversation_loop._notify_context_engine_turn_complete") as turn_complete,
+            patch.object(agent, "_try_refresh_env_client_credentials") as refresh_credentials,
+            patch.object(agent, "_restore_primary_runtime") as restore_runtime,
+            patch.object(agent, "_ensure_db_session") as ensure_session,
+            patch.object(agent, "_persist_session") as persist_session,
+            patch.object(agent, "_save_trajectory") as save_trajectory,
+            patch.object(agent, "_cleanup_task_resources") as cleanup_resources,
+            patch.object(agent, "_sync_external_memory_for_turn") as sync_memory,
+            patch.object(agent, "_spawn_background_review") as background_review,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "bounded"
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        has_hook.assert_not_called()
+        invoke_hook.assert_not_called()
+        request_mw.assert_not_called()
+        execution_mw.assert_not_called()
+        select_context.assert_not_called()
+        turn_complete.assert_not_called()
+        refresh_credentials.assert_not_called()
+        restore_runtime.assert_not_called()
+        ensure_session.assert_not_called()
+        persist_session.assert_not_called()
+        save_trajectory.assert_not_called()
+        cleanup_resources.assert_not_called()
+        sync_memory.assert_not_called()
+        background_review.assert_not_called()
+        agent._memory_manager.on_turn_start.assert_not_called()
+        agent._memory_manager.prefetch_all.assert_not_called()
+        for callback in callback_spies:
+            callback.assert_not_called()
+
+    def test_ordinary_mode_preserves_hook_middleware_surfaces(self, agent):
+        self._setup_agent(agent)
+        agent._suppress_external_effects = False
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="ordinary", finish_reason="stop"
+        )
+        request_result = SimpleNamespace(
+            payload={"model": agent.model, "messages": []},
+            original_payload={"model": agent.model, "messages": []},
+            trace=[],
+        )
+
+        with (
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook", return_value=[]) as invoke_hook,
+            patch(
+                "hermes_cli.middleware.apply_llm_request_middleware",
+                return_value=request_result,
+            ) as request_mw,
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=lambda request, callback, **_kwargs: callback(request),
+            ) as execution_mw,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert request_mw.called
+        assert execution_mw.called
+        hook_names = {call.args[0] for call in invoke_hook.call_args_list}
+        assert {
+            "pre_llm_call",
+            "pre_api_request",
+            "post_api_request",
+            "transform_llm_output",
+            "post_llm_call",
+            "on_session_end",
+        }.issubset(hook_names)
+
     def test_strict_oneshot_rejects_streaming_route_before_turn_setup(self, agent):
         self._setup_agent(agent)
         agent.max_tokens = 2000

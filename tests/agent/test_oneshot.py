@@ -95,12 +95,21 @@ class TestHelpers:
         assert _strict_output_budget({"model": {"max_tokens": 2000}}) is None
 
     def test_cli_oneshot_propagates_strict_cap_and_disables_reasoning(self):
-        fake_agent = MagicMock()
-        fake_agent.run_conversation.return_value = {
-            "final_response": "ok",
-            "completed": True,
-        }
-        fake_agent._session_messages = []
+        captured_kwargs = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                assert self._suppress_external_effects is True
+                captured_kwargs.update(kwargs)
+                self._session_messages = []
+
+            def run_conversation(self, prompt):
+                self.prompt = prompt
+                return {"final_response": "ok", "completed": True}
+
+            def close(self):
+                return None
+
         runtime = {
             "api_key": "test-key",
             "base_url": "https://example.invalid/v1",
@@ -127,29 +136,120 @@ class TestHelpers:
             ) as mcp_discovery,
             patch("hermes_cli.oneshot._create_session_db_for_oneshot") as session_db,
             patch("hermes_cli.oneshot.get_fallback_chain") as fallback_chain,
-            patch("run_agent.AIAgent", return_value=fake_agent) as agent_type,
+            patch("run_agent.AIAgent", FakeAgent),
         ):
             strict_prompt = "a" * 8000
             text, result = run_cli_oneshot_agent(strict_prompt)
 
         assert text == "ok"
         assert result["final_response"] == "ok"
-        assert agent_type.call_args.kwargs["max_tokens"] == 2000
-        assert agent_type.call_args.kwargs["reasoning_config"] == {"enabled": False}
-        assert agent_type.call_args.kwargs["skip_background_review"] is True
-        assert agent_type.call_args.kwargs["enabled_toolsets"] == []
-        assert agent_type.call_args.kwargs["session_db"] is None
-        assert agent_type.call_args.kwargs["fallback_model"] is None
-        assert agent_type.call_args.kwargs["skip_context_files"] is True
-        assert agent_type.call_args.kwargs["skip_memory"] is True
-        assert fake_agent._strict_output_token_budget == 2000
-        assert fake_agent._strict_output_tokens_reserved == 0
-        assert fake_agent._disable_streaming is True
-        fake_agent.run_conversation.assert_called_once_with(strict_prompt)
+        assert captured_kwargs["max_tokens"] == 2000
+        assert captured_kwargs["reasoning_config"] == {"enabled": False}
+        assert captured_kwargs["skip_background_review"] is True
+        assert captured_kwargs["enabled_toolsets"] == []
+        assert captured_kwargs["session_db"] is None
+        assert captured_kwargs["fallback_model"] is None
+        assert captured_kwargs["skip_context_files"] is True
+        assert captured_kwargs["skip_memory"] is True
+        assert captured_kwargs["clarify_callback"] is None
+        assert captured_kwargs["max_tokens"] == 2000
         platform_tools.assert_not_called()
         mcp_discovery.assert_not_called()
         session_db.assert_not_called()
         fallback_chain.assert_not_called()
+
+    @pytest.mark.parametrize("prompt", [None, "not-ascii-\N{SNOWMAN}", "a" * 8001])
+    def test_public_cli_rejects_strict_prompt_before_any_effectful_setup(
+        self, prompt, capsys
+    ):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+            patch.dict("os.environ", {}, clear=False),
+        ):
+            status = run_cli_oneshot(prompt)
+
+        assert status == 2
+        assert capsys.readouterr().out == ""
+        toolset_lookup.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_not_called()
+
+    def test_public_cli_rejects_strict_toolsets_before_lookup_or_channel(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+        ):
+            status = run_cli_oneshot("hello", toolsets=["web"])
+
+        assert status == 2
+        toolset_lookup.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_not_called()
+
+    def test_strict_constructor_skips_plugin_and_configured_context_engines(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            },
+            "context": {"engine": "configured-plugin-engine"},
+            "memory": {"provider": "configured-memory-plugin"},
+        }
+        runtime = {
+            "api_key": "test-key",
+            "base_url": "https://example.invalid/v1",
+            "provider": "test",
+            "requested_provider": "test",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value=runtime,
+            ),
+            patch("hermes_cli.plugins.discover_plugins") as discover_plugins,
+            patch("hermes_cli.plugins.get_plugin_context_engine") as plugin_context,
+            patch("plugins.context_engine.load_context_engine") as context_loader,
+            patch("plugins.memory.load_memory_provider") as memory_loader,
+            patch.object(AIAgent, "_create_openai_client", return_value=MagicMock()),
+            patch.object(
+                AIAgent,
+                "run_conversation",
+                return_value={"final_response": "ok", "completed": True},
+            ) as run_conversation,
+            patch.object(AIAgent, "close"),
+        ):
+            text, result = run_cli_oneshot_agent("hello")
+
+        assert text == "ok"
+        assert result["completed"] is True
+        discover_plugins.assert_not_called()
+        plugin_context.assert_not_called()
+        context_loader.assert_not_called()
+        memory_loader.assert_not_called()
+        run_conversation.assert_called_once_with("hello")
 
     @pytest.mark.parametrize(
         ("prompt", "message"),
@@ -334,7 +434,10 @@ class TestHelpers:
             # memory while preserving the caller's explicit keyword shape.
             kwargs["skip_context_files"] = True
             kwargs["skip_memory"] = True
-            agent = AIAgent(**kwargs)
+            with patch.object(
+                AIAgent, "_create_openai_client", return_value=MagicMock()
+            ):
+                agent = AIAgent(**kwargs)
             agent._spawn_background_review = MagicMock()
             agent._save_trajectory = MagicMock()
             agent._cleanup_task_resources = MagicMock()

@@ -619,6 +619,12 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    # Strict one-shot sets this per-instance marker before __init__. Ordinary
+    # agents default false; no process-global plugin state is changed.
+    agent._suppress_external_effects = bool(
+        getattr(agent, "_suppress_external_effects", False)
+    )
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
@@ -963,7 +969,7 @@ def init_agent(
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.
-    agent._skip_mcp_refresh = False
+    agent._skip_mcp_refresh = agent._suppress_external_effects
     # Registry generation the current tool snapshot was derived from. Lets a
     # late/concurrent refresh reject a stale (older-generation) rebuild instead
     # of clobbering a newer one. Set adjacent to the tool snapshot below.
@@ -1480,12 +1486,13 @@ def init_agent(
     # A multiplexed gateway may enter a different HERMES_HOME after
     # ``model_tools`` was first imported. Ensure that profile's keyed plugin
     # manager has discovered its registrations before taking the tool snapshot.
-    try:
-        from hermes_cli.plugins import discover_plugins
+    if not agent._suppress_external_effects:
+        try:
+            from hermes_cli.plugins import discover_plugins
 
-        discover_plugins()
-    except Exception:
-        logger.warning("Plugin discovery failed during agent setup", exc_info=True)
+            discover_plugins()
+        except Exception:
+            logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
@@ -1662,7 +1669,7 @@ def init_agent(
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = agent._suppress_external_effects
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1853,8 +1860,9 @@ def init_agent(
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
-    from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
-    _inject_memory_provider_tools(agent)
+    if not agent._suppress_external_effects:
+        from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
+        _inject_memory_provider_tools(agent)
 
     # Skills config: nudge interval for skill creation reminders
     agent._skill_nudge_interval = 10
@@ -2502,11 +2510,12 @@ def init_agent(
     _selected_engine = None
     _copy_failed = False
     _engine_name = "compressor"  # default
-    try:
-        _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-    except Exception:
-        pass
+    if not agent._suppress_external_effects:
+        try:
+            _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
+            _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
+        except Exception:
+            pass
 
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
@@ -2739,7 +2748,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not agent._suppress_external_effects
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,

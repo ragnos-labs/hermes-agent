@@ -91,6 +91,9 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+    suppress_external_effects = bool(
+        getattr(agent, "_suppress_external_effects", False)
+    )
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -98,6 +101,7 @@ def finalize_turn(
     )
     budget_fallback_eligible = (
         budget_exhausted
+        and not suppress_external_effects
         and not interrupted
         and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
@@ -247,18 +251,20 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    if not suppress_external_effects:
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
-    try:
-        agent._cleanup_task_resources(effective_task_id)
-    except Exception as _cleanup_err:
-        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
+    if not suppress_external_effects:
+        try:
+            agent._cleanup_task_resources(effective_task_id)
+        except Exception as _cleanup_err:
+            _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+            logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
@@ -408,7 +414,8 @@ def finalize_turn(
             except Exception as _mc_err:
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
-        agent._persist_session(messages, conversation_history)
+        if not suppress_external_effects:
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -480,7 +487,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not suppress_external_effects:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -555,7 +562,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not suppress_external_effects:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -578,7 +585,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not suppress_external_effects:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -599,29 +606,30 @@ def finalize_turn(
     # turn has finished, with the finalized transcript. Complements the
     # per-request select_context() hook (selection before the request;
     # observation after the turn). No-op default, fail-open.
-    try:
-        from agent.conversation_loop import _notify_context_engine_turn_complete
+    if not suppress_external_effects:
+        try:
+            from agent.conversation_loop import _notify_context_engine_turn_complete
         # Forward the turn's canonical usage when the host has it. The loop
         # stashes the most recent API response's usage dict (the same
         # canonical buckets fed to ``update_from_response``) on the agent as
         # ``_last_turn_usage``. It is ``None`` on turns that never reached a
         # provider response (early failure / interrupt), which is exactly the
         # contract: real usage when available, ``None`` otherwise.
-        _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
-    except Exception as exc:
-        logger.warning("on_turn_complete notification failed: %s", exc)
+            _turn_usage = getattr(agent, "_last_turn_usage", None)
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
+        except Exception as exc:
+            logger.warning("on_turn_complete notification failed: %s", exc)
 
     # Extract reasoning from the CURRENT turn only.  Walk backwards
     # but stop at the user message that started this turn — anything
@@ -714,7 +722,9 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    _leftover_steer = (
+        None if suppress_external_effects else agent._drain_pending_steer()
+    )
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
@@ -724,7 +734,8 @@ def finalize_turn(
         result["interrupt_message"] = agent._interrupt_message
 
     # Clear interrupt state after handling
-    agent.clear_interrupt()
+    if not suppress_external_effects:
+        agent.clear_interrupt()
 
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None
@@ -738,12 +749,13 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not suppress_external_effects:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -753,6 +765,7 @@ def finalize_turn(
     if (
         final_response
         and not interrupted
+        and not suppress_external_effects
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
@@ -775,22 +788,23 @@ def finalize_turn(
     # Plugin hook: on_session_end
     # Fired at the very end of every run_conversation call.
     # Plugins can use this for cleanup, flushing buffers, etc.
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_end hook failed: %s", exc)
+    if not suppress_external_effects:
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_end hook failed: %s", exc)
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

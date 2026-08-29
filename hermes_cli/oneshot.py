@@ -197,6 +197,24 @@ def run_oneshot(
     # bytes reach the terminal.
     logging.disable(logging.CRITICAL)
 
+    # Strict one-shot admission happens at the public boundary.  Nothing below
+    # this point may resolve providers, discover tools/MCP, create session
+    # state, register a stateless channel, or mutate process environment until
+    # the caller-controlled prompt and toolset request have been rejected or
+    # accepted.
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    try:
+        strict_output_budget = _strict_output_budget(cfg)
+        if strict_output_budget is not None:
+            prompt = _validate_strict_prompt(prompt)
+            if toolsets is not None:
+                raise ValueError("strict one-shot mode does not accept toolsets")
+    except ValueError as exc:
+        sys.stderr.write(f"hermes -z: {exc}\n")
+        return 2
+
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
     # not host it), and silently picking the provider's catalog default hides
@@ -248,6 +266,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    config=cfg,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -363,13 +382,14 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    config: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
-    cfg = load_config()
+    cfg = config if config is not None else load_config()
     strict_output_budget = _strict_output_budget(cfg)
     if strict_output_budget is not None:
         prompt = _validate_strict_prompt(prompt)
@@ -483,7 +503,7 @@ def _run_agent(
         # gateway sessions.
         _fb = None if strict_output_budget is not None else get_fallback_chain(cfg)
 
-        agent = AIAgent(
+        agent_kwargs = dict(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
@@ -514,8 +534,28 @@ def _run_agent(
             #                (set above); also falls back to deny on non-tty
             #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
             #   - skill secret capture → returns gracefully when no callback set
-            clarify_callback=_oneshot_clarify_callback,
+            clarify_callback=(
+                None
+                if strict_output_budget is not None
+                else _oneshot_clarify_callback
+            ),
         )
+
+        if strict_output_budget is not None and isinstance(AIAgent, type):
+            # The suppression marker must exist before init_agent() executes,
+            # because configured plugin/context-engine construction happens
+            # during initialization.  Constructing this one instance through
+            # the class' normal __new__/__init__ pair keeps the flag per-agent;
+            # it does not mutate AIAgent or any process-global registry.
+            agent = AIAgent.__new__(AIAgent)
+            agent._suppress_external_effects = True
+            AIAgent.__init__(agent, **agent_kwargs)
+        else:
+            agent = AIAgent(**agent_kwargs)
+            if strict_output_budget is not None:
+                # Test doubles may be callable factories rather than classes.
+                # Production AIAgent always takes the pre-init path above.
+                agent._suppress_external_effects = True
 
         if strict_output_budget is not None:
             # Consumed at the final dispatch boundary. Ordinary chat, gateway,
@@ -526,6 +566,35 @@ def _run_agent(
             # an explicit route property. It must never silently bypass an
             # otherwise-enabled streaming path at the dispatch boundary.
             agent._disable_streaming = True
+            agent._skip_mcp_refresh = True
+            agent._persist_disabled = True
+
+            # No callback surface is available in strict mode.  These are all
+            # existing supported per-agent callback attributes; ordinary mode
+            # retains its existing wiring.
+            for callback_name in (
+                "tool_progress_callback",
+                "tool_start_callback",
+                "tool_complete_callback",
+                "thinking_callback",
+                "reasoning_callback",
+                "clarify_callback",
+                "read_terminal_callback",
+                "read_preview_callback",
+                "read_window_below_callback",
+                "setup_mcp_callback",
+                "step_callback",
+                "stream_delta_callback",
+                "interim_assistant_callback",
+                "tool_gen_callback",
+                "status_callback",
+                "notice_callback",
+                "notice_clear_callback",
+                "event_callback",
+                "reaction_callback",
+                "background_review_callback",
+            ):
+                setattr(agent, callback_name, None)
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.

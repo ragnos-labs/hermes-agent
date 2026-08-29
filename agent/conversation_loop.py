@@ -864,16 +864,17 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    if not getattr(agent, "_suppress_external_effects", False):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -881,12 +882,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # _credits_state already exists). For the plain CLI / any path that didn't seed
     # at build, it primes credits state from /api/oauth/account (or a fixture) on the
     # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+    if not getattr(agent, "_suppress_external_effects", False):
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -1747,7 +1749,38 @@ def run_conversation(
     # review fork's own copy of this attribute stays None — reviews don't
     # spawn nested reviews), so this is a no-op on every other run_conversation
     # caller (subagents, the review fork itself, etc).
-    _pending_review = getattr(agent, "_background_review_agent", None)
+    _suppress_external_effects = bool(
+        getattr(agent, "_suppress_external_effects", False)
+    )
+    if _suppress_external_effects:
+        for _callback_name in (
+            "tool_progress_callback",
+            "tool_start_callback",
+            "tool_complete_callback",
+            "thinking_callback",
+            "reasoning_callback",
+            "clarify_callback",
+            "read_terminal_callback",
+            "read_preview_callback",
+            "read_window_below_callback",
+            "setup_mcp_callback",
+            "step_callback",
+            "stream_delta_callback",
+            "interim_assistant_callback",
+            "tool_gen_callback",
+            "status_callback",
+            "notice_callback",
+            "notice_clear_callback",
+            "event_callback",
+            "reaction_callback",
+            "background_review_callback",
+        ):
+            setattr(agent, _callback_name, None)
+    _pending_review = (
+        None
+        if _suppress_external_effects
+        else getattr(agent, "_background_review_agent", None)
+    )
     if _pending_review is not None:
         try:
             _pending_review.interrupt("superseded by a new live turn")
@@ -1760,10 +1793,11 @@ def run_conversation(
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
     # was built at agent init (#67821). No-op when .env is unchanged.
-    try:
-        agent._try_refresh_env_client_credentials()
-    except Exception:
-        logger.debug("per-turn env credential refresh failed", exc_info=True)
+    if not _suppress_external_effects:
+        try:
+            agent._try_refresh_env_client_credentials()
+        except Exception:
+            logger.debug("per-turn env credential refresh failed", exc_info=True)
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -2290,13 +2324,14 @@ def run_conversation(
             if 0 <= current_turn_user_idx < len(messages)
             else None
         )
-        api_messages = _apply_context_engine_selection(
-            agent,
-            api_messages,
-            messages,
-            _sel_incoming,
-            logger=request_logger,
-        )
+        if not _suppress_external_effects:
+            api_messages = _apply_context_engine_selection(
+                agent,
+                api_messages,
+                messages,
+                _sel_incoming,
+                logger=request_logger,
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2791,35 +2826,42 @@ def run_conversation(
                     _xh["x-initiator"] = "user"
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
+                if _suppress_external_effects:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
+                else:
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
+
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                        )
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
 
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    if (
+                        not _suppress_external_effects
+                        and has_hook("pre_api_request")
+                    ):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -2988,8 +3030,6 @@ def run_conversation(
                         defer_logical_completion=True,
                     )
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -3000,22 +3040,27 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    if _suppress_external_effects:
+                        response = _perform_api_call(api_kwargs)
+                    else:
+                        from hermes_cli.middleware import run_llm_execution_middleware
+
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3514,7 +3559,8 @@ def run_conversation(
                         f"{_CONTENT_POLICY_RECOVERY_HINT}"
                     )
 
-                    agent._cleanup_task_resources(effective_task_id)
+                    if not _suppress_external_effects:
+                        agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     return _content_policy_blocked_result(
                         messages,
@@ -3615,7 +3661,8 @@ def run_conversation(
                             "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
-                        agent._cleanup_task_resources(effective_task_id)
+                        if not _suppress_external_effects:
+                            agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _exhaust_response,
@@ -3796,7 +3843,8 @@ def run_conversation(
                                     "finish_reason": "length",
                                 })
                             agent._session_messages = messages
-                            agent._cleanup_task_resources(effective_task_id)
+                            if not _suppress_external_effects:
+                                agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
                                 "final_response": "" if _strict_length_stop else partial_response or None,
@@ -3865,7 +3913,8 @@ def run_conversation(
                                     f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
                                 )
-                            agent._cleanup_task_resources(effective_task_id)
+                            if not _suppress_external_effects:
+                                agent._cleanup_task_resources(effective_task_id)
                             _final_response = (
                                 "Stream repeatedly dropped mid tool-call (network); "
                                 "the tool was not executed"
@@ -3891,7 +3940,8 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
                         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
 
-                        agent._cleanup_task_resources(effective_task_id)
+                        if not _suppress_external_effects:
+                            agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
                         return {
@@ -6508,7 +6558,7 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                if not _suppress_external_effects and has_hook("post_api_request"):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
@@ -6593,7 +6643,8 @@ def run_conversation(
                     agent._incomplete_scratchpad_retries = 0
                     
                     rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
-                    agent._cleanup_task_resources(effective_task_id)
+                    if not _suppress_external_effects:
+                        agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     
                     return {
@@ -6923,7 +6974,8 @@ def run_conversation(
                             force=True,
                         )
                         agent._invalid_json_retries = 0
-                        agent._cleanup_task_resources(effective_task_id)
+                        if not _suppress_external_effects:
+                            agent._cleanup_task_resources(effective_task_id)
                         _final_response = "Response truncated due to output length limit"
                         # Same tool-tail close as interrupt / invalid-tool
                         # exhaustion — this path never reaches finalize_turn.
