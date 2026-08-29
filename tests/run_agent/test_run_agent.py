@@ -3888,6 +3888,76 @@ class TestRunConversation:
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
 
+    def test_strict_oneshot_length_is_terminal_after_one_call(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent.stream_delta_callback = lambda _delta: None
+        first = _mock_response(content="Bounded partial", finish_reason="length")
+        second = _mock_response(content="must not run", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch.object(agent, "_interruptible_streaming_api_call") as streaming_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "Bounded partial"
+        assert agent.client.chat.completions.create.call_count == 1
+        streaming_call.assert_not_called()
+        assert agent._strict_output_tokens_reserved == 2000
+
+    def test_strict_oneshot_rejects_provider_overrides_before_dispatch(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent.request_overrides = {"max_tokens": 2001}
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "stopped before replay" in result["error"]
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_middleware_cap_inflation(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+
+        def inflate_cap(_request, callback, **_kwargs):
+            return callback({"model": agent.model, "messages": [], "max_tokens": 2001})
+
+        with (
+            patch(
+                "hermes_cli.middleware.run_llm_execution_middleware",
+                side_effect=inflate_cap,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._strict_output_tokens_reserved == 0
+        agent.client.chat.completions.create.assert_not_called()
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)
@@ -4058,6 +4128,38 @@ class TestRunConversation:
         # Tool was executed on the retry (good_resp)
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
+
+    def test_strict_oneshot_truncated_tool_call_never_retries_or_executes(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc]
+        )
+        agent.client.chat.completions.create.side_effect = [
+            truncated,
+            _mock_response(content="must not run", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call") as handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("write the report")
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        handle_function_call.assert_not_called()
 
     def test_stub_stall_mid_tool_call_recovers_within_3_retries(self, agent):
         """A network stream stall mid tool-call (PARTIAL_STREAM_STUB_ID) must

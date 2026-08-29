@@ -319,6 +319,24 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _strict_output_budget(cfg: dict) -> int | None:
+    """Return the one-shot aggregate output budget, when strict mode is enabled."""
+    model_cfg = cfg.get("model") or {}
+    if not isinstance(model_cfg, dict):
+        return None
+    mode = model_cfg.get("output_budget_mode")
+    if mode is None:
+        return None
+    if mode != "strict":
+        raise ValueError("model.output_budget_mode must be 'strict' when set")
+    raw_budget = model_cfg.get("max_tokens")
+    if isinstance(raw_budget, bool) or not isinstance(raw_budget, int) or raw_budget <= 0:
+        raise ValueError(
+            "strict one-shot output budgeting requires a positive integer model.max_tokens"
+        )
+    return raw_budget
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -337,6 +355,7 @@ def _run_agent(
     from run_agent import AIAgent
 
     cfg = load_config()
+    strict_output_budget = _strict_output_budget(cfg)
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -437,6 +456,10 @@ def _run_agent(
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            max_tokens=strict_output_budget,
+            reasoning_config=(
+                {"enabled": False} if strict_output_budget is not None else None
+            ),
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
@@ -456,6 +479,12 @@ def _run_agent(
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )
+
+        if strict_output_budget is not None:
+            # Consumed at the final dispatch boundary. Ordinary chat, gateway,
+            # and subagent runs never set this one-shot-only contract.
+            agent._strict_output_token_budget = strict_output_budget
+            agent._strict_output_tokens_reserved = 0
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.

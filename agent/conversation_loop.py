@@ -58,6 +58,67 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
 )
+
+
+def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> None:
+    """Fail closed before a strict one-shot request can exceed its aggregate cap."""
+    budget = getattr(agent, "_strict_output_token_budget", None)
+    if budget is None:
+        return
+    if getattr(agent, "request_overrides", None):
+        raise RuntimeError("strict output budget rejects provider request overrides")
+
+    caps: list[int] = []
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        if key not in api_kwargs:
+            continue
+        raw = api_kwargs[key]
+        if isinstance(raw, bool):
+            raise RuntimeError("strict output budget requires one positive output cap")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "strict output budget requires one positive output cap"
+            ) from exc
+        if value <= 0:
+            raise RuntimeError("strict output budget requires one positive output cap")
+        caps.append(value)
+    inference_config = api_kwargs.get("inferenceConfig")
+    if isinstance(inference_config, dict) and "maxTokens" in inference_config:
+        raw = inference_config["maxTokens"]
+        if isinstance(raw, bool):
+            raise RuntimeError("strict output budget requires one positive output cap")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "strict output budget requires one positive output cap"
+            ) from exc
+        if value <= 0:
+            raise RuntimeError("strict output budget requires one positive output cap")
+        caps.append(value)
+    if len(caps) != 1:
+        raise RuntimeError("strict output budget requires exactly one output cap")
+
+    reserved = int(getattr(agent, "_strict_output_tokens_reserved", 0) or 0)
+    remaining = int(budget) - reserved
+    if caps[0] > remaining:
+        raise RuntimeError("strict output budget exhausted before provider dispatch")
+    agent._strict_output_tokens_reserved = reserved + caps[0]
+
+
+def _require_strict_single_attempt_mode(agent: Any) -> None:
+    """Reject strict modes whose helper can fan out or retry physical calls."""
+    if getattr(agent, "_strict_output_token_budget", None) is None:
+        return
+    if getattr(agent, "provider", None) == "moa":
+        raise RuntimeError("strict output budget does not support MoA fan-out")
+    api_mode = getattr(agent, "api_mode", None)
+    if api_mode not in {"chat_completions", "bedrock_converse"}:
+        raise RuntimeError(
+            f"strict output budget does not support multi-attempt API mode: {api_mode}"
+        )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -2741,6 +2802,7 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    _require_strict_single_attempt_mode(agent)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2748,6 +2810,14 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    _reserve_strict_output_budget(agent, next_api_kwargs)
+                    if getattr(agent, "_strict_output_token_budget", None) is not None:
+                        # Strict one-shot mode permits one physical provider
+                        # attempt only. Bypass streaming's internal retries,
+                        # Bedrock's stream-to-converse fallback, and Relay's
+                        # post-validation request rewrite. Any exception is
+                        # terminal in the strict branch below.
+                        return agent._interruptible_api_call(next_api_kwargs)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -3414,6 +3484,8 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
+                            if getattr(agent, "_strict_output_token_budget", None) is not None:
+                                length_continue_retries = 4
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
                             # must not be appended as an interim assistant
@@ -3528,7 +3600,10 @@ def run_conversation(
                             _is_stub_stall = (
                                 getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                             )
-                            if truncated_tool_call_retries < 4:
+                            if (
+                                truncated_tool_call_retries < 4
+                                and getattr(agent, "_strict_output_token_budget", None) is None
+                            ):
                                 truncated_tool_call_retries += 1
                                 if _is_stub_stall:
                                     # The stream broke mid tool-call (network /
@@ -3924,6 +3999,19 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if getattr(agent, "_strict_output_token_budget", None) is not None:
+                    _final_response = "Strict one-shot output budget stopped before replay"
+                    close_interrupted_tool_sequence(messages, _final_response)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _final_response,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
