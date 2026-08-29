@@ -997,24 +997,26 @@ def init_agent(
     # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
     # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
     # (which creates a new AIAgent per message) won't duplicate handlers.
-    from hermes_logging import setup_logging, setup_verbose_logging
-    setup_logging(hermes_home=_ra()._hermes_home)
+    if not agent._suppress_external_effects:
+        from hermes_logging import setup_logging, setup_verbose_logging
 
-    if agent.verbose_logging:
-        setup_verbose_logging()
-        _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
-    elif agent.quiet_mode:
-        # In quiet mode (CLI default), keep console output clean —
-        # but DO NOT raise per-logger levels. Doing so prevents the
-        # root logger's file handlers (agent.log, errors.log) from
-        # ever seeing the records, because Python checks
-        # logger.isEnabledFor() before handler propagation. We rely
-        # on the fact that hermes_logging.setup_logging() does not
-        # install a console StreamHandler in quiet mode — so INFO
-        # records flow to the file handlers but never reach a
-        # console. Any future noise reduction belongs at the
-        # handler level inside hermes_logging.py, not here.
-        pass
+        setup_logging(hermes_home=_ra()._hermes_home)
+
+        if agent.verbose_logging:
+            setup_verbose_logging()
+            _ra().logger.info("Verbose logging enabled (third-party library logs suppressed)")
+        elif agent.quiet_mode:
+            # In quiet mode (CLI default), keep console output clean —
+            # but DO NOT raise per-logger levels. Doing so prevents the
+            # root logger's file handlers (agent.log, errors.log) from
+            # ever seeing the records, because Python checks
+            # logger.isEnabledFor() before handler propagation. We rely
+            # on the fact that hermes_logging.setup_logging() does not
+            # install a console StreamHandler in quiet mode — so INFO
+            # records flow to the file handlers but never reach a
+            # console. Any future noise reduction belongs at the
+            # handler level inside hermes_logging.py, not here.
+            pass
     
     # Internal stream callback (set during streaming TTS).
     # Initialized here so _vprint can reference it before run_conversation.
@@ -1576,38 +1578,41 @@ def init_agent(
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
     # fallback synchronized because different tool paths still read both.
-    try:
-        from gateway.session_context import set_current_session_id
-
-        set_current_session_id(agent.session_id)
-    except Exception:
-        # Preserve the root-agent legacy fallback, but never let delegated
-        # construction publish a child ID process-wide even if the ContextVar
-        # bridge itself failed to import.
+    if not agent._suppress_external_effects:
         try:
-            from agent.delegation_context import is_delegated_child_context
+            from gateway.session_context import set_current_session_id
 
-            delegated_child = is_delegated_child_context()
+            set_current_session_id(agent.session_id)
         except Exception:
-            delegated_child = False
-        if not delegated_child:
-            os.environ["HERMES_SESSION_ID"] = agent.session_id
+            # Preserve the root-agent legacy fallback, but never let delegated
+            # construction publish a child ID process-wide even if the ContextVar
+            # bridge itself failed to import.
+            try:
+                from agent.delegation_context import is_delegated_child_context
+
+                delegated_child = is_delegated_child_context()
+            except Exception:
+                delegated_child = False
+            if not delegated_child:
+                os.environ["HERMES_SESSION_ID"] = agent.session_id
 
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if not agent._suppress_external_effects:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
     # reads the JSON files directly.  See run_agent._save_session_log.
     agent._session_json_enabled = False
-    try:
-        from hermes_cli.config import load_config_readonly as _load_sess_cfg
-        _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
-    except Exception:
-        pass
+    if not agent._suppress_external_effects:
+        try:
+            from hermes_cli.config import load_config_readonly as _load_sess_cfg
+            _sess_cfg = (_load_sess_cfg().get("sessions") or {})
+            agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        except Exception:
+            pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
     # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
     
@@ -2492,10 +2497,14 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
-    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
-        _config_context_length
-    )
-    if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
+    _lmstudio_runtime_context_length = None
+    if not agent._suppress_external_effects:
+        _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+            _config_context_length
+        )
+    if not agent._suppress_external_effects and agent._lmstudio_load_was_unverified(
+        _lmstudio_runtime_context_length
+    ):
         _ra().logger.warning(
             "LM Studio model activation was rejected or completed without a "
             "verifiable active context length; falling back to configured context"

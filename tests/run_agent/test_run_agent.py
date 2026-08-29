@@ -3970,6 +3970,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources") as cleanup_resources,
             patch.object(agent, "_sync_external_memory_for_turn") as sync_memory,
             patch.object(agent, "_spawn_background_review") as background_review,
+            patch.object(agent, "_dump_api_request_debug") as dump_request,
+            patch.dict("os.environ", {"HERMES_DUMP_REQUESTS": "1"}),
         ):
             result = agent.run_conversation("hello")
 
@@ -3991,6 +3993,7 @@ class TestRunConversation:
         cleanup_resources.assert_not_called()
         sync_memory.assert_not_called()
         background_review.assert_not_called()
+        dump_request.assert_not_called()
         agent._memory_manager.on_turn_start.assert_not_called()
         agent._memory_manager.prefetch_all.assert_not_called()
         for callback in callback_spies:

@@ -1,5 +1,6 @@
 """Tests for agent.oneshot — shared one-off (stateless) LLM requests."""
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -96,19 +97,20 @@ class TestHelpers:
 
     def test_cli_oneshot_propagates_strict_cap_and_disables_reasoning(self):
         captured_kwargs = {}
+        created = []
 
         class FakeAgent:
             def __init__(self, **kwargs):
                 assert self._suppress_external_effects is True
                 captured_kwargs.update(kwargs)
                 self._session_messages = []
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
+                created.append(self)
 
             def run_conversation(self, prompt):
                 self.prompt = prompt
                 return {"final_response": "ok", "completed": True}
-
-            def close(self):
-                return None
 
         runtime = {
             "api_key": "test-key",
@@ -157,6 +159,8 @@ class TestHelpers:
         mcp_discovery.assert_not_called()
         session_db.assert_not_called()
         fallback_chain.assert_not_called()
+        created[0].shutdown_memory_provider.assert_not_called()
+        created[0].close.assert_not_called()
 
     @pytest.mark.parametrize("prompt", [None, "not-ascii-\N{SNOWMAN}", "a" * 8001])
     def test_public_cli_rejects_strict_prompt_before_any_effectful_setup(
@@ -205,7 +209,65 @@ class TestHelpers:
         declare_channel.assert_not_called()
         run_agent.assert_not_called()
 
-    def test_strict_constructor_skips_plugin_and_configured_context_engines(self):
+    def test_public_cli_strict_success_skips_global_setup(self):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot.logging.disable") as disable_logging,
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot._normalize_toolsets") as normalize_toolsets,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch(
+                "hermes_cli.oneshot._run_agent",
+                return_value=("ok", {"final_response": "ok", "completed": True}),
+            ) as run_agent,
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            status = run_cli_oneshot("hello")
+            assert "HERMES_YOLO_MODE" not in os.environ
+            assert "HERMES_ACCEPT_HOOKS" not in os.environ
+
+        assert status == 0
+        disable_logging.assert_not_called()
+        toolset_lookup.assert_not_called()
+        normalize_toolsets.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_called_once()
+
+    def test_public_cli_rejects_strict_usage_file_before_global_setup(self, tmp_path):
+        strict_cfg = {
+            "model": {
+                "default": "test-model",
+                "output_budget_mode": "strict",
+                "max_tokens": 2000,
+            }
+        }
+        usage_path = tmp_path / "usage.json"
+        with (
+            patch("hermes_cli.config.load_config", return_value=strict_cfg),
+            patch("hermes_cli.oneshot.logging.disable") as disable_logging,
+            patch("hermes_cli.oneshot._validate_explicit_toolsets") as toolset_lookup,
+            patch("hermes_cli.oneshot.declare_stateless_channel") as declare_channel,
+            patch("hermes_cli.oneshot._run_agent") as run_agent,
+        ):
+            status = run_cli_oneshot("hello", usage_file=str(usage_path))
+
+        assert status == 2
+        assert not usage_path.exists()
+        disable_logging.assert_not_called()
+        toolset_lookup.assert_not_called()
+        declare_channel.assert_not_called()
+        run_agent.assert_not_called()
+
+    def test_strict_constructor_skips_plugin_and_configured_context_engines(
+        self, tmp_path
+    ):
         strict_cfg = {
             "model": {
                 "default": "test-model",
@@ -236,13 +298,20 @@ class TestHelpers:
             patch("plugins.memory.load_memory_provider") as memory_loader,
             patch("tools.env_probe.warm_environment_probe_async") as env_probe,
             patch("run_agent._openrouter_prewarm_done") as prewarm_gate,
+            patch("hermes_logging.setup_logging") as setup_logging,
+            patch("gateway.session_context.set_current_session_id") as set_session,
+            patch("agent.agent_init.get_hermes_home", return_value=tmp_path),
+            patch.object(
+                AIAgent, "_ensure_lmstudio_runtime_loaded"
+            ) as lmstudio_preload,
             patch.object(AIAgent, "_create_openai_client", return_value=MagicMock()),
             patch.object(
                 AIAgent,
                 "run_conversation",
                 return_value={"final_response": "ok", "completed": True},
             ) as run_conversation,
-            patch.object(AIAgent, "close"),
+            patch.object(AIAgent, "shutdown_memory_provider") as shutdown_memory,
+            patch.object(AIAgent, "close") as close_agent,
         ):
             text, result = run_cli_oneshot_agent("hello")
 
@@ -255,6 +324,12 @@ class TestHelpers:
         env_probe.assert_not_called()
         prewarm_gate.is_set.assert_not_called()
         prewarm_gate.set.assert_not_called()
+        setup_logging.assert_not_called()
+        set_session.assert_not_called()
+        lmstudio_preload.assert_not_called()
+        shutdown_memory.assert_not_called()
+        close_agent.assert_not_called()
+        assert not (tmp_path / "sessions").exists()
         run_conversation.assert_called_once_with("hello")
 
     @pytest.mark.parametrize(
@@ -510,6 +585,8 @@ class TestHelpers:
         assert agent_type.call_args.kwargs["skip_background_review"] is strict_mode
         assert created[0].skip_background_review is strict_mode
         assert created[0]._spawn_background_review.call_count == expected_review_calls
+        assert created[0].shutdown_memory_provider.call_count == (0 if strict_mode else 1)
+        assert created[0].close.call_count == (0 if strict_mode else 1)
 
     def test_strict_output_budget_accepts_bedrock_wire_cap_once(self):
         agent = MagicMock()

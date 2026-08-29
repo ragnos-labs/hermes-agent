@@ -2922,7 +2922,9 @@ def run_conversation(
                 except Exception:
                     pass
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                if not agent._suppress_external_effects and env_var_enabled(
+                    "HERMES_DUMP_REQUESTS"
+                ):
                     agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
                 # This object is private to the in-process MoA facade.  Add it

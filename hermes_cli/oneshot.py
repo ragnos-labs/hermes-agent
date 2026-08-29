@@ -21,6 +21,7 @@ Env var fallbacks (used when the corresponding arg is not passed):
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import sys
@@ -190,13 +191,6 @@ def run_oneshot(
 
     Returns the exit code.  The caller owns process termination.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
-
     # Strict one-shot admission happens at the public boundary.  Nothing below
     # this point may resolve providers, discover tools/MCP, create session
     # state, register a stateless channel, or mutate process environment until
@@ -211,6 +205,8 @@ def run_oneshot(
             prompt = _validate_strict_prompt(prompt)
             if toolsets is not None:
                 raise ValueError("strict one-shot mode does not accept toolsets")
+            if usage_file is not None:
+                raise ValueError("strict one-shot mode does not accept usage_file")
     except ValueError as exc:
         sys.stderr.write(f"hermes -z: {exc}\n")
         return 2
@@ -228,37 +224,45 @@ def run_oneshot(
         )
         return 2
 
-    explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
-    if toolsets_error:
-        sys.stderr.write(toolsets_error)
-        return 2
-    use_config_toolsets = _normalize_toolsets(toolsets) is None
+    if strict_output_budget is not None:
+        explicit_toolsets = []
+        use_config_toolsets = False
+    else:
+        # Silence every stdlib logger for the duration. AIAgent, tools, and
+        # provider adapters all log to stderr through the root logger.
+        logging.disable(logging.CRITICAL)
+        explicit_toolsets, toolsets_error = _validate_explicit_toolsets(toolsets)
+        if toolsets_error:
+            sys.stderr.write(toolsets_error)
+            return 2
+        use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
-    os.environ["HERMES_ACCEPT_HOOKS"] = "1"
+        # Auto-approve any shell / tool approvals. Non-interactive by
+        # definition — a prompt would hang forever.
+        os.environ["HERMES_YOLO_MODE"] = "1"
+        os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
-    # One-shot prints a single final response and exits: there is no later turn
-    # for a detached subagent's completion to re-enter, and nothing here drains
-    # process_registry.completion_queue (only cli.py's interactive process_loop
-    # and the gateway watchers do). Left unbound, async_delivery_supported()
-    # defaults True, delegate_task is forced background, and every subagent
-    # result is discarded. Declaring the channel stateless routes delegate_task
-    # to its inline/synchronous path. See declare_stateless_channel().
-    declare_stateless_channel()
+        # One-shot prints a single final response and exits: there is no later
+        # turn for detached subagent completion to re-enter. Ordinary oneshot
+        # therefore binds the stateless channel; strict mode has no tools.
+        declare_stateless_channel()
 
-    # Redirect stderr AND stdout to devnull for the entire call tree.
+    # Capture stderr and stdout for the entire call tree. Strict mode uses an
+    # in-memory sink so it does not open or write a filesystem target.
     # We'll print the final response to the real stdout at the end.
     real_stdout = sys.stdout
     real_stderr = sys.stderr
-    devnull = open(os.devnull, "w", encoding="utf-8")
+    output_sink = (
+        io.StringIO()
+        if strict_output_budget is not None
+        else open(os.devnull, "w", encoding="utf-8")
+    )
 
     response: Optional[str] = None
     result: dict = {}
     failure: BaseException | None = None
     try:
-        with redirect_stdout(devnull), redirect_stderr(devnull):
+        with redirect_stdout(output_sink), redirect_stderr(output_sink):
             try:
                 response, result = _run_agent(
                     prompt,
@@ -279,7 +283,7 @@ def run_oneshot(
                 failure = exc
     finally:
         try:
-            devnull.close()
+            output_sink.close()
         except Exception:
             pass
 
@@ -618,7 +622,7 @@ def _run_agent(
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,
         # NOT cli.py:_run_cleanup — oneshot has no _active_agent_ref and must
         # close the agent explicitly because the hard-exit path skips finalizers.
-        if agent is not None:
+        if agent is not None and strict_output_budget is None:
             try:
                 session_messages = getattr(agent, "_session_messages", None)
                 if isinstance(session_messages, list):
