@@ -214,12 +214,13 @@ class TestHelpers:
             },
             "context": {"engine": "configured-plugin-engine"},
             "memory": {"provider": "configured-memory-plugin"},
+            "agent": {"environment_probe": True},
         }
         runtime = {
             "api_key": "test-key",
             "base_url": "https://example.invalid/v1",
-            "provider": "test",
-            "requested_provider": "test",
+            "provider": "openrouter",
+            "requested_provider": "openrouter",
             "api_mode": "chat_completions",
             "credential_pool": None,
         }
@@ -233,6 +234,8 @@ class TestHelpers:
             patch("hermes_cli.plugins.get_plugin_context_engine") as plugin_context,
             patch("plugins.context_engine.load_context_engine") as context_loader,
             patch("plugins.memory.load_memory_provider") as memory_loader,
+            patch("tools.env_probe.warm_environment_probe_async") as env_probe,
+            patch("run_agent._openrouter_prewarm_done") as prewarm_gate,
             patch.object(AIAgent, "_create_openai_client", return_value=MagicMock()),
             patch.object(
                 AIAgent,
@@ -249,6 +252,9 @@ class TestHelpers:
         plugin_context.assert_not_called()
         context_loader.assert_not_called()
         memory_loader.assert_not_called()
+        env_probe.assert_not_called()
+        prewarm_gate.is_set.assert_not_called()
+        prewarm_gate.set.assert_not_called()
         run_conversation.assert_called_once_with("hello")
 
     @pytest.mark.parametrize(
