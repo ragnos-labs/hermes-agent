@@ -4221,6 +4221,52 @@ class TestRunConversation:
         assert agent._strict_provider_attempted is True
         assert agent.client.chat.completions.create.call_count == 1
 
+    def test_strict_oneshot_disables_compression_before_large_multi_tool_turn(
+        self, agent
+    ):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent.context_compressor.last_prompt_tokens = 100_000
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search", arguments='{"q":"bounded one"}', call_id="strict-1"
+            ),
+            _mock_tool_call(
+                name="web_search", arguments='{"q":"bounded two"}', call_id="strict-2"
+            ),
+        ]
+        first = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=tool_calls
+        )
+        second = _mock_response(content="must not run", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [first, second]
+
+        with (
+            patch(
+                "run_agent.handle_function_call", return_value="x" * 100_000
+            ) as handle_function_call,
+            patch.object(agent.context_compressor, "should_compress", return_value=True) as should_compress,
+            patch.object(agent.context_compressor, "_generate_summary") as summary_llm,
+            patch.object(agent, "_compress_context") as compress_context,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent.compression_enabled is False
+        assert agent._strict_provider_attempted is True
+        assert agent.client.chat.completions.create.call_count == 1
+        assert handle_function_call.call_count == 2
+        should_compress.assert_not_called()
+        compress_context.assert_not_called()
+        summary_llm.assert_not_called()
+
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
         self._setup_agent(agent)

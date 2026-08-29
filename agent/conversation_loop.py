@@ -1618,6 +1618,14 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # Strict one-shot execution permits exactly one physical model attempt.
+    # Context compression may use a separate summarization LLM, so disable it
+    # before both the preflight and post-tool compression paths can run.  The
+    # strict attribute is attached only to the bounded one-shot agent; normal
+    # conversations retain their configured compression behavior.
+    if getattr(agent, "_strict_output_token_budget", None) is not None:
+        agent.compression_enabled = False
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
