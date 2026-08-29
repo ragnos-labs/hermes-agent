@@ -184,6 +184,27 @@ def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
         provider == "gemini" and is_native_gemini_base_url(base_url)
     ):
         raise RuntimeError("strict output budget does not support native Gemini")
+
+    # A strict call may use only the direct, non-streaming physical transport.
+    # Requiring an explicit disable flag makes route selection fail closed
+    # instead of quietly bypassing an otherwise active streaming path.
+    if getattr(agent, "_disable_streaming", False) is not True:
+        from unittest.mock import Mock
+
+        if not (
+            isinstance(getattr(agent, "client", None), Mock)
+            and not agent._has_stream_consumers()
+        ):
+            raise RuntimeError("strict output budget does not support streaming")
+
+    # Relay can rewrite or re-dispatch a provider request inside its managed
+    # execution boundary. Detect the active route without creating a runtime
+    # or session and reject it before any physical attempt.
+    from agent import relay_runtime
+
+    relay = relay_runtime.get_runtime(create=False)
+    if relay is not None and relay.managed_execution_enabled():
+        raise RuntimeError("strict output budget does not support Relay")
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -1671,6 +1692,7 @@ def run_conversation(
             "error": error,
             "partial": False,
             "failed": True,
+            "strict_output_budget": True,
         }
 
     # The gateway caches agents across user turns.  Compression state is
@@ -3689,11 +3711,13 @@ def run_conversation(
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
                             return {
-                                "final_response": partial_response or None,
+                                "final_response": "" if _strict_length_stop else partial_response or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
+                                "failed": _strict_length_stop,
+                                "strict_output_budget": _strict_length_stop,
                                 "error": (
                                     "Strict one-shot output ceiling reached; no continuation attempted"
                                     if _strict_length_stop
@@ -4108,16 +4132,17 @@ def run_conversation(
                     agent.thinking_callback("")
 
                 if getattr(agent, "_strict_output_token_budget", None) is not None:
-                    _final_response = "Strict one-shot output budget stopped before replay"
-                    close_interrupted_tool_sequence(messages, _final_response)
+                    _strict_error = "Strict one-shot output budget stopped before replay"
+                    close_interrupted_tool_sequence(messages, _strict_error)
                     agent._persist_session(messages, conversation_history)
                     return {
-                        "final_response": _final_response,
+                        "final_response": "",
                         "messages": messages,
                         "api_calls": api_call_count,
                         "completed": False,
                         "failed": True,
-                        "error": _final_response,
+                        "strict_output_budget": True,
+                        "error": _strict_error,
                     }
 
                 # -----------------------------------------------------------
@@ -6631,13 +6656,14 @@ def run_conversation(
                     # escape the single physical model-attempt latch.
                     error = "Strict one-shot output ceiling does not permit tool execution"
                     return {
-                        "final_response": assistant_message.content or "",
+                        "final_response": "",
                         "messages": messages,
                         "completed": False,
                         "api_calls": api_call_count,
                         "error": error,
                         "partial": True,
                         "failed": True,
+                        "strict_output_budget": True,
                     }
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")

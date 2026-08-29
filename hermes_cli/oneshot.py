@@ -277,6 +277,13 @@ def run_oneshot(
 
     _write_usage_file(usage_file, result)
 
+    if result.get("strict_output_budget") and (
+        result.get("failed") or result.get("partial") or not result.get("completed", False)
+    ):
+        # Never print provider text from a bounded failure, even if an inner
+        # adapter accidentally returned partial content alongside the failure.
+        return 2
+
     # Model text can contain lone UTF-16 surrogates (invalid in UTF-8). Writing
     # those to a real stdout TextIO raises UnicodeEncodeError and aborts with
     # exit 1 after the turn already completed — scrub to U+FFFD first.
@@ -330,9 +337,9 @@ def _strict_output_budget(cfg: dict) -> int | None:
     if mode != "strict":
         raise ValueError("model.output_budget_mode must be 'strict' when set")
     raw_budget = model_cfg.get("max_tokens")
-    if isinstance(raw_budget, bool) or not isinstance(raw_budget, int) or raw_budget <= 0:
+    if isinstance(raw_budget, bool) or not isinstance(raw_budget, int) or raw_budget != 2000:
         raise ValueError(
-            "strict one-shot output budgeting requires a positive integer model.max_tokens"
+            "strict one-shot output budgeting requires model.max_tokens == 2000"
         )
     return raw_budget
 
@@ -486,6 +493,10 @@ def _run_agent(
             # and subagent runs never set this one-shot-only contract.
             agent._strict_output_token_budget = strict_output_budget
             agent._strict_output_tokens_reserved = 0
+            # The strict transport guard requires streaming to be disabled as
+            # an explicit route property. It must never silently bypass an
+            # otherwise-enabled streaming path at the dispatch boundary.
+            agent._disable_streaming = True
 
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
@@ -494,6 +505,16 @@ def _run_agent(
         agent.tool_gen_callback = None
 
         result = agent.run_conversation(prompt)
+        if strict_output_budget is not None:
+            result["strict_output_budget"] = True
+            if result.get("failed") or result.get("partial") or not result.get(
+                "completed", False
+            ):
+                # Strict failure receipts never carry provider text and must
+                # be unambiguously non-successful to the process wrapper.
+                result["final_response"] = ""
+                result["failed"] = True
+                return "", result
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,

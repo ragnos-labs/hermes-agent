@@ -18,6 +18,7 @@ from agent.conversation_loop import (
 from agent.turn_finalizer import finalize_turn
 from hermes_cli.oneshot import _run_agent as run_cli_oneshot_agent
 from hermes_cli.oneshot import _strict_output_budget
+from hermes_cli.oneshot import run_oneshot as run_cli_oneshot
 from run_agent import AIAgent
 
 
@@ -79,22 +80,26 @@ class TestRunOneshot:
 
 
 class TestHelpers:
-    def test_strict_output_budget_requires_positive_model_cap(self):
+    def test_strict_output_budget_requires_exact_2000_model_cap(self):
         assert _strict_output_budget(
             {"model": {"output_budget_mode": "strict", "max_tokens": 2000}}
         ) == 2000
 
-        with pytest.raises(ValueError, match="positive integer"):
-            _strict_output_budget(
-                {"model": {"output_budget_mode": "strict", "max_tokens": True}}
-            )
+        for invalid_cap in (True, 1999, 2001, 50_000, "2000"):
+            with pytest.raises(ValueError, match="max_tokens == 2000"):
+                _strict_output_budget(
+                    {"model": {"output_budget_mode": "strict", "max_tokens": invalid_cap}}
+                )
 
     def test_strict_output_budget_is_default_off(self):
         assert _strict_output_budget({"model": {"max_tokens": 2000}}) is None
 
     def test_cli_oneshot_propagates_strict_cap_and_disables_reasoning(self):
         fake_agent = MagicMock()
-        fake_agent.run_conversation.return_value = {"final_response": "ok"}
+        fake_agent.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+        }
         fake_agent._session_messages = []
         runtime = {
             "api_key": "test-key",
@@ -131,6 +136,30 @@ class TestHelpers:
         assert agent_type.call_args.kwargs["skip_background_review"] is True
         assert fake_agent._strict_output_token_budget == 2000
         assert fake_agent._strict_output_tokens_reserved == 0
+        assert fake_agent._disable_streaming is True
+
+    def test_cli_oneshot_strict_failure_never_prints_partial_content(
+        self, capsys
+    ):
+        with patch(
+            "hermes_cli.oneshot._run_agent",
+            return_value=(
+                "provider text must stay hidden",
+                {
+                    "final_response": "provider text must stay hidden",
+                    "completed": False,
+                    "partial": True,
+                    "failed": True,
+                    "strict_output_budget": True,
+                },
+            ),
+        ):
+            status = run_cli_oneshot("hello")
+
+        captured = capsys.readouterr()
+        assert status == 2
+        assert captured.out == ""
+        assert "provider text must stay hidden" not in captured.err
 
     @pytest.mark.parametrize(
         ("strict_mode", "expected_review_calls"),
@@ -200,7 +229,7 @@ class TestHelpers:
                     _should_review_memory=False,
                     _turn_exit_reason="text_response(1)",
                 )
-                return {"final_response": "ok"}
+                return {"final_response": "ok", "completed": True}
 
             agent.run_conversation = MagicMock(side_effect=finish_turn)
             agent.shutdown_memory_provider = MagicMock()

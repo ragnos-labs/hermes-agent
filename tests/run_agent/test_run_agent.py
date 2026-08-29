@@ -3893,6 +3893,7 @@ class TestRunConversation:
         agent.max_tokens = 2000
         agent._strict_output_token_budget = 2000
         agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
         agent.stream_delta_callback = lambda _delta: None
         first = _mock_response(content="Bounded partial", finish_reason="length")
         second = _mock_response(content="must not run", finish_reason="stop")
@@ -3909,13 +3910,79 @@ class TestRunConversation:
         assert result["completed"] is False
         assert result["partial"] is True
         assert result["api_calls"] == 1
-        assert result["final_response"] == "Bounded partial"
+        assert result["final_response"] == ""
+        assert result["failed"] is True
+        assert result["strict_output_budget"] is True
         assert result["error"] == (
             "Strict one-shot output ceiling reached; no continuation attempted"
         )
         assert agent.client.chat.completions.create.call_count == 1
         streaming_call.assert_not_called()
         assert agent._strict_output_tokens_reserved == 2000
+
+    def test_strict_oneshot_rejects_streaming_route_before_turn_setup(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = False
+        agent.stream_delta_callback = lambda _delta: None
+
+        with patch("agent.conversation_loop.build_turn_context") as build_turn_context:
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["final_response"] == ""
+        assert result["api_calls"] == 0
+        assert "streaming" in result["error"]
+        build_turn_context.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_strict_oneshot_rejects_relay_route_before_turn_setup(self, agent):
+        self._setup_agent(agent)
+        agent.max_tokens = 2000
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent._disable_streaming = True
+        relay = MagicMock()
+        relay.managed_execution_enabled.return_value = True
+
+        with (
+            patch("agent.relay_runtime.get_runtime", return_value=relay),
+            patch("agent.conversation_loop.build_turn_context") as build_turn_context,
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert result["final_response"] == ""
+        assert result["api_calls"] == 0
+        assert "Relay" in result["error"]
+        build_turn_context.assert_not_called()
+        agent.client.chat.completions.create.assert_not_called()
+
+    def test_ordinary_mode_does_not_apply_strict_transport_guards(self, agent):
+        self._setup_agent(agent)
+        agent._disable_streaming = False
+        agent.stream_delta_callback = lambda _delta: None
+        relay = MagicMock()
+        relay.managed_execution_enabled.return_value = True
+        agent._interruptible_streaming_api_call = MagicMock(
+            return_value=_mock_response(content="ordinary", finish_reason="stop")
+        )
+
+        with (
+            patch("agent.relay_runtime.get_runtime", return_value=relay),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "ordinary"
+        agent._interruptible_streaming_api_call.assert_called_once()
 
     def test_strict_oneshot_rejects_provider_overrides_before_dispatch(self, agent):
         self._setup_agent(agent)
