@@ -65,6 +65,8 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
     budget = getattr(agent, "_strict_output_token_budget", None)
     if budget is None:
         return
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget != 2000:
+        raise RuntimeError("strict output budget requires exactly 2000 tokens")
     if getattr(agent, "request_overrides", None):
         raise RuntimeError("strict output budget rejects provider request overrides")
 
@@ -119,7 +121,12 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
                     )
 
     caps: list[int] = []
-    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+    for key in (
+        "max_output_tokens",
+        "max_completion_tokens",
+        "max_tokens",
+        "maxTokens",
+    ):
         if key not in api_kwargs:
             continue
         raw = api_kwargs[key]
@@ -139,11 +146,12 @@ def _reserve_strict_output_budget(agent: Any, api_kwargs: Dict[str, Any]) -> Non
         raise RuntimeError("strict output budget exhausted after one provider attempt")
 
     reserved = int(getattr(agent, "_strict_output_tokens_reserved", 0) or 0)
-    remaining = int(budget) - reserved
-    if caps[0] > remaining:
-        raise RuntimeError("strict output budget exhausted before provider dispatch")
+    if reserved != 0 or caps[0] != budget:
+        raise RuntimeError(
+            "strict output budget requires the exact configured output cap"
+        )
     agent._strict_provider_attempted = True
-    agent._strict_output_tokens_reserved = reserved + caps[0]
+    agent._strict_output_tokens_reserved = caps[0]
 
 
 def _require_strict_single_attempt_mode(
@@ -189,13 +197,7 @@ def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
     # Requiring an explicit disable flag makes route selection fail closed
     # instead of quietly bypassing an otherwise active streaming path.
     if getattr(agent, "_disable_streaming", False) is not True:
-        from unittest.mock import Mock
-
-        if not (
-            isinstance(getattr(agent, "client", None), Mock)
-            and not agent._has_stream_consumers()
-        ):
-            raise RuntimeError("strict output budget does not support streaming")
+        raise RuntimeError("strict output budget does not support streaming")
 
     # Relay can rewrite or re-dispatch a provider request inside its managed
     # execution boundary. Detect the active route without creating a runtime
@@ -205,6 +207,28 @@ def _require_strict_physical_single_attempt_mode(agent: Any) -> None:
     relay = relay_runtime.get_runtime(create=False)
     if relay is not None and relay.managed_execution_enabled():
         raise RuntimeError("strict output budget does not support Relay")
+
+
+def _strict_terminal_failure(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    api_call_count: int,
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Return a content-free terminal result for a strict physical attempt."""
+    if getattr(agent, "_strict_output_token_budget", None) is None:
+        return None
+    return {
+        "final_response": "",
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "partial": True,
+        "failed": True,
+        "strict_output_budget": True,
+        "error": f"Strict one-shot request failed: {reason}",
+    }
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
@@ -1676,6 +1700,12 @@ def run_conversation(
     # conversations retain their configured compression behavior.
     if getattr(agent, "_strict_output_token_budget", None) is not None:
         agent.compression_enabled = False
+        _strict_compressor = getattr(agent, "context_compressor", None)
+        if _strict_compressor is not None:
+            # Post-turn micro-compaction is an auxiliary model/write path.
+            # The strict one-shot agent is isolated and disposable, so disable
+            # it for the entire bounded turn before any finalizer can run.
+            _strict_compressor._micro_compact_enabled = False
     try:
         _require_strict_single_attempt_mode(agent, moa_config=moa_config)
         _require_strict_physical_single_attempt_mode(agent)
@@ -3113,6 +3143,14 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    _strict_failure = _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="invalid provider response",
+                    )
+                    if _strict_failure is not None:
+                        return _strict_failure
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -3340,6 +3378,40 @@ def run_conversation(
                         )
                         finish_reason = "length"
 
+                # Strict chat-completions responses are already normalized at
+                # this point. Reject every non-final, tool-bearing, or empty
+                # result before usage hooks, fallback bookkeeping, or any
+                # other post-response auxiliary path can run.
+                if (
+                    getattr(agent, "_strict_output_token_budget", None) is not None
+                    and finish_reason not in {"content_filter", "length"}
+                ):
+                    _strict_has_text = agent._has_content_after_think_block(
+                        assistant_message.content or ""
+                    )
+                    _strict_provider_data = assistant_message.provider_data or {}
+                    _strict_refusal = _strict_provider_data.get("refusal")
+                    if (
+                        assistant_message.tool_calls
+                        or finish_reason != "stop"
+                        or not _strict_has_text
+                        or (
+                            isinstance(_strict_refusal, str)
+                            and bool(_strict_refusal.strip())
+                        )
+                    ):
+                        return _strict_terminal_failure(
+                            agent,
+                            messages,
+                            api_call_count,
+                            reason=(
+                                "provider refusal"
+                                if isinstance(_strict_refusal, str)
+                                and bool(_strict_refusal.strip())
+                                else "non-terminal or empty provider response"
+                            ),
+                        )
+
                 # ── Content-policy refusal (HTTP 200) ──────────────────
                 # The model — or the provider's safety system — returned a
                 # *successful* response whose stop/finish reason is a refusal:
@@ -3355,6 +3427,14 @@ def run_conversation(
                 # exception-based ``content_policy_blocked`` recovery: try a
                 # configured fallback once, otherwise return the refusal.
                 if finish_reason == "content_filter":
+                    _strict_failure = _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="provider refusal",
+                    )
+                    if _strict_failure is not None:
+                        return _strict_failure
                     _refusal_transport = agent._get_transport()
                     if agent.api_mode == "anthropic_messages":
                         _refusal_result = _refusal_transport.normalize_response(
@@ -3444,6 +3524,14 @@ def run_conversation(
                     )
 
                 if finish_reason == "length":
+                    _strict_failure = _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="output ceiling reached",
+                    )
+                    if _strict_failure is not None:
+                        return _strict_failure
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Response truncated — stream "
@@ -6399,6 +6487,22 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            if getattr(agent, "_strict_output_token_budget", None) is not None:
+                _strict_has_text = agent._has_content_after_think_block(
+                    assistant_message.content or ""
+                )
+                if (
+                    assistant_message.tool_calls
+                    or finish_reason != "stop"
+                    or not _strict_has_text
+                ):
+                    return _strict_terminal_failure(
+                        agent,
+                        messages,
+                        api_call_count,
+                        reason="non-terminal or empty provider response",
+                    )
+
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
@@ -7697,6 +7801,11 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
+                if getattr(agent, "_strict_output_token_budget", None) is not None:
+                    messages.append(final_msg)
+                    _turn_exit_reason = "strict_text_response"
+                    break
+
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
                 # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"
@@ -7964,6 +8073,14 @@ def run_conversation(
                 break
             
         except Exception as e:
+            _strict_failure = _strict_terminal_failure(
+                agent,
+                messages,
+                api_call_count,
+                reason="response processing failure",
+            )
+            if _strict_failure is not None:
+                return _strict_failure
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.

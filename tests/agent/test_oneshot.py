@@ -270,6 +270,32 @@ class TestHelpers:
                 agent, {"inferenceConfig": {"maxTokens": 1}}
             )
 
+    @pytest.mark.parametrize("cap", [1, 1999, 2001])
+    def test_strict_output_budget_rejects_non_exact_first_cap(self, cap):
+        agent = MagicMock()
+        agent._strict_output_token_budget = 2000
+        agent._strict_output_tokens_reserved = 0
+        agent.request_overrides = {}
+
+        with pytest.raises(RuntimeError, match="exact configured output cap"):
+            _reserve_strict_output_budget(agent, {"max_tokens": cap})
+
+        assert agent._strict_output_tokens_reserved == 0
+        assert vars(agent).get("_strict_provider_attempted", False) is False
+
+    @pytest.mark.parametrize("budget", [1, 1999, 2001, "2000", True])
+    def test_strict_output_budget_rejects_non_exact_configured_budget(self, budget):
+        agent = MagicMock()
+        agent._strict_output_token_budget = budget
+        agent._strict_output_tokens_reserved = 0
+        agent.request_overrides = {}
+
+        with pytest.raises(RuntimeError, match="requires exactly 2000 tokens"):
+            _reserve_strict_output_budget(agent, {"max_tokens": 2000})
+
+        assert agent._strict_output_tokens_reserved == 0
+        assert vars(agent).get("_strict_provider_attempted", False) is False
+
     @pytest.mark.parametrize(
         ("provider", "api_mode"),
         [
