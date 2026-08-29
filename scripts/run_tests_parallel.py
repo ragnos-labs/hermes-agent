@@ -391,7 +391,7 @@ def _run_one_file_once(
     pytest_temp_root = tempfile.mkdtemp(prefix="hp-", dir=short_temp_parent)
     child_env = os.environ.copy()
     child_env["PYTEST_DEBUG_TEMPROOT"] = pytest_temp_root
-    
+
     subproc_start = time.monotonic()
     # launch the pytest process
     try:
@@ -441,7 +441,6 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
-        shutil.rmtree(pytest_temp_root, ignore_errors=True)
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -449,8 +448,11 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
-
-    shutil.rmtree(pytest_temp_root, ignore_errors=True)
+    finally:
+        # Delete the temp root for this attempt. Nothing reads it after the
+        # subprocess exits. More than 3000 of them fill the disk of the
+        # runner over one suite.
+        shutil.rmtree(pytest_temp_root, ignore_errors=True)
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
