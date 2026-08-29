@@ -1105,6 +1105,44 @@ jobs:
           assert "index:io.ragnos.hermes.execution.action-contract=${ACTION_CONTRACT_VERSION}" in text
           assert "application/vnd.ragnos.hermes.execution.action.release-receipt.v1+json" in text
           assert "hermes.execution.action.release-receipt.v1" in text
+
+          release_lock = job_body("release-lock")
+          package_contract = re.compile(
+              r'\.package_type == "container"\s+'
+              r'and \.name == "hermes-agent"\s+'
+              r'and \.visibility == "private"\s+'
+              r'and \.repository\.full_name == "ragnos-labs/hermes-agent"'
+          )
+          assert package_contract.search(release_lock)
+          assert 'package_link:{linked_repository:"ragnos-labs/hermes-agent",visibility:"private"}' in release_lock
+
+
+          def maintenance_package_is_admitted(metadata):
+              return (
+                  isinstance(metadata, dict)
+                  and metadata.get("package_type") == "container"
+                  and metadata.get("name") == "hermes-agent"
+                  and metadata.get("visibility") == "private"
+                  and isinstance(metadata.get("repository"), dict)
+                  and metadata["repository"].get("full_name") == "ragnos-labs/hermes-agent"
+              )
+
+
+          exact_private = {
+              "package_type": "container",
+              "name": "hermes-agent",
+              "visibility": "private",
+              "repository": {"full_name": "ragnos-labs/hermes-agent"},
+          }
+          assert maintenance_package_is_admitted(exact_private)
+          for rejected_visibility in ("public", "internal", None, ["private", "public"]):
+              candidate = dict(exact_private)
+              if rejected_visibility is None:
+                  candidate.pop("visibility")
+              else:
+                  candidate["visibility"] = rejected_visibility
+              assert not maintenance_package_is_admitted(candidate), candidate
+          assert "if [ \"$MAINTENANCE\" != true ]; then" in text
           print("publication_graph_and_exact_digest_fences=passed")
           PY
 
@@ -1586,7 +1624,7 @@ jobs:
           gh api "orgs/ragnos-labs/packages/container/hermes-agent" > "$package_json"
           jq -e '.package_type == "container"
                  and .name == "hermes-agent"
-                 and .visibility == "public"
+                 and .visibility == "private"
                  and .repository.full_name == "ragnos-labs/hermes-agent"' \
             "$package_json" >/dev/null
           gh api --paginate --slurp \
@@ -1682,7 +1720,7 @@ jobs:
               source:{sha:$source_sha,tree:$source_tree},
               workflow:{sha:$workflow_sha,run_id:$run_id,run_attempt:$run_attempt},
               collision:{git_ref:"absent",active_versions:"absent",deleted_versions:"absent"},
-              package_link:{linked_repository:"ragnos-labs/hermes-agent",visibility:"public"},
+              package_link:{linked_repository:"ragnos-labs/hermes-agent",visibility:"private"},
               privileged_review:{environment:"hermes-execution-read-release",receipt_digest:$approval_digest,
                 covers:["organization_audit_180d","package_acl","workflow_writer","tag_ruleset"]},
               recovery:{state:"immutable_tag_created",instruction:"Never move or delete the tag; reconcile partial registry state before any successor."}}' \
