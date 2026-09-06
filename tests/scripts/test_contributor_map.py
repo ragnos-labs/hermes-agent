@@ -69,6 +69,23 @@ def test_add_creates_mapping_file(emails_dir):
     assert "# PR #999 salvage" in path.read_text()
 
 
+def test_case_distinct_addresses_retain_both_attributions(emails_dir, monkeypatch):
+    import audit_pr_attribution
+
+    assert add_contributor("Agent@example.com", "first-person") == 0
+    assert add_contributor("agent@example.com", "second-person") == 0
+    assert add_contributor("agent@example.com", "second-person") == 0
+    assert add_contributor("agent@example.com", "wrong-person") == 1
+    assert release._load_contributor_dir(emails_dir) == {
+        "Agent@example.com": "first-person",
+        "agent@example.com": "second-person",
+    }
+    monkeypatch.setattr(audit_pr_attribution, "REPO_ROOT", emails_dir.parents[1])
+    assert audit_pr_attribution.is_mapped("Agent@example.com")
+    assert audit_pr_attribution.is_mapped("agent@example.com")
+    assert not audit_pr_attribution.is_mapped("AGENT@example.com")
+
+
 
 
 

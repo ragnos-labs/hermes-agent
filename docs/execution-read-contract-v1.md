@@ -143,6 +143,11 @@ set is:
 `cancellation_requested`, `terminal_succeeded`, `terminal_failed`,
 `terminal_cancelled`, `terminal_partial`, and `terminal_ambiguous`.
 
+A cancellation request is provisional until execution acknowledges the stop.
+Work that completes first may transition from `cancellation_requested` to
+`terminal_succeeded`. Effect-bearing success still requires matching durable
+effect evidence; completion without it becomes `terminal_ambiguous`.
+
 `execution_id` and its work, proposal, and effect references are immutable.
 An `effect_id` requires both `work_ref` and `proposal_ref`. `revision` is the
 optimistic concurrency token. `created_at`, `started_at`, `updated_at`, and

@@ -52,7 +52,7 @@ jobs:
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
-            if [ -f "contributors/emails/${email}" ]; then
+            if python3 -c 'import pathlib, sys; sys.exit(not any(p.is_file() and p.name == sys.argv[1] for p in pathlib.Path("contributors/emails").rglob("*")))' "$email"; then
               continue  # mapped via the contributors directory
             fi
 
