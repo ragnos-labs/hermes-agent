@@ -3060,16 +3060,15 @@ class TestInboundMediaAuthorizationGate:
         assert result.raw_response is None
 
     @pytest.mark.asyncio
-    async def test_live_media_redacts_long_path_before_bounding(self, tmp_path):
-        parent = tmp_path
-        private_parts = []
-        for index in range(6):
-            part = f"private-{index}-" + ("x" * 150)
-            private_parts.append(part)
-            parent = parent / part
-            parent.mkdir()
+    async def test_live_media_redacts_long_path_before_bounding(self, tmp_path, monkeypatch):
+        private_part = "private-upload-directory"
+        parent = tmp_path / private_part
+        parent.mkdir()
         media = parent / "handoff.txt"
         media.write_text("safe handoff", encoding="utf-8")
+        # Exercise redaction before truncation without exceeding macOS PATH_MAX.
+        output_bound = len(str(media)) - 1
+        monkeypatch.setattr(_buzz_mod, "_MAX_CLI_MESSAGE_CHARS", output_bound)
         adapter = _make_adapter()
         adapter._run_cli = AsyncMock(
             return_value=(
@@ -3087,9 +3086,9 @@ class TestInboundMediaAuthorizationGate:
         result = await adapter.send_document(CHANNEL, str(media))
 
         assert result.success is False
-        assert all(part not in result.error for part in private_parts)
+        assert private_part not in result.error
         assert "handoff.txt" in result.error
-        assert len(result.error) <= 900
+        assert len(result.error) <= output_bound
 
     @pytest.mark.asyncio
     async def test_send_to_platform_live_buzz_delivers_all_media(self, monkeypatch, tmp_path):

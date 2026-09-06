@@ -40,16 +40,32 @@ def test_guest_barriers_apply_configured_synchronous(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
+def _assert_unset_synchronous(monkeypatch, tmp_path, expected):
     _config(monkeypatch, {})
     conn = sqlite3.connect(tmp_path / "state.db")
     try:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA synchronous=1")
         apply_durability_barriers(conn)
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == expected
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     finally:
         conn.close()
+
+
+@pytest.mark.linux_only
+def test_guest_barriers_leave_synchronous_alone_when_unset_linux(monkeypatch, tmp_path):
+    _assert_unset_synchronous(monkeypatch, tmp_path, 1)
+
+
+@pytest.mark.windows_only
+def test_guest_barriers_leave_synchronous_alone_when_unset_windows(monkeypatch, tmp_path):
+    _assert_unset_synchronous(monkeypatch, tmp_path, 1)
+
+
+@pytest.mark.macos_only
+def test_guest_barriers_retain_full_durability_when_unset_macos(monkeypatch, tmp_path):
+    _assert_unset_synchronous(monkeypatch, tmp_path, 2)
 
 
 def test_guest_barriers_survive_config_failure(monkeypatch, tmp_path):

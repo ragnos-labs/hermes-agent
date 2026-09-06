@@ -840,8 +840,12 @@ class TestRunLifecycleSweep:
 class TestStopRun:
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("effect_bound", "expected_lifecycle"),
+        [(False, "terminal_succeeded"), (True, "terminal_ambiguous")],
+    )
     async def test_completion_wins_before_uncooperative_stop_is_acknowledged(
-        self, adapter
+        self, adapter, effect_bound, expected_lifecycle
     ):
         """A provisional Stop cannot discard a real completion."""
         app = _create_runs_app(adapter)
@@ -865,8 +869,16 @@ class TestStopRun:
                 mock_agent.run_conversation.side_effect = _run_conversation
                 mock_create.return_value = mock_agent
 
-                resp = await cli.post("/v1/runs", json={"input": "hello"})
-                run_id = (await resp.json())["run_id"]
+                body = {"input": "hello"}
+                if effect_bound:
+                    body["execution_context"] = {
+                        "work_ref": "work:late-completion",
+                        "proposal_ref": "proposal:late-completion",
+                        "effect_id": "effect:late-completion",
+                    }
+                resp = await cli.post("/v1/runs", json=body)
+                accepted = await resp.json()
+                run_id = accepted["run_id"]
                 assert started.wait(timeout=3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -888,6 +900,11 @@ class TestStopRun:
                 assert run_id not in adapter._active_run_tasks
                 assert adapter._run_statuses[run_id]["status"] == "completed"
                 assert adapter._run_statuses[run_id]["output"] == "late result"
+                execution = adapter._execution_contract_store().get_execution(
+                    accepted["execution_id"]
+                )
+                assert execution["lifecycle"] == expected_lifecycle
+                assert not adapter._execution_contract_is_degraded()
 
     @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):
@@ -1576,6 +1593,7 @@ class TestHostedRoomRuns:
         self, auth_adapter
     ):
         run_id = "run-room-approval"
+        auth_adapter._run_streams[run_id] = asyncio.Queue()
         current = approval_mod._ApprovalEntry({
             "request_id": "approval-B",
             "command": "rm -rf build-B",
@@ -1622,6 +1640,9 @@ class TestHostedRoomRuns:
         assert stale_body["error"]["code"] == "approval_not_pending"
         assert exact.status == 200
         assert exact_body["request_id"] == "approval-B"
+        event = auth_adapter._run_streams[run_id].get_nowait()
+        assert event["event"] == "approval.responded"
+        assert event["request_id"] == "approval-B"
         assert current.result == "once"
         assert "approval" not in auth_adapter._run_statuses[run_id]
 

@@ -118,6 +118,7 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     ),
     "cancellation_requested": frozenset(
         {
+            "terminal_succeeded",
             "terminal_cancelled",
             "terminal_failed",
             "terminal_partial",

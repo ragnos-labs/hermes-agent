@@ -1422,6 +1422,7 @@ async def _handle_run_approval(
                 "timestamp": time.time(),
                 "choice": choice,
                 "resolved": resolved,
+                **({"request_id": durable_request_id} if durable_request_id else {}),
                 **(
                     {"decision_id": durable_decision["decision_id"]}
                     if durable_decision is not None
