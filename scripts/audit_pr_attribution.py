@@ -66,7 +66,10 @@ def is_mapped(email: str) -> bool:
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+    if any(
+        path.is_file() and path.name == email
+        for path in (REPO_ROOT / "contributors" / "emails").rglob("*")
+    ):
         return True
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:

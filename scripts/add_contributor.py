@@ -17,6 +17,7 @@ legacy AUTHOR_MAP), refuses with exit 1 so a typo can't silently reassign
 someone's commits.
 """
 
+import hashlib
 import re
 import sys
 from pathlib import Path
@@ -66,8 +67,13 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         print(f"error: {login!r} is not a valid GitHub login", file=sys.stderr)
         return 2
 
-    path = EMAILS_DIR / email
-    existing = read_mapping_file(path) if path.is_file() else None
+    mappings = [p for p in EMAILS_DIR.rglob("*") if p.is_file()]
+    exact = next((p for p in mappings if p.name == email), None)
+    path = exact or EMAILS_DIR / email
+    if exact is None and any(p.name.casefold() == email.casefold() for p in mappings):
+        # Keep both exact addresses without relying on filesystem case rules.
+        path = EMAILS_DIR / "case-variants" / hashlib.sha256(email.encode()).hexdigest() / email
+    existing = read_mapping_file(exact) if exact is not None else None
     if existing is None:
         existing = _legacy_login(email)
     if existing is not None:
@@ -81,12 +87,12 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         )
         return 1
 
-    EMAILS_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     body = login + "\n"
     if comment:
         body += f"# {comment}\n"
     path.write_text(body, encoding="utf-8")
-    print(f"added: contributors/emails/{email} -> {login}")
+    print(f"added: contributors/emails/{path.relative_to(EMAILS_DIR)} -> {login}")
     return 0
 
 

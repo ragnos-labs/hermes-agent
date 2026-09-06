@@ -446,22 +446,39 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 
 Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
 
-Private coordinators that need retry-safe dispatch can send an
-`Idempotency-Key` with the full `API_SERVER_KEY`. Hermes durably binds the
-hashed key to the canonical request, `run_id`, and execution-read
-`execution_id`. An exact retry returns the same `202` response without a
-second launch; changing the body or `X-Hermes-Session-Key` under that key
-returns `409`. The raw key and request body are not stored in the execution
-ledger.
+Private coordinators using the full `API_SERVER_KEY` retain the fork's
+[execution action contract](https://github.com/ragnos-labs/hermes-agent/blob/main/docs/execution-action-contract-v1.md).
+`Idempotency-Key` reserves a permanent, profile-scoped hashed key. Exact retries
+return the identical `{run_id, execution_id, status: "started"}` response,
+including after restart or completion; changed requests return `409`. Raw keys
+and request bodies are not stored in that execution ledger.
 
-When the body includes closed `execution_context` bindings, the response also
-contains the durable `execution_id`. Poll that object through the execution
-read contract. An authoritative terminal receipt still requires exact evidence
-from a named executor; generic run completion is not evidence.
+Room-grant requests use upstream's separate Runs reservation, scoped to the
+credential, profile and room. Their keys use 1-255 visible ASCII characters,
+with status retained for at least the grant's result window and the store's
+24-hour retention policy. Replays return the original run with current status
+and `Idempotency-Replayed: true`. Room grants cannot submit `execution_context`
+or use the private execution contract. One request uses only one reservation
+store. Requests without a key always create a new run.
+
+Private execution bindings expose a durable `execution_id`; authoritative
+terminal receipts still require exact evidence from a named executor. Generic
+completion alone is not that evidence.
+
+When `session_id` identifies an existing Hermes session and no explicit
+`conversation_history` or `previous_response_id` is supplied, the run loads
+that session's active transcript. Session turn leases serialize concurrent
+writers and refresh the transcript after a contended wait.
 
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.
+
+Room-grant keyed runs can recover their retained status through this endpoint
+after restart. Private action-contract clients recover the stable `execution_id`
+by replaying the original submission, then query the execution-read contract.
+The private execution ledger does not retain raw Runs output or recreate expired
+process/stream state; an old private run handle may therefore return `404` here.
 
 ```json
 {
