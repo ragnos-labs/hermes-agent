@@ -1,6 +1,7 @@
 """Built-in corrections invalidate the matching mirrored fact, across restart."""
 
 import json
+import threading
 
 import pytest
 
@@ -114,4 +115,45 @@ def test_committed_batch_matches_fact_store(tmp_path, monkeypatch, operations, e
         assert json.loads(result)["success"]
         assert contents(value) == set()
     finally:
+        value.shutdown()
+
+
+def test_reordered_callback_cannot_erase_a_newer_fact(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    first_store, second_store = MemoryStore(), MemoryStore()
+    value = provider(tmp_path)
+    manager = MemoryManager.__new__(MemoryManager)
+    manager._providers = [value]
+    captured, release = threading.Event(), threading.Event()
+    errors = []
+
+    def metadata():
+        captured.set()
+        assert release.wait(5)
+        return {"task_id": "older"}
+
+    first = {"action": "add", "content": "Check battery."}
+    result = memory_tool(store=first_store, **first)
+
+    def notify():
+        try:
+            manager.notify_memory_tool_write(result, first, build_metadata=metadata)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=notify)
+    worker.start()
+    try:
+        assert captured.wait(5)
+        later = {"action": "add", "content": "Check lamp."}
+        second_result = memory_tool(store=second_store, **later)
+        assert json.loads(second_result)["success"]
+        manager.notify_memory_tool_write(second_result, later)
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive() and not errors
+        assert contents(value) == {"Check battery.", "Check lamp."}
+    finally:
+        release.set()
+        worker.join(5)
         value.shutdown()

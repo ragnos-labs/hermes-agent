@@ -283,6 +283,22 @@ class MemoryStore:
         """Reconcile one committed batch, including duplicate native entries."""
         import json
 
+        source_path = metadata.get("committed_source_path")
+        if source_path is not None:
+            from tools.memory_tool import MemoryStore as BuiltinMemoryStore
+            path = Path(source_path)
+            # Native writers use this same lock. Verify freshness and retain
+            # it through the fact transaction so reordered callbacks cannot
+            # erase facts from a later committed write.
+            with BuiltinMemoryStore._file_lock(path):
+                current, readable = BuiltinMemoryStore._read_entries_checked(path)
+                if not readable or current != metadata["committed_entries"]:
+                    return
+                snapshot = {key: value for key, value in metadata.items()
+                            if key != "committed_source_path"}
+                self._mirror_builtin_snapshot(target, snapshot)
+            return
+
         entries = metadata["committed_entries"]
         if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
             raise ValueError("Invalid committed memory snapshot")

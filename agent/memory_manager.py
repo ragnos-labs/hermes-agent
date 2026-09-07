@@ -1322,6 +1322,7 @@ class MemoryManager:
                 metadata = dict(build_metadata() if build_metadata else {})
                 if committed_entries is not None:
                     metadata["committed_entries"] = committed_entries
+                    metadata["committed_source_path"] = str(path)
                     metadata["batch_final"] = index == len(raw_operations) - 1
                 old_text = op.get("old_text")
                 if old_text:
