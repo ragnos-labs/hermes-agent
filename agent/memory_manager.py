@@ -1298,7 +1298,7 @@ class MemoryManager:
         else:
             raw_operations = [{
                 "action": tool_args.get("action"),
-                "content": tool_args.get("content"),
+                "content": tool_args.get("content") if tool_args.get("content") is not None else tool_args.get("new_text"),
                 "old_text": tool_args.get("old_text"),
             }]
 
@@ -1316,7 +1316,7 @@ class MemoryManager:
                 self.on_memory_write(
                     action,
                     target,
-                    str(op.get("content") or ""),
+                    str((op.get("content") if op.get("content") is not None else op.get("new_text")) or ""),
                     metadata=metadata,
                 )
             except Exception as e:

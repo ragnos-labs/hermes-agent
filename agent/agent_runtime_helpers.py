@@ -2732,6 +2732,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
         from agent.moa_loop import build_moa_facade
         return build_moa_facade(agent, getattr(agent, "model", None) or "default")
+    if agent.provider == "codex_exec":
+        from agent.codex_exec_client import CodexExecClient
+        return CodexExecClient(cancel_check=lambda: bool(getattr(agent, "_interrupt_requested", False)))
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)

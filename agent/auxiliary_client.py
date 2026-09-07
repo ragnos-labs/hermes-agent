@@ -6418,6 +6418,9 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
 
     if isinstance(sync_client, _AuxProbeClientStub):
         return sync_client, model
+    from agent.codex_exec_client import CodexExecClient, AsyncCodexExecClient
+    if isinstance(sync_client, CodexExecClient):
+        return AsyncCodexExecClient(sync_client), model
     if isinstance(sync_client, CodexAuxiliaryClient):
         return AsyncCodexAuxiliaryClient(sync_client), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
@@ -7216,6 +7219,13 @@ def resolve_provider_client(
             or _read_main_model_for_aux(),
             provider,
         )
+        if provider == "codex_exec":
+            from agent.codex_exec_client import CodexExecClient, CodexExecError
+            if not final_model:
+                raise CodexExecError("unsupported_request", "Codex exec requires an explicit or main model")
+            client = CodexExecClient()
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
         if provider == "copilot-acp":
             api_key = str(creds.get("api_key", "")).strip()
             base_url = str(creds.get("base_url", "")).strip()

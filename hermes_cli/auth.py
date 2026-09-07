@@ -305,6 +305,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
     ),
+    "codex_exec": ProviderConfig(
+        id="codex_exec",
+        name="Codex CLI (exec)",
+        auth_type="external_process",
+        inference_base_url="codex-exec://local",
+    ),
     "gemini": ProviderConfig(
         id="gemini",
         name="Google AI Studio",
@@ -7287,6 +7293,15 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
+    if provider_id in {"codex_exec", "codex-exec"}:
+        from agent.codex_exec_client import CodexExecError, resolve_process
+        try:
+            result = resolve_process()
+        except (CodexExecError, ValueError):
+            return {"configured": False, "provider": "codex_exec", "logged_in": False}
+        # Executable presence does not establish a successful Codex login.
+        return {**result, "configured": True, "logged_in": False, "authentication": "cli_managed"}
+
     command = (
         os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
         or os.getenv("COPILOT_CLI_PATH", "").strip()
@@ -7513,6 +7528,10 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
+
+    if provider_id in {"codex_exec", "codex-exec"}:
+        from agent.codex_exec_client import resolve_process
+        return resolve_process()
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
