@@ -1292,6 +1292,16 @@ class MemoryManager:
             return
 
         target = str(tool_args.get("target") or "memory")
+        committed_entries = None
+        try:
+            from tools.memory_tool import MemoryStore
+            path = MemoryStore._path_for(target)
+            if path.exists():
+                raw, readable = MemoryStore._read_raw_checked(path)
+                if readable:
+                    committed_entries = MemoryStore._parse_entries(raw)
+        except (OSError, ValueError):
+            logger.debug("Committed memory snapshot unavailable", exc_info=True)
         operations = tool_args.get("operations")
         if isinstance(operations, list) and operations:
             raw_operations = operations
@@ -1302,7 +1312,7 @@ class MemoryManager:
                 "old_text": tool_args.get("old_text"),
             }]
 
-        for op in raw_operations:
+        for index, op in enumerate(raw_operations):
             if not isinstance(op, dict):
                 continue
             action = str(op.get("action") or "")
@@ -1310,13 +1320,16 @@ class MemoryManager:
                 continue
             try:
                 metadata = dict(build_metadata() if build_metadata else {})
+                if committed_entries is not None:
+                    metadata["committed_entries"] = committed_entries
+                    metadata["batch_final"] = index == len(raw_operations) - 1
                 old_text = op.get("old_text")
                 if old_text:
                     metadata["old_text"] = str(old_text)
                 self.on_memory_write(
                     action,
                     target,
-                    str((op.get("content") if op.get("content") is not None else op.get("new_text")) or ""),
+                    str((op.get("content") or op.get("new_text")) or ""),
                     metadata=metadata,
                 )
             except Exception as e:

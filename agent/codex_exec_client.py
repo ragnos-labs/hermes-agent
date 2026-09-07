@@ -303,7 +303,8 @@ class CodexExecClient:
         for process in processes:
             _stop(process)
 
-    def _run(self, request: dict[str, Any], reasoning: str) -> tuple[str, dict[str, int]]:
+    def _run(self, request: dict[str, Any], reasoning: str,
+             cancel_event: threading.Event | None = None) -> tuple[str, dict[str, int]]:
         payload = _INSTRUCTIONS + "\n" + json.dumps(request, ensure_ascii=False, allow_nan=False)
         if len(payload.encode()) > _MAX_BYTES:
             raise CodexExecError("request_too_large", "Codex request exceeds the transport limit")
@@ -328,7 +329,7 @@ class CodexExecClient:
                 try:
                     deadline = time.monotonic() + self.timeout
                     while True:
-                        if self.is_closed or self._cancel_check and self._cancel_check():
+                        if self.is_closed or cancel_event and cancel_event.is_set() or self._cancel_check and self._cancel_check():
                             raise CodexExecError("cancelled", "Codex request was cancelled")
                         if time.monotonic() >= deadline:
                             raise CodexExecError("timeout", "Codex request timed out")
@@ -339,7 +340,7 @@ class CodexExecClient:
                             break
                         except subprocess.TimeoutExpired:
                             pass
-                    if self.is_closed or self._cancel_check and self._cancel_check():
+                    if self.is_closed or cancel_event and cancel_event.is_set() or self._cancel_check and self._cancel_check():
                         raise CodexExecError("cancelled", "Codex request was cancelled")
                     stdout.seek(0)
                     data = stdout.read(_MAX_BYTES + 1)
@@ -381,7 +382,7 @@ class CodexExecClient:
         reasoning = kwargs.get("reasoning_effort") or self.settings.get("reasoning_effort", "high")
         if reasoning not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
             raise CodexExecError("unsupported_request", "Unsupported Codex reasoning effort")
-        answer, usage = (self._executor(request, reasoning) if self._executor else self._run(request, reasoning))
+        answer, usage = (self._executor(request, reasoning) if self._executor else self._run(request, reasoning, kwargs.get("_cancel_event")))
         message = decode_response(answer, request)
         completion = SimpleNamespace(
             id="codex-exec", model=request["model"],
@@ -404,13 +405,23 @@ class AsyncCodexExecClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
     async def create(self, **kwargs: Any) -> Any:
+        cancel_event = threading.Event()
+        worker = asyncio.create_task(asyncio.to_thread(
+            self.client.create, **kwargs, _cancel_event=cancel_event,
+        ))
         try:
-            result = await asyncio.to_thread(self.client.create, **kwargs)
+            result = await asyncio.shield(worker)
             if kwargs.get("stream"):
                 return _AsyncChunks(result)
             return result
         except asyncio.CancelledError:
-            self.client.close()
+            cancel_event.set()
+            # The cached client may serve other requests. Reap only this
+            # request's subprocess, leaving the wrapper reusable.
+            try:
+                await asyncio.shield(worker)
+            except Exception:
+                pass
             raise
 
     async def close(self) -> None:

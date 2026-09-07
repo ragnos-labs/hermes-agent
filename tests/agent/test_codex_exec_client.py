@@ -1,6 +1,7 @@
 """The CLI is a model transport; only validated Hermes calls can escape it."""
 
 import json
+import asyncio
 import subprocess
 import sys
 import threading
@@ -225,6 +226,36 @@ async def test_async_auxiliary_stream_is_an_async_iterator():
     chunks = [chunk async for chunk in stream]
     assert chunks[0].choices[0].delta.content == "Ready"
     assert chunks[-1].usage.prompt_tokens == 17
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_cancellation_keeps_shared_client_and_other_request_alive(monkeypatch):
+    original = subprocess.Popen
+    started = threading.Event()
+    processes = []
+    slow = True
+
+    def spawn(argv, **kwargs):
+        script = "import time; time.sleep(30)" if slow else "print(" + repr(events()) + ")"
+        process = original([sys.executable, "-c", script], **kwargs)
+        processes.append(process)
+        started.set()
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    client = AsyncCodexExecClient(CodexExecClient(settings={}))
+    first = asyncio.create_task(client.create(model="test-model", messages=[]))
+    assert await asyncio.to_thread(started.wait, 5)
+    slow = False
+    second = asyncio.create_task(client.create(model="test-model", messages=[]))
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert (await second).choices[0].message.content == "Ready"
+    assert (await client.create(model="test-model", messages=[])).choices[0].message.content == "Ready"
+    assert not client.client.is_closed
+    assert all(process.poll() is not None for process in processes)
     await client.close()
 
 

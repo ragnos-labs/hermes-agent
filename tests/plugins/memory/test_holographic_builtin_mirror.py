@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agent.memory_manager import MemoryManager
 from plugins.memory.holographic import HolographicMemoryProvider
 from tools.memory_tool import MemoryStore, memory_tool
@@ -77,5 +79,39 @@ def test_real_memory_tool_manager_bridge_handles_new_text_alias(tmp_path, monkey
         # A failed or staged write must never update the fact store.
         manager.notify_memory_tool_write({"success": True, "staged": True}, {"action": "remove", "old_text": "new battery"})
         assert contents(value) == {"Check the new battery."}
+    finally:
+        value.shutdown()
+
+
+@pytest.mark.parametrize("operations,expected", [
+    ([
+        {"action": "add", "content": "Check battery."},
+        {"action": "add", "content": "Check lamp."},
+        {"action": "replace", "old_text": "lamp", "content": "Check battery."},
+        {"action": "remove", "old_text": "battery"},
+    ], {"Check battery."}),
+    ([
+        {"action": "add", "content": "Check battery."},
+        {"action": "replace", "old_text": "battery", "content": "", "new_text": "Check fuel."},
+    ], {"Check fuel."}),
+])
+def test_committed_batch_matches_fact_store(tmp_path, monkeypatch, operations, expected):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    builtin = MemoryStore()
+    value = provider(tmp_path)
+    manager = MemoryManager.__new__(MemoryManager)
+    manager._providers = [value]
+    try:
+        arguments = {"operations": operations}
+        result = memory_tool(store=builtin, **arguments)
+        assert json.loads(result)["success"]
+        manager.notify_memory_tool_write(result, arguments)
+        assert set(builtin.memory_entries) == expected == contents(value)
+        # The following operation reloads and deduplicates the native entries.
+        remove = {"action": "remove", "old_text": next(iter(expected))}
+        result = memory_tool(store=builtin, **remove)
+        manager.notify_memory_tool_write(result, remove)
+        assert json.loads(result)["success"]
+        assert contents(value) == set()
     finally:
         value.shutdown()

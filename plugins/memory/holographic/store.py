@@ -207,6 +207,10 @@ class MemoryStore:
 
         if action not in {"add", "replace", "remove"} or target not in {"memory", "user"}:
             return
+        if metadata and "committed_entries" in metadata:
+            if metadata.get("batch_final", True):
+                self._mirror_builtin_snapshot(target, metadata)
+            return
         content = content.strip()
         metadata = dict(metadata or {})
         old_text = str(metadata.get("old_text") or "").strip()
@@ -273,6 +277,69 @@ class MemoryStore:
                     self._link_fact_entity(fact_id, self._resolve_entity(name))
                 self._compute_hrr_vector(fact_id, content)
             for changed_category in changed_categories:
+                self._rebuild_bank(changed_category)
+
+    def _mirror_builtin_snapshot(self, target: str, metadata: dict) -> None:
+        """Reconcile one committed batch, including duplicate native entries."""
+        import json
+
+        entries = metadata["committed_entries"]
+        if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
+            raise ValueError("Invalid committed memory snapshot")
+        desired = set(entry.strip() for entry in entries if entry.strip())
+        provenance = json.dumps({key: value for key, value in metadata.items()
+                                 if key not in {"committed_entries", "batch_final"}}, sort_keys=True)
+        category = "user_pref" if target == "user" else "general"
+        categories, created = {category}, []
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                links = self._conn.execute(
+                    "SELECT m.*, f.content AS fact_content, f.category FROM builtin_memory_mirrors m "
+                    "LEFT JOIN facts f ON f.fact_id=m.fact_id WHERE m.target=?", (target,),
+                ).fetchall()
+                retained = set()
+                for link in links:
+                    if link["entry"] in desired and link["fact_content"] == link["entry"]:
+                        retained.add(link["entry"])
+                        continue
+                    self._conn.execute("DELETE FROM builtin_memory_mirrors WHERE target=? AND entry=?",
+                                       (target, link["entry"]))
+                    referenced = self._conn.execute("SELECT 1 FROM builtin_memory_mirrors WHERE fact_id=? LIMIT 1",
+                                                    (link["fact_id"],)).fetchone()
+                    if link["owned"] and not referenced and link["fact_content"] == link["entry"]:
+                        categories.add(link["category"])
+                        self._conn.execute("DELETE FROM fact_entities WHERE fact_id=?", (link["fact_id"],))
+                        self._conn.execute("DELETE FROM facts WHERE fact_id=?", (link["fact_id"],))
+                for entry in sorted(desired - retained):
+                    existing = self._conn.execute("SELECT fact_id FROM facts WHERE content=?", (entry,)).fetchone()
+                    owned = existing is None
+                    if existing:
+                        fact_id = existing["fact_id"]
+                        owned = bool(self._conn.execute(
+                            "SELECT 1 FROM builtin_memory_mirrors WHERE fact_id=? AND owned=1 LIMIT 1", (fact_id,),
+                        ).fetchone())
+                    else:
+                        fact_id = self._conn.execute(
+                            "INSERT INTO facts(content, category, trust_score) VALUES (?, ?, ?)",
+                            (entry, category, self.default_trust),
+                        ).lastrowid
+                        created.append((fact_id, entry))
+                    self._conn.execute(
+                        "INSERT INTO builtin_memory_mirrors(target, entry, fact_id, owned, provenance) VALUES (?, ?, ?, ?, ?)",
+                        (target, entry, fact_id, int(owned), provenance),
+                    )
+                for changed_category in categories:
+                    self._conn.execute("DELETE FROM memory_banks WHERE bank_name=?", (changed_category,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            for fact_id, entry in created:
+                for name in self._extract_entities(entry):
+                    self._link_fact_entity(fact_id, self._resolve_entity(name))
+                self._compute_hrr_vector(fact_id, entry)
+            for changed_category in categories:
                 self._rebuild_bank(changed_category)
 
     def add_fact(
