@@ -242,12 +242,12 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
+    def on_memory_write(self, action: str, target: str, content: str,
+                        metadata: Dict[str, Any] | None = None) -> None:
+        """Mirror additions, corrections and removals with source provenance."""
+        if self._store:
             try:
-                category = "user_pref" if target == "user" else "general"
-                self._store.add_fact(content, category=category)
+                self._store.mirror_builtin_write(action, target, content, metadata)
             except Exception as e:
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 

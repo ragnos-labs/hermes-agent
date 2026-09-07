@@ -7,6 +7,11 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    "codex_exec": {
+        "command": "codex",
+        "reasoning_effort": "high",
+        "timeout_seconds": 120,
+    },
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

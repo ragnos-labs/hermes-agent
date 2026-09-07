@@ -1,0 +1,4 @@
+name: codex_exec
+kind: model-provider
+version: 1.0.0
+description: Codex exec model backend with the native Hermes agent loop

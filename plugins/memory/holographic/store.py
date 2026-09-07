@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS memory_banks (
     fact_count INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS builtin_memory_mirrors (
+    target TEXT NOT NULL,
+    entry TEXT NOT NULL,
+    fact_id INTEGER NOT NULL,
+    owned INTEGER NOT NULL DEFAULT 0,
+    provenance TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (target, entry)
+);
 """
 
 # Trust adjustment constants
@@ -185,6 +194,169 @@ class MemoryStore:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def mirror_builtin_write(self, action: str, target: str, content: str,
+                             metadata: dict | None = None) -> None:
+        """Keep a tracked built-in memory entry and its fact in agreement.
+
+        Ownership is recorded separately from content deduplication. Removing a
+        mirror never removes an independently created fact, a manually changed
+        fact, or a fact still referenced by the other built-in target.
+        """
+        import json
+
+        if action not in {"add", "replace", "remove"} or target not in {"memory", "user"}:
+            return
+        if metadata and "committed_entries" in metadata:
+            if metadata.get("batch_final", True):
+                self._mirror_builtin_snapshot(target, metadata)
+            return
+        content = content.strip()
+        metadata = dict(metadata or {})
+        old_text = str(metadata.get("old_text") or "").strip()
+        if action in {"add", "replace"} and not content:
+            raise ValueError("mirror content is required")
+        if action in {"replace", "remove"} and not old_text:
+            raise ValueError("mirror old_text is required")
+        category = "user_pref" if target == "user" else "general"
+        changed_categories = {category}
+        with self._lock:
+            # Match the native tool's substring selector, but only among this
+            # target's tracked entries. Never guess between ambiguous matches.
+            old = self._conn.execute(
+                "SELECT * FROM builtin_memory_mirrors WHERE target = ? AND instr(entry, ?) > 0",
+                (target, old_text),
+            ).fetchall() if action != "add" else []
+            if len(old) > 1:
+                raise ValueError("ambiguous built-in mirror selector")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for previous in old:
+                    self._conn.execute(
+                        "DELETE FROM builtin_memory_mirrors WHERE target = ? AND entry = ?",
+                        (target, previous["entry"]),
+                    )
+                    referenced = self._conn.execute(
+                        "SELECT 1 FROM builtin_memory_mirrors WHERE fact_id = ? LIMIT 1",
+                        (previous["fact_id"],),
+                    ).fetchone()
+                    row = self._conn.execute(
+                        "SELECT content, category FROM facts WHERE fact_id = ?", (previous["fact_id"],),
+                    ).fetchone()
+                    if previous["owned"] and not referenced and row and row["content"] == previous["entry"]:
+                        changed_categories.add(row["category"])
+                        self._conn.execute("DELETE FROM fact_entities WHERE fact_id = ?", (previous["fact_id"],))
+                        self._conn.execute("DELETE FROM facts WHERE fact_id = ?", (previous["fact_id"],))
+                        self._conn.execute("DELETE FROM memory_banks WHERE bank_name = ?", (row["category"],))
+                if action != "remove":
+                    existing = self._conn.execute("SELECT fact_id FROM facts WHERE content = ?", (content,)).fetchone()
+                    owned = existing is None
+                    if existing:
+                        fact_id = existing["fact_id"]
+                        owned = bool(self._conn.execute(
+                            "SELECT 1 FROM builtin_memory_mirrors WHERE fact_id = ? AND owned = 1 LIMIT 1", (fact_id,),
+                        ).fetchone())
+                    else:
+                        fact_id = self._conn.execute(
+                            "INSERT INTO facts(content, category, trust_score) VALUES (?, ?, ?)",
+                            (content, category, self.default_trust),
+                        ).lastrowid
+                    self._conn.execute(
+                        "INSERT INTO builtin_memory_mirrors(target, entry, fact_id, owned, provenance) VALUES (?, ?, ?, ?, ?) "
+                        "ON CONFLICT(target, entry) DO UPDATE SET fact_id=excluded.fact_id, provenance=excluded.provenance",
+                        (target, content, fact_id, int(owned), json.dumps(metadata, sort_keys=True)),
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            # Search rows and source links are committed together. Rebuild the
+            # derived entity/vector indexes from the resulting fact afterward.
+            if action != "remove" and owned:
+                for name in self._extract_entities(content):
+                    self._link_fact_entity(fact_id, self._resolve_entity(name))
+                self._compute_hrr_vector(fact_id, content)
+            for changed_category in changed_categories:
+                self._rebuild_bank(changed_category)
+
+    def _mirror_builtin_snapshot(self, target: str, metadata: dict) -> None:
+        """Reconcile one committed batch, including duplicate native entries."""
+        import json
+
+        source_path = metadata.get("committed_source_path")
+        if source_path is not None:
+            from tools.memory_tool import MemoryStore as BuiltinMemoryStore
+            path = Path(source_path)
+            # Native writers use this same lock. Verify freshness and retain
+            # it through the fact transaction so reordered callbacks cannot
+            # erase facts from a later committed write.
+            with BuiltinMemoryStore._file_lock(path):
+                current, readable = BuiltinMemoryStore._read_entries_checked(path)
+                if not readable or current != metadata["committed_entries"]:
+                    return
+                snapshot = {key: value for key, value in metadata.items()
+                            if key != "committed_source_path"}
+                self._mirror_builtin_snapshot(target, snapshot)
+            return
+
+        entries = metadata["committed_entries"]
+        if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
+            raise ValueError("Invalid committed memory snapshot")
+        desired = set(entry.strip() for entry in entries if entry.strip())
+        provenance = json.dumps({key: value for key, value in metadata.items()
+                                 if key not in {"committed_entries", "batch_final"}}, sort_keys=True)
+        category = "user_pref" if target == "user" else "general"
+        categories, created = {category}, []
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                links = self._conn.execute(
+                    "SELECT m.*, f.content AS fact_content, f.category FROM builtin_memory_mirrors m "
+                    "LEFT JOIN facts f ON f.fact_id=m.fact_id WHERE m.target=?", (target,),
+                ).fetchall()
+                retained = set()
+                for link in links:
+                    if link["entry"] in desired and link["fact_content"] == link["entry"]:
+                        retained.add(link["entry"])
+                        continue
+                    self._conn.execute("DELETE FROM builtin_memory_mirrors WHERE target=? AND entry=?",
+                                       (target, link["entry"]))
+                    referenced = self._conn.execute("SELECT 1 FROM builtin_memory_mirrors WHERE fact_id=? LIMIT 1",
+                                                    (link["fact_id"],)).fetchone()
+                    if link["owned"] and not referenced and link["fact_content"] == link["entry"]:
+                        categories.add(link["category"])
+                        self._conn.execute("DELETE FROM fact_entities WHERE fact_id=?", (link["fact_id"],))
+                        self._conn.execute("DELETE FROM facts WHERE fact_id=?", (link["fact_id"],))
+                for entry in sorted(desired - retained):
+                    existing = self._conn.execute("SELECT fact_id FROM facts WHERE content=?", (entry,)).fetchone()
+                    owned = existing is None
+                    if existing:
+                        fact_id = existing["fact_id"]
+                        owned = bool(self._conn.execute(
+                            "SELECT 1 FROM builtin_memory_mirrors WHERE fact_id=? AND owned=1 LIMIT 1", (fact_id,),
+                        ).fetchone())
+                    else:
+                        fact_id = self._conn.execute(
+                            "INSERT INTO facts(content, category, trust_score) VALUES (?, ?, ?)",
+                            (entry, category, self.default_trust),
+                        ).lastrowid
+                        created.append((fact_id, entry))
+                    self._conn.execute(
+                        "INSERT INTO builtin_memory_mirrors(target, entry, fact_id, owned, provenance) VALUES (?, ?, ?, ?, ?)",
+                        (target, entry, fact_id, int(owned), provenance),
+                    )
+                for changed_category in categories:
+                    self._conn.execute("DELETE FROM memory_banks WHERE bank_name=?", (changed_category,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            for fact_id, entry in created:
+                for name in self._extract_entities(entry):
+                    self._link_fact_entity(fact_id, self._resolve_entity(name))
+                self._compute_hrr_vector(fact_id, entry)
+            for changed_category in categories:
+                self._rebuild_bank(changed_category)
 
     def add_fact(
         self,
