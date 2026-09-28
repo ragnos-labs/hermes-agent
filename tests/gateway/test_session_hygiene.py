@@ -2056,13 +2056,14 @@ def _hygiene_stub_agent(session_id, compress, cleanup_done, **attrs):
 
 def _count_extend_calls(monkeypatch, limit=50):
     """Count host wait-loop passes whose slice expired before the worker
-    finished. Raises after ``limit`` passes so a regressed spin fails fast."""
+    finished. Raises after ``limit`` passes so a regressed spin fails fast.
+    Each entry records when the host saw that slice expire, as ``at``."""
     gateway_run = importlib.import_module("gateway.run")
     real_extend = gateway_run.hygiene_wait_should_extend
     calls = []
 
     def _counting_extend(**kwargs):
-        calls.append(kwargs)
+        calls.append(dict(kwargs, at=time.monotonic()))
         if len(calls) > limit:
             raise _SpinDetected(f"host wait loop ran {len(calls)} passes")
         return real_extend(**kwargs)
@@ -2185,6 +2186,12 @@ async def test_hygiene_wait_wakes_promptly_for_a_worker_slower_than_a_slice(
     and then resume as soon as the worker finishes, not at the end of the
     0.25s slice it is sleeping in.
 
+    The worker finishes at a fixed point early in the third slice, measured
+    from when the host saw the second slice expire. The host must resume
+    before that third slice could have ended. A host that sleeps out the
+    slice resumes after it ends, however late CI schedules the worker, so
+    this bound does not depend on absolute wake latency.
+
     Host resumption is timed at its first read after the wait loop, the
     ``_last_compaction_in_place`` check.
     """
@@ -2198,7 +2205,7 @@ async def test_hygiene_wait_wakes_promptly_for_a_worker_slower_than_a_slice(
 
     def _compress(self, messages, *_args, **_kwargs):
         _wait_for_expired_slices(extend_calls, 2)
-        time.sleep(0.03)
+        time.sleep(max(extend_calls[1]["at"] + 0.03 - time.monotonic(), 0))
         finished_at.append(time.monotonic())
         return (messages, None)
 
@@ -2227,10 +2234,16 @@ async def test_hygiene_wait_wakes_promptly_for_a_worker_slower_than_a_slice(
             f"expected two expired slices before the wake, got {len(extend_calls)}"
         )
         assert finished_at and resumed_at, "the worker result was never consumed"
-        wake_latency = resumed_at[0] - finished_at[0]
-        assert wake_latency < 0.15, (
-            f"host resumed {wake_latency:.3f}s after the worker finished; "
-            "it slept out the slice instead of waiting on completion"
+        # The third slice starts after the host saw the second one expire
+        # and lasts the full 0.25s cap, so it cannot end before this point.
+        third_slice_earliest_end = extend_calls[1]["at"] + 0.25
+        assert finished_at[0] < third_slice_earliest_end - 0.05, (
+            "the worker did not finish well inside the third slice"
+        )
+        assert resumed_at[0] < third_slice_earliest_end, (
+            f"host resumed {resumed_at[0] - finished_at[0]:.3f}s after the "
+            "worker finished, after the slice ended; it slept out the slice "
+            "instead of waiting on completion"
         )
         messages = [r.getMessage() for r in caplog.records]
         assert not any("auto-compress failed" in m for m in messages)
@@ -2392,4 +2405,225 @@ async def test_hygiene_worker_future_cancelled_before_start_is_handled(
             "an agent whose worker never started was never cleaned up"
         )
     finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_worker_lifecycle_skips_work_abandoned_before_the_lock():
+    """The executor thread is already running ``run()`` but has not taken the
+    lifecycle lock when the host cancels the future and abandons the worker.
+    ``run()`` must see the abandonment, skip the wrapped compression, and
+    leave ``exited`` resolved exactly once, by ``abandon()``."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    gateway_run = importlib.import_module("gateway.run")
+    loop = asyncio.get_running_loop()
+    lifecycle = gateway_run._HygieneWorkerLifecycle(loop)
+    resolve_calls = []
+    real_resolve = lifecycle._resolve_exited
+
+    def _counting_resolve():
+        resolve_calls.append(1)
+        real_resolve()
+
+    lifecycle._resolve_exited = _counting_resolve
+    thread_started = threading.Event()
+    gate = threading.Event()
+    compress_calls = []
+
+    def _worker():
+        thread_started.set()
+        assert gate.wait(5)
+        return lifecycle.run(lambda: compress_calls.append(1))
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = loop.run_in_executor(executor, _worker)
+        assert await asyncio.to_thread(thread_started.wait, 2)
+        # A running executor future cannot be cancelled on the thread, but
+        # the asyncio wrapper is: this is the state the host sees.
+        assert future.cancel()
+        lifecycle.abandon()
+        assert lifecycle.exited.done()
+        assert resolve_calls == [1]
+
+        gate.set()
+        await asyncio.to_thread(executor.shutdown, True)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert compress_calls == [], "an abandoned worker ran compression"
+        assert resolve_calls == [1], "exited was resolved more than once"
+    finally:
+        gate.set()
+        executor.shutdown(wait=False)
+
+
+def _enter_hygiene_handler(monkeypatch, tmp_path, site):
+    """Route the host wait into the turn-hold or timeout handler.
+
+    Returns a zero-argument callable that reports whether the host has
+    raised into that handler.
+    """
+    gateway_run = importlib.import_module("gateway.run")
+    if site == "turn_hold":
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(
+            cfg_path.read_text(encoding="utf-8")
+            + "  hygiene_max_turn_hold_seconds: 0.3\n",
+            encoding="utf-8",
+        )
+        entered = threading.Event()
+        real_turn_hold = gateway_run.HygieneTurnHoldExceeded
+
+        class _SignallingTurnHold(real_turn_hold):
+            def __init__(self, *args):
+                entered.set()
+                super().__init__(*args)
+
+        monkeypatch.setattr(gateway_run, "HygieneTurnHoldExceeded", _SignallingTurnHold)
+        return entered.is_set
+
+    calls = []
+
+    def _never_extend(**kwargs):
+        calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(gateway_run, "hygiene_wait_should_extend", _never_extend)
+    return lambda: bool(calls)
+
+
+async def _wait_until(predicate, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition never became true")
+        await asyncio.sleep(0.005)
+
+
+async def _drain_deferred_cleanup(runner):
+    for _ in range(100):
+        if not getattr(runner, "_deferred_agent_cleanup_tasks", set()):
+            break
+        await asyncio.sleep(0.01)
+    assert not getattr(runner, "_deferred_agent_cleanup_tasks", set())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["turn_hold", "timeout"])
+@pytest.mark.parametrize("stage", ["admitted_commit", "fence_poll"])
+@pytest.mark.parametrize("interrupt", ["host_cancel", "future_cancel"])
+async def test_hygiene_handler_awaits_unwind_on_cancellation(
+    monkeypatch, tmp_path, site, stage, interrupt
+):
+    """The turn-hold and timeout handlers still await the worker: at the
+    fence poll, and while an admitted commit finishes. A cancellation there
+    used to escape the handler without the unwind, so the outer ``finally``
+    closed the agent inline while the worker was still committing, and a
+    future cancelled from outside cancelled the user's turn.
+
+    Now a host cancel propagates with the fence-cancel label, a future
+    cancelled from outside lets the turn continue uncompressed, and in both
+    cases cleanup waits for the worker thread to exit, commit admission is
+    revoked, and the deferred cleanup task drains.
+    """
+    from hermes_state import SessionDB
+
+    session_id = f"sess-handler-{site}-{stage}-{interrupt}"
+    agent_created = threading.Event()
+    worker_holding = threading.Event()
+    release_hold = threading.Event()
+    release_exit = threading.Event()
+    cleanup_done = threading.Event()
+    late_commit = []
+
+    def _compress(self, messages, *_args, commit_fence=None, **_kwargs):
+        if stage == "admitted_commit":
+            assert commit_fence.begin_commit()
+            worker_holding.set()
+            release_hold.wait(timeout=5)
+            commit_fence.finish_commit()
+        else:
+            # Holding the fence lock outside a commit keeps the host's
+            # try_cancel_before_commit undecided, so it polls.
+            assert commit_fence.begin_lock_setup()
+            worker_holding.set()
+            release_hold.wait(timeout=5)
+            commit_fence.finish_lock_setup()
+        # Stay alive after the hold so the test can check that cleanup
+        # waits for the thread to exit, not for the hold to end.
+        release_exit.wait(timeout=5)
+        admitted = commit_fence.begin_commit()
+        late_commit.append(admitted)
+        if admitted:
+            commit_fence.finish_commit()
+        return (messages, None)
+
+    base_cls = _hygiene_stub_agent(session_id, _compress, cleanup_done)
+
+    class HandlerCancelAgent(base_cls):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            agent_created.set()
+
+    captured = _capture_hygiene_future(
+        monkeypatch, asyncio.get_running_loop(), agent_created
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, HandlerCancelAgent, db, session_id
+        )
+        in_handler = _enter_hygiene_handler(monkeypatch, tmp_path, site)
+        task = asyncio.create_task(runner._handle_message(event))
+        assert await asyncio.to_thread(worker_holding.wait, 2)
+        await _wait_until(in_handler)
+        # Let the handler reach its await on the worker.
+        await asyncio.sleep(0.1)
+        assert not task.done()
+
+        if interrupt == "host_cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            state = db.get_compression_failure_cooldown(session_id)
+            assert state is not None
+            assert state["error"] == (
+                "session hygiene compression cancelled at commit fence"
+            )
+        else:
+            assert captured["future"].cancel()
+            if stage == "fence_poll":
+                # The poll does not await the future. Once the worker leaves
+                # lock setup the host's cancel wins, and cleanup must still
+                # wait for the worker although its future was cancelled.
+                release_hold.set()
+            result = await asyncio.wait_for(task, timeout=5)
+            assert result == "ok"
+            assert runner._run_agent.await_count == 1
+            state = db.get_compression_failure_cooldown(session_id)
+            assert state is not None
+            if stage == "admitted_commit":
+                assert state["error"] == (
+                    "session hygiene compression worker was cancelled"
+                )
+
+        # The worker thread is still running: its agent must not be closed,
+        # neither during the hold nor after it while the thread lives on.
+        for gate in (release_hold, release_exit):
+            await asyncio.sleep(0.05)
+            assert not cleanup_done.is_set(), (
+                "the agent was closed while the worker thread was alive"
+            )
+            gate.set()
+        assert await asyncio.to_thread(cleanup_done.wait, 2), (
+            "deferred cleanup never ran after the worker thread exited"
+        )
+        assert late_commit == [False], "admission stayed open after the unwind"
+        await _drain_deferred_cleanup(runner)
+    finally:
+        release_hold.set()
+        release_exit.set()
         db.close()
