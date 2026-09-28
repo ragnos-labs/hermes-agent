@@ -2098,10 +2098,15 @@ def _creator_toolset_bound(
     Uses the agent's own enabled list when dispatch supplies it. Otherwise
     falls back to the allowlist cap of the session's platform. ``None``
     means the caller is unbounded (no enabled list and no cap).
+
+    Disabled toolsets are removed at the tool level: an enabled composite
+    that still holds a disabled tool is replaced by the toolsets it covers
+    without that tool (see ``subtract_disabled_toolsets``).
     """
-    disabled = {str(t) for t in (creator_disabled or [])}
+    from hermes_cli.tools_config import subtract_disabled_toolsets
+
     if creator_enabled is not None:
-        return sorted({str(t) for t in creator_enabled} - disabled)
+        return subtract_disabled_toolsets(list(creator_enabled), creator_disabled)
     from gateway.session_context import get_session_env
     from hermes_cli.config import load_config
     from hermes_cli.tools_config import toolset_cap
@@ -2110,7 +2115,7 @@ def _creator_toolset_bound(
     cap = toolset_cap(load_config(), platform)
     if cap is None:
         return None
-    return sorted({str(t) for t in cap} - disabled)
+    return subtract_disabled_toolsets(sorted(cap), creator_disabled)
 
 
 def _cronjob_handler(args, **kw):

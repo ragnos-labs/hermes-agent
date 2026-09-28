@@ -677,6 +677,100 @@ def cron_doctor() -> int:
     return 1
 
 
+UNBOUND_JOBS_SCHEMA = "hermes.cron.unbound_jobs.v1"
+
+
+def _read_jobs_for_audit() -> List[Dict[str, Any]]:
+    """Read the job store without repairing, migrating or writing it.
+
+    ``load_jobs()`` may rewrite a damaged store, so the audit parses the file
+    itself. Raises ``ValueError`` when the file is unreadable or has an
+    unknown shape.
+    """
+    from cron.jobs import _current_cron_store
+
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+    data = json.loads(jobs_file.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        jobs = data
+    elif isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        if isinstance(jobs, dict):
+            jobs = [
+                {**value, "id": value.get("id") or key}
+                for key, value in jobs.items()
+                if isinstance(value, dict)
+            ]
+    else:
+        raise ValueError("jobs file has an unknown shape")
+    if not isinstance(jobs, list):
+        raise ValueError("jobs file has an unknown shape")
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def cron_unbound_jobs_report() -> Dict[str, Any]:
+    """Build the read-only report of jobs that carry no ``toolset_bound``.
+
+    Jobs created or edited with the ``cronjob`` tool since the toolset bound
+    shipped record their author's toolsets as ``toolset_bound``. Jobs created
+    before then, and every job created with ``hermes cron``, the dashboard,
+    blueprints or suggestions, carry none and run under the full ``cron``
+    platform cap. The store records no reliable author, so the report lists
+    every unbound job; the operator decides which ones an agent created.
+    """
+    try:
+        jobs = _read_jobs_for_audit()
+    except Exception as exc:
+        return {
+            "schema": UNBOUND_JOBS_SCHEMA,
+            "status": "unreadable",
+            "error": type(exc).__name__,
+            "total_jobs": None,
+            "unbound_count": None,
+            "jobs": [],
+        }
+    unbound = []
+    for job in jobs:
+        if job.get("toolset_bound") is not None:
+            continue
+        origin = job.get("origin")
+        unbound.append(
+            {
+                "id": str(job.get("id", "")),
+                "name": job.get("name"),
+                "created_at": job.get("created_at"),
+                "enabled": bool(job.get("enabled", True)),
+                "no_agent": bool(job.get("no_agent", False)),
+                "enabled_toolsets": job.get("enabled_toolsets"),
+                "origin_platform": origin.get("platform") if isinstance(origin, dict) else None,
+            }
+        )
+    unbound.sort(key=lambda item: item["id"])
+    return {
+        "schema": UNBOUND_JOBS_SCHEMA,
+        "status": "unbound_jobs_found" if unbound else "no_unbound_jobs",
+        "error": None,
+        "total_jobs": len(jobs),
+        "unbound_count": len(unbound),
+        "jobs": unbound,
+    }
+
+
+def cron_unbound_jobs() -> int:
+    """Print the unbound-jobs report as JSON. Read-only.
+
+    Exit status: 0 when no job is unbound, 1 when at least one is, 2 when the
+    job store cannot be read (never reported as clean).
+    """
+    report = cron_unbound_jobs_report()
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if report["status"] == "unreadable":
+        return 2
+    return 1 if report["unbound_count"] else 0
+
+
 def cron_create(args):
     # The gateway-lifecycle guard lives in cron.jobs.create_job so it fires on
     # every job-creation path (this CLI subcommand AND the agent's `cronjob`
@@ -967,6 +1061,12 @@ def cron_command(args):
     if subcmd == "doctor":
         return cron_doctor()
 
+    if subcmd == "unbound-jobs":
+        rc = cron_unbound_jobs()
+        if rc:
+            sys.exit(rc)
+        return 0
+
     if subcmd == "tick":
         return cron_tick()
 
@@ -999,5 +1099,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|unbound-jobs|tick]")
     sys.exit(1)

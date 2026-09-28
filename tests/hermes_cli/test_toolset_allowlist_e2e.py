@@ -130,6 +130,68 @@ def test_acp_session_is_capped(golden, monkeypatch):
     _assert_bounded(golden, kwargs["enabled_toolsets"], kwargs["disabled_toolsets"])
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["new", "load", "resume", "fork"])
+async def test_acp_client_cannot_reuse_configured_mcp_name(golden, path):
+    """A client-supplied MCP server named like the configured ``demo`` server
+    is refused on every session path. With MCP on, the cap admits ``demo``
+    by design, so before the collision check the client's own command was
+    registered under that name. The configured server stays in the session's
+    toolsets exactly as the cap resolved it."""
+    from unittest.mock import MagicMock, patch
+
+    from acp.schema import McpServerStdio
+
+    from acp_adapter.server import HermesACPAgent
+    from acp_adapter.session import SessionManager, _expand_acp_enabled_toolsets
+    from hermes_cli.tools_config import bound_enabled_toolsets
+
+    # Same expansion SessionManager uses: hermes-acp plus configured servers.
+    session_toolsets = bound_enabled_toolsets(
+        _expand_acp_enabled_toolsets(["hermes-acp"], mcp_server_names=["demo"]),
+        golden.cfg,
+        "acp",
+    )
+
+    def factory():
+        agent = MagicMock(name="MockAIAgent")
+        agent.enabled_toolsets = list(session_toolsets)
+        agent.disabled_toolsets = _disabled(golden.cfg)
+        agent.tools = []
+        agent.valid_tool_names = set()
+        return agent
+
+    manager = SessionManager(agent_factory=factory)
+    acp_agent = HermesACPAgent(session_manager=manager)
+    servers = [McpServerStdio(name="demo", command="/tmp/client-demo", args=[], env=[])]
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register, \
+         patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+        if path == "new":
+            resp = await acp_agent.new_session(cwd="/tmp", mcp_servers=servers)
+            sid = resp.session_id
+        else:
+            sid = manager.create_session(cwd="/tmp").session_id
+            if path == "load":
+                await acp_agent.load_session(cwd="/tmp", session_id=sid, mcp_servers=servers)
+            elif path == "resume":
+                await acp_agent.resume_session(cwd="/tmp", session_id=sid, mcp_servers=servers)
+            else:
+                resp = await acp_agent.fork_session(cwd="/tmp", session_id=sid, mcp_servers=servers)
+                sid = resp.session_id
+
+    mock_register.assert_not_called()
+    mock_defs.assert_not_called()
+    state = manager.get_session(sid)
+    # The session keeps exactly what the cap resolved: the configured
+    # server's toolset with MCP on, none with no_mcp. The client's command
+    # never reached registration under that name.
+    assert state.agent.enabled_toolsets == session_toolsets
+    if golden.no_mcp:
+        assert not _mcp(session_toolsets)
+    else:
+        assert _mcp(session_toolsets) == {"mcp-demo"}
+
+
 def test_webhook_route_is_capped(golden):
     from gateway.run import GatewayRunner
 

@@ -2637,6 +2637,22 @@ def mcp_disabled_for_platform(config: dict, platform: Optional[str] = None) -> b
     return False
 
 
+def configured_mcp_server_names(config: dict) -> Set[str]:
+    """Names of every MCP server the operator configured, enabled or not.
+
+    Covers ``mcp_servers`` entries in ``config.yaml`` (including disabled
+    ones) and servers contributed by portable plugins. A server that an ACP
+    client supplies must not reuse one of these names: the allowlist cap
+    admits configured server names, so a reused name would carry the
+    client's own command or URL through the cap.
+    """
+    names = set(enabled_mcp_server_names(config))
+    mcp_servers = (config or {}).get("mcp_servers") or {}
+    if isinstance(mcp_servers, dict):
+        names |= {str(name) for name in mcp_servers}
+    return names
+
+
 def _mcp_toolset_names(config: dict) -> Set[str]:
     """Every name that selects an MCP server's tools (alias and ``mcp-`` form)."""
     names = set(enabled_mcp_server_names(config))
@@ -2656,6 +2672,69 @@ def _toolset_tools(name: str) -> Set[str]:
     except Exception:
         logger.debug("could not resolve toolset %s", name, exc_info=True)
     return set()
+
+
+def _disabled_tool_names(disabled: Set[str]) -> Set[str]:
+    """Tool names that *disabled* toolsets remove, as ``model_tools`` does.
+
+    Platform bundles (``hermes-*``) and posture toolsets remove only their
+    non-core tools; every other toolset removes all of its tools. Errors
+    propagate so callers can refuse instead of under-subtracting.
+    """
+    from toolsets import (
+        bundle_non_core_tools,
+        get_toolset,
+        resolve_toolset,
+        validate_toolset,
+    )
+
+    tools: Set[str] = set()
+    for name in disabled:
+        if not validate_toolset(name):
+            continue
+        if name.startswith("hermes-") or (get_toolset(name) or {}).get("posture"):
+            tools |= set(bundle_non_core_tools(name))
+        else:
+            tools |= set(resolve_toolset(name))
+    return tools
+
+
+def subtract_disabled_toolsets(
+    enabled_toolsets: List[str], disabled_toolsets: Optional[List[str]]
+) -> List[str]:
+    """Remove *disabled_toolsets* from *enabled_toolsets* at the tool level.
+
+    A name listed in *disabled_toolsets* is dropped. An enabled composite
+    (``hermes-acp``, ``all``) that still contains a disabled tool is replaced
+    by every known toolset it fully covers once the disabled tools are
+    removed, so a composite never carries a disabled tool through by name.
+    Names that resolve to no tools (MCP servers not yet registered, unknown
+    names) are kept unless disabled by name.
+    """
+    drop_names = {str(t) for t in disabled_toolsets or []}
+    enabled = [str(t) for t in enabled_toolsets]
+    if not drop_names:
+        return sorted(set(enabled))
+    drop_tools = _disabled_tool_names(drop_names)
+    candidates: Optional[List[str]] = None
+    kept: Set[str] = set()
+    for name in enabled:
+        if name in drop_names:
+            continue
+        tools = _toolset_tools(name)
+        if not (tools & drop_tools):
+            kept.add(name)
+            continue
+        allowed = tools - drop_tools
+        if candidates is None:
+            from toolsets import get_toolset_names
+
+            candidates = [c for c in get_toolset_names() if c not in drop_names]
+        for candidate in candidates:
+            candidate_tools = _toolset_tools(candidate)
+            if candidate_tools and candidate_tools <= allowed:
+                kept.add(candidate)
+    return sorted(kept)
 
 
 def _cap_toolsets(enabled_toolsets: List[str], cap: Set[str], config: dict) -> List[str]:
