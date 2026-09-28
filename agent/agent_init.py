@@ -1602,6 +1602,12 @@ def init_agent(
     except Exception:
         logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
+    # RAGNOS_GOVERNANCE_REQUIRED=1 with no governance plugin registered: refuse
+    # to build an agent whose tool calls nothing would gate.
+    from hermes_cli.governance_startup import enforce_governance_startup
+
+    enforce_governance_startup()
+
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).

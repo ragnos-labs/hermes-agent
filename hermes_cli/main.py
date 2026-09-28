@@ -12564,6 +12564,16 @@ def _prepare_agent_startup(args) -> None:
     ):
         return
 
+    # Refuse to start an agent command when governance is required but its
+    # plugin is not loaded (the TUI backend runs the same check itself).
+    if not _is_tui_chat_launch(args):
+        from hermes_cli.governance_startup import governance_startup_error
+
+        _governance_error = governance_startup_error()
+        if _governance_error is not None:
+            print(f"hermes: {_governance_error['message']}", file=sys.stderr)
+            sys.exit(1)
+
     _accept_hooks = bool(getattr(args, "accept_hooks", False))
     if not _is_tui_chat_launch(args):
         # The TUI backend process does its own plugin discovery; the launcher
