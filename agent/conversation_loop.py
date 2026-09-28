@@ -1933,23 +1933,17 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        moa_config: Optional one-turn Mixture-of-Agents preset, passed as
+            an in-process argument by trusted callers only. The user message
+            is never parsed for a MoA request: text that starts with
+            ``MOA_MARKER_PREFIX`` is ordinary user text, because gateway
+            platforms, the API server, webhooks, cron jobs, and one-shot
+            input can all deliver it, and its payload names its own
+            providers.
 
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
-        try:
-            from hermes_cli.moa_config import decode_moa_turn
-
-            _decoded_message, _decoded_moa_config = decode_moa_turn(user_message)
-            if _decoded_moa_config is not None:
-                user_message = _decoded_message
-                moa_config = _decoded_moa_config
-                if persist_user_message is None:
-                    persist_user_message = _decoded_message
-        except Exception:
-            pass
-
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
