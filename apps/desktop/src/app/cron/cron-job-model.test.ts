@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
+import type { CronJob } from '@/types/hermes'
+
 import {
   cronEditorUpdates,
+  cronJobEditUpdates,
   jobIsScriptOnly,
+  jobName,
   parseCronDeliveryTargets,
   toggleCronDeliveryTarget,
   validateCronEditor
@@ -148,5 +152,52 @@ describe('cronEditorUpdates', () => {
 
   it('sends a cleared name so the server can clear the marker', () => {
     expect(edit('', 'vault rotation').name).toBe('')
+  })
+})
+
+describe('cronJobEditUpdates', () => {
+  // The server shows an unnamed job under the start of its prompt.
+  const unnamedJob: CronJob = {
+    enabled: true,
+    id: 'abc123def456',
+    name: 'sk-live-7f3a9c rotate the vault token',
+    prompt: 'sk-live-7f3a9c rotate the vault token and post it'
+  }
+
+  // What the editor holds after the user opened `job` and edited only the prompt.
+  const promptEdit = (job: CronJob, prompt: string) => ({
+    deliver: 'local',
+    model: '',
+    name: jobName(job),
+    prompt,
+    provider: '',
+    schedule: 'every 1h'
+  })
+
+  it('omits the name the editor was pre-filled with', () => {
+    const updates = cronJobEditUpdates(unnamedJob, promptEdit(unnamedJob, 'harmless replacement'))
+
+    expect(updates).not.toHaveProperty('name')
+    expect(updates.prompt).toBe('harmless replacement')
+  })
+
+  it('omits a padded stored name the editor showed trimmed', () => {
+    const job: CronJob = { ...unnamedJob, name: '  vault  ' }
+
+    expect(cronJobEditUpdates(job, promptEdit(job, 'go'))).not.toHaveProperty('name')
+  })
+
+  it('sends a rename and a cleared name', () => {
+    const renamed = { ...promptEdit(unnamedJob, 'go'), name: 'Vault rotation' }
+    const cleared = { ...promptEdit(unnamedJob, 'go'), name: '' }
+
+    expect(cronJobEditUpdates(unnamedJob, renamed).name).toBe('Vault rotation')
+    expect(cronJobEditUpdates(unnamedJob, cleared).name).toBe('')
+  })
+
+  it('keeps the script-only prompt rule', () => {
+    const job: CronJob = { ...unnamedJob, no_agent: true, prompt: '', script: 'backup.sh' }
+
+    expect(cronJobEditUpdates(job, promptEdit(job, ''))).not.toHaveProperty('prompt')
   })
 })
