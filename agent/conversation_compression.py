@@ -1007,23 +1007,28 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
         grace = max(float(grace_seconds), 0.0)
     except (TypeError, ValueError):
         grace = 0.0
-    try:
-        future.result(timeout=grace)
-        return True
-    except concurrent.futures.TimeoutError:
+    # Wait on completion, not on ``future.result``: a worker that exits by
+    # RAISING ``TimeoutError`` (the pre-start deadline gate does exactly
+    # that, and ``concurrent.futures.TimeoutError`` is the builtin since
+    # 3.11) is indistinguishable from a join timeout when caught from
+    # ``result()``, which misreported an exited worker as an orphan and kept
+    # its lease retained.
+    done, _pending = concurrent.futures.wait([future], timeout=grace)
+    if not done:
         return False
-    except concurrent.futures.CancelledError:
+    if future.cancelled():
         # Never started; nothing can be in flight.
         return True
-    except Exception:
-        # The worker raised — it exited. The exception is intentionally
+    exc = future.exception()
+    if exc is not None:
+        # The worker raised, so it exited. The exception is intentionally
         # swallowed here: the host already chose the fallback result, and the
         # fence prevents the failed attempt from touching session state.
         logger.debug(
             "cancelled compression worker exited with an exception",
-            exc_info=True,
+            exc_info=exc,
         )
-        return True
+    return True
 
 # Bounded admission for the shared compress-timeout pool (#76354 review F6).
 # The stdlib executor queue is unbounded: with all four workers wedged in hung
@@ -1477,7 +1482,6 @@ def run_compress_context_with_progress_timeout(
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
     fence = fence if fence is not None else CompressionCommitFence()
-    fence.set_total_ceiling_seconds(ceiling)
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1486,6 +1490,35 @@ def run_compress_context_with_progress_timeout(
     from tools.thread_context import propagate_context_to_thread
 
     executor = _get_compress_timeout_executor()
+
+    def _fence_gated_worker(worker_fence: CompressionCommitFence):
+        # F6: an admitted job can still start after the host stopped waiting
+        # (worker slot freed late). Check the fence BEFORE any expensive
+        # summary work so a stale job never burns an LLM call; its return
+        # value is discarded by the already-departed host.
+        if worker_fence.deadline_exceeded:
+            raise concurrent.futures.TimeoutError(
+                "compression deadline expired before worker start"
+            )
+        if worker_fence.is_cancelled:
+            logger.info(
+                "Skipping stale compression job: fence cancelled before start"
+            )
+            return messages, ""
+        return worker(worker_fence)
+
+    # Bare pool workers start with an empty ContextVar map; propagate the
+    # parent conversation/approval context into the worker. Wrapping runs on
+    # this (parent) thread and, on first use in a process, lazily imports
+    # ``tools.terminal_tool`` and its dependency tree (tens of ms idle,
+    # hundreds of ms on a loaded host). That host-side setup, like resolving
+    # the executor above, must finish BEFORE the shared deadline is armed:
+    # the ceiling budgets the worker's summary phase, and ``wait_started``
+    # is taken after submit. Arming first let a cold import consume the
+    # whole ceiling, so the worker hit its pre-start deadline gate and the
+    # host tore down an attempt that never ran.
+    gated_worker = propagate_context_to_thread(_fence_gated_worker)
+    fence.set_total_ceiling_seconds(ceiling)
     # Bounded admission (#76354 F6): refuse rather than queue when every pool
     # slot is occupied. A queued job would silently wait out its whole budget
     # without starting and stay eligible to run as a stale cancelled job when
@@ -1512,28 +1545,8 @@ def run_compress_context_with_progress_timeout(
             )
         return messages, _resolve_fallback_prompt()
 
-    def _fence_gated_worker(worker_fence: CompressionCommitFence):
-        # F6: an admitted job can still start after the host stopped waiting
-        # (worker slot freed late). Check the fence BEFORE any expensive
-        # summary work so a stale job never burns an LLM call; its return
-        # value is discarded by the already-departed host.
-        if worker_fence.deadline_exceeded:
-            raise concurrent.futures.TimeoutError(
-                "compression deadline expired before worker start"
-            )
-        if worker_fence.is_cancelled:
-            logger.info(
-                "Skipping stale compression job: fence cancelled before start"
-            )
-            return messages, ""
-        return worker(worker_fence)
-
-    # Bare pool workers start with an empty ContextVar map; propagate the
-    # parent conversation/approval context into the worker.
     try:
-        future = executor.submit(
-            propagate_context_to_thread(_fence_gated_worker), fence
-        )
+        future = executor.submit(gated_worker, fence)
     except BaseException:
         _release_compression_admission()
         raise
