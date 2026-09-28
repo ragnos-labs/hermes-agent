@@ -903,10 +903,12 @@ recreate any job an agent created, or edit it with `hermes cron edit` to
 narrow its toolsets.
 
 A job created without a name is named after the start of its prompt, skill
-or script, so the audit prints a name only when one was set explicitly.
-Every other name, including the names of jobs created before this marker
-existed, is printed as `"name": null` with `"name_redacted": true`; use the
-id to find the job. `hermes cron doctor` also prints a one-line warning with
+or script, and a name an agent chose through the `cronjob` tool can copy
+prompt content. The audit therefore prints a name only when an operator set
+or changed it (CLI, dashboard, desktop app). Re-sending the stored name with
+an edit does not count. Every other name, including the names of jobs
+created before this marker existed, is printed as `"name": null` with
+`"name_redacted": true`; use the id to find the job. `hermes cron doctor` also prints a one-line warning with
 the number of unbound jobs, without changing its exit status.
 
 ### Turning MCP off everywhere

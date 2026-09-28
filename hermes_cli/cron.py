@@ -645,7 +645,13 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
 
 
 def cron_doctor() -> int:
-    """Run read-only cron health checks and return a shell-friendly status."""
+    """Run cron health checks and return a shell-friendly status.
+
+    Not read-only. Loading jobs through ``list_jobs()`` can create the cron
+    ``output/`` directory and ``executions.db``, and can rewrite
+    ``jobs.json`` when the store is not in the standard wrapped shape. The
+    unbound-jobs warning at the end reads the store without writing.
+    """
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=False)

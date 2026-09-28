@@ -2226,6 +2226,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     toolset_bound: Optional[List[str]] = None,
+    mark_name_explicit: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2293,6 +2294,13 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        toolset_bound: The creating agent's effective toolsets. None for
+                jobs created by the user.
+        mark_name_explicit: Whether a supplied ``name`` records
+                ``name_explicit``. Operator surfaces (CLI, dashboard,
+                desktop, blueprints) keep the default. The agent-facing
+                ``cronjob`` tool passes False, because a model-chosen name
+                can carry prompt content.
 
     Returns:
         The created job dict
@@ -2451,11 +2459,13 @@ def create_job(
         job["toolset_bound"] = sorted(
             {str(t).strip() for t in toolset_bound if str(t).strip()}
         )
-    # Mark a name the caller set. Without it the name was derived from the
-    # prompt, skills or script, and readers that must not expose the payload
-    # (``hermes cron unbound-jobs``) withhold it. Absent key = derived or
-    # unknown, so existing and unnamed jobs stay byte-identical.
-    if name and str(name).strip():
+    # Mark a name an operator set. Without it the name was derived from the
+    # prompt, skills or script, or was chosen by an agent (which can copy
+    # prompt content into it), and readers that must not expose the payload
+    # (``hermes cron unbound-jobs``) withhold it. Absent key = derived,
+    # agent-chosen or unknown, so existing and unnamed jobs stay
+    # byte-identical.
+    if mark_name_explicit and name and str(name).strip():
         job["name_explicit"] = True
 
     with _jobs_lock():
@@ -2529,8 +2539,19 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    *,
+    mark_name_explicit: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Update a job by ID, refreshing derived schedule fields when needed.
+
+    ``mark_name_explicit`` says whether a rename (a non-empty name that
+    differs from the stored one) records ``name_explicit``. Operator
+    surfaces keep the default; the agent-facing ``cronjob`` tool passes
+    False. Re-sending the stored name never changes the marker.
+    """
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2593,14 +2614,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
-            # ``name_explicit`` follows the name, never the caller: a new
-            # non-empty name sets it, clearing the name clears it, and an
-            # update without a name keeps the stored marker.
+            # ``name_explicit`` follows the name, never the payload. Editors
+            # re-send the stored name with every edit, so only a name that
+            # differs from the stored one counts as a rename: an operator
+            # rename sets the marker, an agent rename clears it, and clearing
+            # the name clears it. Re-sending the stored name, or omitting
+            # the name, keeps the stored marker.
             updated.pop("name_explicit", None)
+            _stored_explicit = job.get("name_explicit") is True
             if "name" in updates:
-                _name_explicit = bool(str(updates.get("name") or "").strip())
+                _new_name = str(updates.get("name") or "").strip()
+                if not _new_name:
+                    _name_explicit = False
+                elif _new_name == str(job.get("name") or "").strip():
+                    _name_explicit = _stored_explicit
+                else:
+                    _name_explicit = bool(mark_name_explicit)
             else:
-                _name_explicit = job.get("name_explicit") is True
+                _name_explicit = _stored_explicit
             if _name_explicit:
                 updated["name_explicit"] = True
 

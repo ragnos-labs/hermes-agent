@@ -227,6 +227,128 @@ def test_update_job_ignores_caller_supplied_marker(jobs_file):
     assert "name_explicit" not in get_job(job["id"])
 
 
+@pytest.mark.parametrize("pad", ["", "  "], ids=["exact", "padded"])
+def test_resent_stored_name_with_new_prompt_stays_redacted(jobs_file, pad):
+    """Editors (desktop, dashboard) re-send the pre-filled stored name with
+    every edit. That is not a rename, so a derived name stays withheld even
+    after the prompt it came from is replaced."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    stored = get_job(job["id"])["name"]
+    update_job(
+        job["id"],
+        {"prompt": "harmless replacement prompt", "name": f"{pad}{stored}{pad}"},
+    )
+    assert "name_explicit" not in get_job(job["id"])
+
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+    text = json.dumps(cron_unbound_jobs_report())
+    for fragment in ("sk-live", "SECRET_PROMPT_MARKER", "rotate the vault"):
+        assert fragment not in text
+
+
+def test_cli_edit_resending_stored_name_stays_redacted(jobs_file):
+    """The CLI and TUI edit path (``cronjob()`` without the agent flag)."""
+    from cron.jobs import create_job, get_job
+    from tools.cronjob_tools import cronjob
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    stored = get_job(job["id"])["name"]
+    result = json.loads(
+        cronjob(action="update", job_id=job["id"],
+                prompt="harmless replacement prompt", name=stored)
+    )
+    assert result["success"] is True
+    assert "name_explicit" not in get_job(job["id"])
+    assert "SECRET_PROMPT_MARKER" not in json.dumps(cron_unbound_jobs_report())
+
+
+def test_operator_rename_is_shown(jobs_file):
+    """A real rename from an operator surface is reported, and later
+    edits that re-send it keep it."""
+    from cron.jobs import create_job, get_job, update_job
+    from tools.cronjob_tools import cronjob
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    result = json.loads(
+        cronjob(action="update", job_id=job["id"],
+                prompt="harmless replacement prompt", name="vault rotation")
+    )
+    assert result["success"] is True
+    assert get_job(job["id"])["name_explicit"] is True
+    update_job(job["id"], {"prompt": "second prompt", "name": "vault rotation"})
+    assert get_job(job["id"])["name_explicit"] is True
+
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] == "vault rotation"
+    assert entry["name_redacted"] is False
+
+
+AGENT_PROMPT = "Summarize the deploy notes for AGENT_PROMPT_MARKER each hour"
+
+
+def _agent_cronjob(monkeypatch, args):
+    """Dispatch ``cronjob`` the way a model calls it. No enabled list and no
+    platform cap, so the caller is unbounded and its jobs carry no bound
+    and stay visible to the audit."""
+    import tools.cronjob_tools  # noqa: F401  (registers the cronjob tool)
+    from tools.registry import registry
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"mcp_servers": {}})
+    return json.loads(registry.dispatch("cronjob", args))
+
+
+def test_agent_created_name_is_redacted(jobs_file, monkeypatch, capsys):
+    """A model-chosen name can copy prompt content, so it is never marked."""
+    from cron.jobs import get_job
+
+    created = _agent_cronjob(monkeypatch, {
+        "action": "create", "schedule": "every 1h", "prompt": AGENT_PROMPT,
+        "name": "deploy notes AGENT_PROMPT_MARKER",
+    })
+    assert created["success"] is True
+    stored = get_job(created["job_id"])
+    assert stored["name"] == "deploy notes AGENT_PROMPT_MARKER"
+    assert "name_explicit" not in stored
+    assert stored.get("toolset_bound") is None
+    capsys.readouterr()
+
+    assert cron_unbound_jobs() == 1
+    out = capsys.readouterr().out
+    (entry,) = json.loads(out)["jobs"]
+    assert entry["id"] == created["job_id"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+    assert "AGENT_PROMPT_MARKER" not in out
+
+
+def test_agent_rename_clears_marker_and_resend_keeps_it(jobs_file, monkeypatch):
+    """An agent that re-sends the whole schema keeps an operator's name
+    marked; an agent that changes the name clears the marker."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt="nightly check", schedule="every 1h", name="nightly vault check")
+    resent = _agent_cronjob(monkeypatch, {
+        "action": "update", "job_id": job["id"], "prompt": AGENT_PROMPT,
+        "name": "nightly vault check",
+    })
+    assert resent["success"] is True
+    assert get_job(job["id"])["name_explicit"] is True
+
+    renamed = _agent_cronjob(monkeypatch, {
+        "action": "update", "job_id": job["id"],
+        "name": "deploy notes AGENT_PROMPT_MARKER",
+    })
+    assert renamed["success"] is True
+    assert "name_explicit" not in get_job(job["id"])
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+
+
 # -- the audit reads every store the scheduler reads ---------------------------
 
 CONTROL_CHAR_STORE = '{"jobs": [{"id": "ctl", "prompt": "line one\nline two"}]}'
