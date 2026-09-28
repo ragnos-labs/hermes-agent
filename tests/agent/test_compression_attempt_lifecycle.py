@@ -19,6 +19,7 @@ collapsed lean compaction to one auxiliary request per attempt:
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import os
 import threading
@@ -32,6 +33,7 @@ from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.conversation_compression import (
     CompressionCommitFence,
     _claim_compressor_attempt,
+    _join_cancelled_worker,
     compress_context,
     compression_blocked_transiently,
     run_compress_context_with_progress_timeout,
@@ -89,8 +91,9 @@ class TestWorkerTeardownOnCeiling:
                 time.sleep(0.01)
             # Cooperative-but-not-instant exit: the unwind after seeing the
             # poison takes real time (rollback, telemetry). Long enough that
-            # a host WITHOUT the bounded-grace join returns first; far
-            # inside the 5s grace for a host WITH it.
+            # a host WITHOUT the bounded-grace join returns first; well
+            # inside the grace for a host WITH it (the grace is
+            # min(5s, ceiling), so 0.2s here).
             time.sleep(0.08)
             worker_done.set()
             return (original, "late")
@@ -118,6 +121,73 @@ class TestWorkerTeardownOnCeiling:
         assert prompt in ("fallback", "late")
         # Teardown proved quiescence, so the lease must NOT stay retained.
         assert fence._retain_cancelled_lock_until_worker_done is False
+
+    def test_host_setup_cost_does_not_consume_the_worker_ceiling(
+        self, monkeypatch
+    ):
+        """Host-side setup before submit must not eat the worker's ceiling.
+
+        Wrapping the worker with ``propagate_context_to_thread`` lazily
+        imports ``tools.terminal_tool`` on first use in a process, which
+        takes hundreds of ms on a loaded CI runner. When the shared deadline
+        was armed BEFORE that setup, the whole 0.2s ceiling could elapse
+        before submit: the worker hit its pre-start deadline gate and never
+        ran, and the host returned with ``total wait 0.0s``. The slow wrap
+        below reproduces that cold import deterministically.
+        """
+        import tools.thread_context as thread_context
+
+        real_propagate = thread_context.propagate_context_to_thread
+
+        def slow_propagate(target):
+            time.sleep(0.3)  # longer than the 0.2s total ceiling
+            return real_propagate(target)
+
+        monkeypatch.setattr(
+            thread_context, "propagate_context_to_thread", slow_propagate
+        )
+        worker_ran = threading.Event()
+        compressed = [{"role": "user", "content": "compressed"}]
+
+        def prompt_worker(fence: CompressionCommitFence):
+            worker_ran.set()
+            return (compressed, "new prompt")
+
+        msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=prompt_worker,
+            messages=[{"role": "user", "content": "keep"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.1,
+            total_ceiling_seconds=0.2,
+            fence=CompressionCommitFence(),
+            stall_fallback=False,
+        )
+        assert worker_ran.is_set(), (
+            "worker never ran: host setup consumed the total ceiling before "
+            "submit"
+        )
+        assert (msgs, prompt) == (compressed, "new prompt")
+
+    def test_join_counts_worker_that_raised_timeout_error_as_exited(self):
+        """A worker that exited by raising ``TimeoutError`` is not an orphan.
+
+        The pre-start deadline gate raises ``concurrent.futures.TimeoutError``
+        (the builtin ``TimeoutError`` since 3.11). Catching it from
+        ``future.result(timeout=...)`` made it look like the join timed out,
+        so an exited worker was reported as orphaned and its lease retained.
+        """
+        raised = concurrent.futures.Future()
+        raised.set_running_or_notify_cancel()
+        raised.set_exception(
+            concurrent.futures.TimeoutError(
+                "compression deadline expired before worker start"
+            )
+        )
+        assert _join_cancelled_worker(raised, 0.05) is True
+
+        still_running = concurrent.futures.Future()
+        still_running.set_running_or_notify_cancel()
+        assert _join_cancelled_worker(still_running, 0.05) is False
 
     def test_uninterruptible_worker_is_orphaned_with_lease_retained(self):
         """A worker stuck in an uninterruptible provider call is orphaned:
