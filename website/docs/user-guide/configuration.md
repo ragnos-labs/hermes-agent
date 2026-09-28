@@ -831,6 +831,31 @@ the `hermes tools` UI.
 
 Leaving the list empty, or omitting the key, is a no-op.
 
+The list applies to every agent Hermes builds, not only the main chat agent:
+gateway platforms (including plugin platforms that fall back to their
+`hermes-<platform>` toolset), webhook routes that carry their own toolset
+list, cron jobs with a per-job toolset list, ACP sessions and their MCP
+refresh, the TUI and desktop gateway (after the surface toolsets are added),
+background and preview agents, the API server, the gateway `/compress` agent and the
+skills curator. The curator skips its run when `skills` is in the list.
+
+### Turning MCP off everywhere
+
+`no_mcp` in a platform's `platform_toolsets` entry keeps MCP server tools off
+that platform. To keep them off every platform, including plugin platforms
+that have no `platform_toolsets` entry, set:
+
+```yaml
+agent:
+  no_mcp: true
+```
+
+With either form, MCP toolsets are also removed from webhook route toolset
+lists, cron per-job toolset lists (`no_mcp` under `platform_toolsets.cron`
+or `agent.no_mcp`), the TUI toolset pin, and ACP sessions (both configured
+servers and servers the ACP client supplies). MCP server processes may still
+start; only their tools are withheld from the agent.
+
 ## Git Worktree Isolation
 
 Enable isolated git worktrees for running multiple agents in parallel on the same repo:

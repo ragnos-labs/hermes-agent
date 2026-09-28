@@ -1,6 +1,6 @@
 name: ragnos-governance
 version: 0.1.0
-description: "RAGnos governance overlay: observes every tool call to a ledger and (when RAGNOS_GOVERNANCE_ENFORCE=1) blocks gated mutating tools so they route through the Hermes Hub. Observe-only by default."
+description: "RAGnos governance overlay: observes every tool call to a ledger and (when RAGNOS_GOVERNANCE_ENFORCE=1) blocks gated tools and toolsets so they route through the Hermes Hub. Observe-only by default; RAGNOS_GOVERNANCE_REQUIRED=1 fails closed without an enforcing config."
 author: "RAGnos"
 hooks:
   - pre_tool_call

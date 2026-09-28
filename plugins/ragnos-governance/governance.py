@@ -9,6 +9,24 @@ Set ``RAGNOS_GOVERNANCE_ENFORCE=1`` (plus ``RAGNOS_GOVERNANCE_FORBIDDEN_TOOLS``)
 to BLOCK gated tools so they must route through the Hermes Hub (preview +
 approval). This file edits no upstream code; it lives only under
 ``plugins/ragnos-governance/`` (a RAGnos-owned surface).
+
+Settings come from the process environment, then from an optional
+``$HERMES_HOME/governance.env`` file (``KEY=VALUE`` lines, ``#`` comments,
+optional ``export`` prefix). The process environment wins on conflicts. Only
+``RAGNOS_GOVERNANCE_*`` keys are read from the file. Services that start
+Hermes without the operator's shell environment (gateway units, cron, the
+desktop app) pick up the policy from the file.
+
+``RAGNOS_GOVERNANCE_FORBIDDEN_TOOLS`` accepts tool names and toolset names.
+A toolset name (``terminal``, ``hermes-sms``, ``mcp-github``, ``all``) blocks
+every tool it resolves to at call time, so tools that MCP servers or plugins
+register later are covered.
+
+Fail-open is the default: with no settings, nothing is blocked. Set
+``RAGNOS_GOVERNANCE_REQUIRED=1`` to fail closed instead: while it is set and
+the effective settings do not enable enforcement with a non-empty forbidden
+list (for example because ``governance.env`` is missing or unreadable), every
+tool call is blocked with a message that says what is missing.
 """
 from __future__ import annotations
 
@@ -20,8 +38,137 @@ from typing import Any, Mapping, Optional
 ENFORCE_ENV = "RAGNOS_GOVERNANCE_ENFORCE"
 FORBIDDEN_ENV = "RAGNOS_GOVERNANCE_FORBIDDEN_TOOLS"
 LEDGER_ENV = "RAGNOS_GOVERNANCE_LEDGER"
+REQUIRED_ENV = "RAGNOS_GOVERNANCE_REQUIRED"
+ENV_FILE_NAME = "governance.env"
+_KEY_PREFIX = "RAGNOS_GOVERNANCE_"
+# Set in the effective settings when governance.env exists but cannot be read
+# or parsed, so the fail-closed check can report it.
+ENV_FILE_ERROR_KEY = "_RAGNOS_GOVERNANCE_ENV_FILE_ERROR"
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+_env_file_cache: dict[str, tuple[tuple[int, int], dict[str, str]]] = {}
+
+
+def _hermes_home(env: Mapping[str, str]) -> Path:
+    raw = env.get("HERMES_HOME")
+    if raw:
+        return Path(str(raw)).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:  # noqa: BLE001 - keep the policy importable standalone.
+        return Path.home() / ".hermes"
+
+
+def env_file_path(env: Optional[Mapping[str, str]] = None) -> Path:
+    env = os.environ if env is None else env
+    return _hermes_home(env) / ENV_FILE_NAME
+
+
+def parse_env_file(text: str) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` lines, keeping only ``RAGNOS_GOVERNANCE_*`` keys."""
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key.startswith(_KEY_PREFIX):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """Read ``governance.env``; cached on mtime and size. Missing file gives {}."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {}
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _env_file_cache.get(str(path))
+    if cached is not None and cached[0] == signature:
+        return dict(cached[1])
+    values = parse_env_file(path.read_text(encoding="utf-8"))
+    _env_file_cache[str(path)] = (signature, values)
+    return dict(values)
+
+
+def effective_env(env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """Merge ``$HERMES_HOME/governance.env`` under the given environment.
+
+    Keys already present in ``env`` (default ``os.environ``) win. A file that
+    exists but cannot be read adds ``ENV_FILE_ERROR_KEY`` instead of values.
+    """
+    env = os.environ if env is None else env
+    merged: dict[str, str] = {}
+    path = env_file_path(env)
+    try:
+        merged.update(read_env_file(path))
+    except Exception as exc:  # noqa: BLE001 - reported through REQUIRED.
+        merged[ENV_FILE_ERROR_KEY] = f"{path}: {type(exc).__name__}"
+    merged.update({k: str(v) for k, v in env.items()})
+    return merged
+
+
+def is_required(env: Optional[Mapping[str, str]] = None) -> bool:
+    env = os.environ if env is None else env
+    return str(env.get(REQUIRED_ENV, "")).strip().lower() in _TRUTHY
+
+
+def missing_required_config(env: Mapping[str, str]) -> Optional[str]:
+    """Return why enforcement is not configured, or None when it is.
+
+    Only meaningful when ``RAGNOS_GOVERNANCE_REQUIRED`` is set.
+    """
+    problems = []
+    if env.get(ENV_FILE_ERROR_KEY):
+        problems.append(f"{ENV_FILE_NAME} could not be read")
+    if not is_enforcing(env):
+        problems.append(f"{ENFORCE_ENV} is not enabled")
+    if not forbidden_tools(env):
+        problems.append(f"{FORBIDDEN_ENV} is empty")
+    return "; ".join(problems) or None
+
+
+def required_config_block(reason: str) -> dict[str, str]:
+    return {
+        "action": "block",
+        "message": (
+            f"RAGnos governance: {REQUIRED_ENV} is set but enforcement is not "
+            f"configured ({reason}). Every tool call is blocked until the "
+            f"governance settings are fixed in the environment or {ENV_FILE_NAME}."
+        ),
+    }
+
+
+def expand_forbidden(names: frozenset[str]) -> frozenset[str]:
+    """Add the tools of every entry that names a toolset.
+
+    Entries stay in the result as tool names too, since a tool and a toolset
+    can share a name (``terminal``). Resolution failures keep the raw names.
+    """
+    if not names:
+        return names
+    expanded = set(names)
+    try:
+        from toolsets import resolve_toolset
+    except Exception:  # noqa: BLE001 - standalone use without Hermes.
+        return frozenset(expanded)
+    for name in names:
+        try:
+            expanded.update(resolve_toolset(name))
+        except Exception:  # noqa: BLE001 - never break a tool call here.
+            continue
+    return frozenset(expanded)
 
 
 def is_enforcing(env: Optional[Mapping[str, str]] = None) -> bool:

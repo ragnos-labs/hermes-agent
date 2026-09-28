@@ -129,8 +129,75 @@ def build_write_approval_paths(home: str) -> set[str]:
     }
 
 
+# HERMES_HOME entries that decide which code runs and which tools the model
+# gets. A model that can write these can widen its own tool surface on the
+# next start or tick (a user plugin overrides a bundled one of the same name,
+# gateway hooks run any handler, a cron job or webhook route carries its own
+# toolset list, a profile.yaml marks the install as bot-managed,
+# governance.env holds the tool-call gate policy). They sit
+# next to config.yaml and .env as write-denied control state; change them
+# with the ``hermes`` CLI instead.
+_HERMES_CONTROL_DIRS = ("plugins", "hooks")
+_HERMES_CONTROL_FILES = (
+    os.path.join("cron", "jobs.json"),
+    "webhook_subscriptions.json",
+    "profile.yaml",
+    "governance.env",
+)
+
+
+def _is_under(resolved: str, base: str) -> bool:
+    return resolved == base or resolved.startswith(base + os.sep)
+
+
+def is_hermes_control_path(path: str) -> bool:
+    """True when ``path`` is Hermes control state under HERMES_HOME or the root.
+
+    Covers ``plugins/``, ``hooks/``, ``cron/jobs.json``,
+    ``webhook_subscriptions.json``, ``profile.yaml`` and ``governance.env``
+    in the active home and the Hermes root, plus every other profile under
+    ``<root>/profiles/``. The active profile's own home stays writable apart
+    from its control entries, so running under a profile does not make the
+    whole home read-only.
+    """
+    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    bases: list[str] = []
+    for base in (_hermes_home_path(), _hermes_root_path()):
+        try:
+            real = os.path.realpath(base)
+        except Exception:
+            continue
+        if real not in bases:
+            bases.append(real)
+
+    for base_real in bases:
+        for name in _HERMES_CONTROL_DIRS:
+            if _is_under(resolved, os.path.join(base_real, name)):
+                return True
+        for name in _HERMES_CONTROL_FILES:
+            if resolved == os.path.join(base_real, name):
+                return True
+
+    try:
+        root_real = os.path.realpath(_hermes_root_path())
+        home_real = os.path.realpath(_hermes_home_path())
+    except Exception:
+        return False
+    profiles_real = os.path.join(root_real, "profiles")
+    if _is_under(resolved, profiles_real):
+        # The active profile's home is handled by the per-base rules above.
+        if (
+            home_real != root_real
+            and _is_under(home_real, profiles_real)
+            and _is_under(resolved, home_real)
+        ):
+            return False
+        return True
+    return False
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    """Return ``'credential'``, ``'hermes_control'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
@@ -147,6 +214,9 @@ def _classify_write_denial(path: str) -> Optional[str]:
     for prefix in build_write_denied_prefixes(home):
         if resolved.startswith(prefix):
             return "credential"
+
+    if is_hermes_control_path(resolved):
+        return "hermes_control"
 
     mcp_tokens_dir_name = "mcp-tokens"
 
@@ -207,6 +277,13 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     denial = _classify_write_denial(path)
     if denial is None:
         return None
+    if denial == "hermes_control":
+        return (
+            f"{verb} denied: '{path}' is Hermes control state (plugins, hooks, "
+            "cron jobs, webhook routes, profiles or governance settings). The "
+            "agent cannot change which code runs or which tools it gets; ask "
+            "the user to make this change with the 'hermes' CLI or an editor."
+        )
     if denial == "safe_root":
         roots_display = os.pathsep.join(sorted(get_safe_write_roots()))
         return (

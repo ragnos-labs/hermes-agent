@@ -1133,6 +1133,24 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import mcp_disabled_for_platform
+
+            mcp_off = mcp_disabled_for_platform(load_config(), "acp")
+        except Exception:
+            logger.debug("ACP: could not read no_mcp setting", exc_info=True)
+            mcp_off = False
+        if mcp_off:
+            # ``agent.no_mcp`` / ``platform_toolsets.acp: [no_mcp]`` also covers
+            # servers the ACP client supplies: do not register or expose them.
+            logger.info(
+                "Session %s: ignoring %d ACP-provided MCP server(s) because MCP is disabled",
+                state.session_id,
+                len(mcp_servers),
+            )
+            return
+
+        try:
             from tools.mcp_tool import register_mcp_servers
 
             config_map: dict[str, dict] = {}

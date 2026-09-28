@@ -24417,7 +24417,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         than trusted. When absent, falls back to standard
         ``platform_toolsets.<platform>`` resolution.
         """
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import _get_platform_tools, mcp_disabled_for_platform
 
         override = None
         try:
@@ -24430,7 +24430,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if override and isinstance(override, list):
             cfg = dict(user_config)
             pts = dict(cfg.get("platform_toolsets") or {})
-            pts[platform_key] = [str(t) for t in override]
+            route_toolsets = [str(t) for t in override]
+            # The override replaces the platform's list, but the platform's
+            # ``no_mcp`` opt-out (or the global ``agent.no_mcp``) still holds:
+            # a per-route list must not bring MCP servers back.
+            if (
+                mcp_disabled_for_platform(user_config, platform_key)
+                and "no_mcp" not in route_toolsets
+            ):
+                route_toolsets.append("no_mcp")
+            pts[platform_key] = route_toolsets
             cfg["platform_toolsets"] = pts
             return sorted(_get_platform_tools(cfg, platform_key))
 

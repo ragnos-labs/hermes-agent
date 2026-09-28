@@ -708,6 +708,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+    # Same reasoning for the rest of the HERMES_HOME control state: plugins,
+    # hooks, cron jobs, webhook routes and profiles each let a write widen the
+    # agent's tools or run code on the next start (see agent/file_safety.py).
+    from agent.file_safety import get_write_denied_error, is_hermes_control_path
+
+    for candidate in (resolved, normalized):
+        if is_hermes_control_path(candidate):
+            return get_write_denied_error(candidate) or (
+                f"Refusing to write to Hermes control state: {filepath}"
+            )
     return None
 
 

@@ -581,13 +581,23 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
         add nothing further (the user named exactly the servers they want)
       * otherwise -> union in every globally-enabled MCP server
     """
-    result = [t for t in per_job if t != "no_mcp"]
-    if "no_mcp" in per_job:
-        return result
     # lazy import: avoid heavy hermes_cli import at cron module load (matches
     # _resolve_cron_enabled_toolsets' fallback) and share one MCP-membership
     # computation with the gateway/CLI platform resolver.
-    from hermes_cli.tools_config import enabled_mcp_server_names
+    from hermes_cli.tools_config import (
+        bound_enabled_toolsets,
+        enabled_mcp_server_names,
+        mcp_disabled_for_platform,
+    )
+
+    result = [t for t in per_job if t != "no_mcp"]
+    if "no_mcp" in per_job:
+        return result
+    # The per-job list replaces the ``cron`` platform list, but the platform's
+    # ``no_mcp`` opt-out and the global ``agent.no_mcp`` still apply: strip
+    # MCP servers (including any the job names) instead of merging them in.
+    if mcp_disabled_for_platform(cfg, "cron"):
+        return bound_enabled_toolsets(result, cfg, "cron") or []
     enabled_mcp = enabled_mcp_server_names(cfg)
     if set(result) & enabled_mcp:
         return result

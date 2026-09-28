@@ -1933,6 +1933,22 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     result_meta["model"] = _model_name
     result_meta["provider"] = _resolved_provider or ""
 
+    # ``agent.disabled_toolsets`` binds the curator like every other agent.
+    # The curator's only toolset is ``skills``; when that is disabled there is
+    # nothing it may do, so skip the model pass instead of running it toolless.
+    try:
+        from hermes_cli.tools_config import load_disabled_toolsets
+
+        _disabled_toolsets = load_disabled_toolsets()
+    except Exception as e:
+        result_meta["error"] = f"could not load agent.disabled_toolsets: {e}"
+        result_meta["summary"] = result_meta["error"]
+        return result_meta
+    if "skills" in (_disabled_toolsets or []):
+        result_meta["error"] = "skipped: the skills toolset is in agent.disabled_toolsets"
+        result_meta["summary"] = result_meta["error"]
+        return result_meta
+
     review_agent = None
     try:
         _agent_kwargs: Dict[str, Any] = {}
@@ -1951,6 +1967,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             request_overrides=_request_overrides,
             **_agent_kwargs,
             enabled_toolsets=["skills"],
+            disabled_toolsets=_disabled_toolsets,
             # ``terminal`` was deliberately removed from this fork (issue
             # #96962): a terminal ``mv``/``cp``/``rm`` under the skills tree
             # writes the same bytes with NO ledger entry, so the archive that

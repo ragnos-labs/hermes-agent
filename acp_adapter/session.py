@@ -626,7 +626,15 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
-        configured_mcp_servers = [
+        from hermes_cli.tools_config import (
+            bound_enabled_toolsets,
+            load_disabled_toolsets,
+            mcp_disabled_for_platform,
+        )
+
+        # ``agent.no_mcp`` (or ``no_mcp`` in ``platform_toolsets.acp``) keeps
+        # every MCP server's tools away from the ACP agent, like the gateway.
+        configured_mcp_servers = [] if mcp_disabled_for_platform(config, "acp") else [
             name
             for name, cfg in (config.get("mcp_servers") or {}).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
@@ -634,10 +642,17 @@ class SessionManager:
 
         kwargs = {
             "platform": "acp",
-            "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
-                mcp_server_names=configured_mcp_servers,
+            "enabled_toolsets": bound_enabled_toolsets(
+                _expand_acp_enabled_toolsets(
+                    ["hermes-acp"],
+                    mcp_server_names=configured_mcp_servers,
+                ),
+                config,
+                "acp",
             ),
+            # ``agent.disabled_toolsets`` applies to ACP sessions too; the MCP
+            # refresh in ``acp_adapter.server`` reuses this list.
+            "disabled_toolsets": load_disabled_toolsets(config),
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
