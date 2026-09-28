@@ -2562,6 +2562,209 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
     return names
 
 
+def load_disabled_toolsets(config: Optional[dict] = None) -> Optional[List[str]]:
+    """Return ``agent.disabled_toolsets`` as a list, or ``None`` when empty.
+
+    Every ``AIAgent`` construction passes this as ``disabled_toolsets`` so the
+    configured denylist is applied at the tool level (``model_tools``) on
+    every path that builds an agent, not only the CLI and gateway platform
+    paths. Loads the active config when *config* is not given.
+    """
+    if config is None:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    agent_cfg = (config or {}).get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        return None
+    from agent.skill_utils import parse_config_string_list
+
+    names: List[str] = []
+    for name in parse_config_string_list(agent_cfg.get("disabled_toolsets")):
+        name = str(name).strip()
+        if name and name not in names:
+            names.append(name)
+    return names or None
+
+
+def merge_disabled_toolsets(*lists: Optional[List[str]]) -> Optional[List[str]]:
+    """Union several disabled-toolset lists, keeping first-seen order."""
+    merged: List[str] = []
+    for items in lists:
+        for name in items or []:
+            name = str(name).strip()
+            if name and name not in merged:
+                merged.append(name)
+    return merged or None
+
+
+def toolset_cap_platform(config: dict, platform: Optional[str] = None) -> Optional[str]:
+    """The ``platform_toolsets`` entry that caps *platform*'s toolsets.
+
+    The platform's own entry when it has one, otherwise the ``cli`` entry,
+    otherwise ``None`` (no cap: upstream behavior). Plugin platforms, the
+    TUI, the curator and any other surface without its own entry therefore
+    inherit the CLI allowlist instead of their unbounded ``hermes-<platform>``
+    default.
+    """
+    platform_toolsets = (config or {}).get("platform_toolsets") or {}
+    if not isinstance(platform_toolsets, dict):
+        return None
+    if platform and isinstance(platform_toolsets.get(platform), list):
+        return platform
+    if isinstance(platform_toolsets.get("cli"), list):
+        return "cli"
+    return None
+
+
+def mcp_disabled_for_platform(config: dict, platform: Optional[str] = None) -> bool:
+    """Whether MCP server toolsets must stay off for *platform*.
+
+    True when the global ``agent.no_mcp`` switch is set, or when the
+    ``platform_toolsets`` entry that caps the platform (its own, else
+    ``cli``; see :func:`toolset_cap_platform`) carries the ``no_mcp``
+    sentinel. A per-route or per-job toolset list replaces the platform list
+    but does not lift the platform's ``no_mcp``.
+    """
+    agent_cfg = (config or {}).get("agent") or {}
+    if isinstance(agent_cfg, dict) and is_truthy_value(agent_cfg.get("no_mcp"), default=False):
+        return True
+    cap_platform = toolset_cap_platform(config, platform)
+    if cap_platform:
+        entry = ((config or {}).get("platform_toolsets") or {}).get(cap_platform)
+        if isinstance(entry, list) and "no_mcp" in [str(t) for t in entry]:
+            return True
+    return False
+
+
+def _mcp_toolset_names(config: dict) -> Set[str]:
+    """Every name that selects an MCP server's tools (alias and ``mcp-`` form)."""
+    names = set(enabled_mcp_server_names(config))
+    mcp_servers = (config or {}).get("mcp_servers") or {}
+    if isinstance(mcp_servers, dict):
+        names |= {str(name) for name in mcp_servers}
+    return names | {f"mcp-{name}" for name in names}
+
+
+def _toolset_tools(name: str) -> Set[str]:
+    """Tool names a toolset resolves to; empty for unknown names."""
+    from toolsets import resolve_toolset, validate_toolset
+
+    try:
+        if validate_toolset(name):
+            return set(resolve_toolset(name))
+    except Exception:
+        logger.debug("could not resolve toolset %s", name, exc_info=True)
+    return set()
+
+
+def _cap_toolsets(enabled_toolsets: List[str], cap: Set[str], config: dict) -> List[str]:
+    """Intersect *enabled_toolsets* with the allowlist *cap*, at the tool level.
+
+    A name is kept when it is itself in the cap or every tool it resolves to
+    is allowed by the cap. A composite (``hermes-acp``, ``hermes-<platform>``)
+    that also carries tools outside the cap is dropped and replaced by the
+    cap toolsets it fully covers, so its allowed tools survive and the rest
+    do not. MCP server toolsets are kept only when the cap includes that
+    server.
+    """
+    mcp_names = _mcp_toolset_names(config)
+
+    def is_mcp(name: str) -> bool:
+        return name in mcp_names or name.startswith("mcp-")
+
+    def server(name: str) -> str:
+        return name[4:] if name.startswith("mcp-") else name
+
+    cap_mcp_servers = {server(n) for n in cap if is_mcp(n)}
+    cap_plain = {n for n in cap if not is_mcp(n)}
+    cap_tools: Set[str] = set()
+    for name in cap_plain:
+        cap_tools |= _toolset_tools(name)
+
+    kept: List[str] = []
+    requested_tools: Set[str] = set()
+    for name in enabled_toolsets:
+        name = str(name)
+        if name == "no_mcp" or name in kept:
+            continue
+        if is_mcp(name):
+            if server(name) in cap_mcp_servers:
+                kept.append(name)
+            continue
+        tools = _toolset_tools(name)
+        requested_tools |= tools
+        if name in cap_plain or (tools and tools <= cap_tools):
+            kept.append(name)
+    for name in sorted(cap_plain):
+        if name in kept:
+            continue
+        tools = _toolset_tools(name)
+        if tools and tools <= requested_tools:
+            kept.append(name)
+    return kept
+
+
+def toolset_cap(config: dict, platform: Optional[str] = None) -> Optional[Set[str]]:
+    """Toolset names the allowlist permits for *platform*, or ``None``.
+
+    Resolved through :func:`_get_platform_tools` for the cap platform (see
+    :func:`toolset_cap_platform`), so the cap already excludes
+    ``agent.disabled_toolsets`` and honors that entry's ``no_mcp``.
+    """
+    cap_platform = toolset_cap_platform(config, platform)
+    if cap_platform is None:
+        return None
+    return set(_get_platform_tools(config, cap_platform, apply_cap=False))
+
+
+def bound_enabled_toolsets(
+    enabled_toolsets: Optional[List[str]],
+    config: dict,
+    platform: Optional[str] = None,
+) -> Optional[List[str]]:
+    """Apply the configured bounds to a toolset list.
+
+    Every agent path resolves its toolsets through here, either directly
+    (ACP, TUI, cron per-job lists, webhook routes, the curator) or through
+    :func:`_get_platform_tools`. Three bounds apply, in order:
+
+    1. The allowlist cap: the result is intersected with the
+       ``platform_toolsets`` entry for *platform*, falling back to the
+       ``cli`` entry when the platform has none (:func:`toolset_cap`).
+       ``None`` (meaning every toolset, e.g. ``HERMES_TUI_TOOLSETS=all``)
+       becomes the cap itself. With no cap entry at all, the list is not
+       capped.
+    2. ``agent.disabled_toolsets`` names are removed.
+    3. When :func:`mcp_disabled_for_platform` holds, every MCP server
+       toolset is removed.
+
+    Callers still pass :func:`load_disabled_toolsets` to ``AIAgent``, which
+    subtracts the disabled tools again at the tool level.
+    """
+    config = config or {}
+    cap = toolset_cap(config, platform)
+    if enabled_toolsets is None:
+        if cap is None:
+            return None
+        enabled_toolsets = sorted(cap)
+    elif cap is not None:
+        enabled_toolsets = _cap_toolsets(list(enabled_toolsets), cap, config)
+    drop = set(load_disabled_toolsets(config) or [])
+    mcp_off = mcp_disabled_for_platform(config, platform)
+    mcp_names = _mcp_toolset_names(config) if mcp_off else set()
+    bounded: List[str] = []
+    for name in enabled_toolsets:
+        name = str(name)
+        if name in drop or name == "no_mcp":
+            continue
+        if mcp_off and (name in mcp_names or name.startswith("mcp-")):
+            continue
+        if name not in bounded:
+            bounded.append(name)
+    return bounded
+
+
 def _exempt_explicit_platform_native(
     default_off: Set[str], platform: str, *, explicitly_configured: bool
 ) -> None:
@@ -2648,8 +2851,14 @@ def _get_platform_tools(
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
+    apply_cap: bool = True,
 ) -> Set[str]:
-    """Resolve which individual toolset names are enabled for a platform."""
+    """Resolve which individual toolset names are enabled for a platform.
+
+    A platform with no ``platform_toolsets`` entry is capped by the ``cli``
+    entry (see :func:`bound_enabled_toolsets`); ``apply_cap=False`` skips
+    that step and is only used to compute the cap itself.
+    """
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
@@ -2892,15 +3101,23 @@ def _get_platform_tools(
     # as an allowlist. Otherwise include every globally enabled MCP server.
     # Special sentinel: "no_mcp" in the toolset list disables all MCP servers.
     enabled_mcp_servers = enabled_mcp_server_names(config)
-    # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
-    if "no_mcp" in toolset_names:
+    # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform.
+    # The global ``agent.no_mcp`` switch does the same for every platform,
+    # including plugin platforms that fall back to ``hermes-<platform>`` and
+    # per-source overrides (webhook routes) that replace the platform list.
+    no_mcp = "no_mcp" in toolset_names or mcp_disabled_for_platform(config, platform)
+    if no_mcp:
         explicit_mcp_servers = set()
-        enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers - {"no_mcp"})
+        mcp_names = _mcp_toolset_names(config)
+        enabled_toolsets.update(
+            ts for ts in explicit_passthrough - {"no_mcp"}
+            if ts not in mcp_names and not ts.startswith("mcp-")
+        )
     else:
         explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
         enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
     if include_default_mcp_servers:
-        if explicit_mcp_servers or "no_mcp" in toolset_names:
+        if explicit_mcp_servers or no_mcp:
             enabled_toolsets.update(explicit_mcp_servers)
         else:
             enabled_toolsets.update(enabled_mcp_servers)
@@ -2946,6 +3163,16 @@ def _get_platform_tools(
                 "to reconfigure. See issue #38798.",
                 platform,
                 ", ".join(_named),
+            )
+
+    # A platform without its own entry (plugin platforms, the TUI, the
+    # curator) is capped by the ``cli`` allowlist rather than getting its
+    # unbounded ``hermes-<platform>`` default.
+    if apply_cap:
+        cap_platform = toolset_cap_platform(config, platform)
+        if cap_platform is not None and cap_platform != platform:
+            enabled_toolsets = set(
+                bound_enabled_toolsets(sorted(enabled_toolsets), config, platform) or []
             )
 
     return enabled_toolsets

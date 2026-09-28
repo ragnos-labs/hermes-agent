@@ -831,6 +831,66 @@ the `hermes tools` UI.
 
 Leaving the list empty, or omitting the key, is a no-op.
 
+The list applies to every agent Hermes builds, not only the main chat agent:
+gateway platforms (including plugin platforms that fall back to their
+`hermes-<platform>` toolset), webhook routes that carry their own toolset
+list, cron jobs with a per-job toolset list, ACP sessions and their MCP
+refresh, the TUI and desktop gateway (after the surface toolsets are added),
+background and preview agents, the API server, the gateway `/compress` and
+session hygiene compression agents, and the skills curator. The curator skips
+its run when `skills` is in the list.
+
+### Allowlist cap
+
+A platform's `platform_toolsets` entry is also a cap. Every agent Hermes
+builds for that platform gets at most the toolsets its entry lists, whatever
+else asks for more: a `hermes-<platform>` default, a composite such as
+`hermes-acp`, a webhook route's own toolset list, a cron job's per-job list,
+the `HERMES_TUI_TOOLSETS` pin (including `all`) or an unbounded ("all
+toolsets") request. A platform with no entry of its own is capped by the
+`cli` entry. When neither the platform nor `cli` has an entry, nothing is
+capped. The skills curator is capped by its `curator` entry, else the `cli`
+entry, and skips its run when `skills` falls outside it.
+
+Two more bounds follow from the cap:
+
+- **Agent-created cron jobs.** When an agent creates or edits a cron job with
+  the `cronjob` tool, the job records that agent's toolsets and never runs
+  with more, whatever toolsets the job asks for. Jobs created with
+  `hermes cron` or the dashboard carry no such bound.
+- **Hosted rooms on the API server.** A room's execution policy is honored
+  only on a request that carries a room grant, and its toolsets are capped by
+  the `api_server` entry (else `cli`). A capped deployment that uses hosted
+  rooms should add `bot_room` to its `api_server` entry.
+
+```yaml
+platform_toolsets:
+  cli: [file, search, todo]     # caps cli and every platform without its own entry
+  webhook: [file, search]       # a route asking for web or terminal gets neither
+```
+
+A composite is kept only when the cap covers all of its tools; otherwise it is
+replaced by the cap toolsets it fully contains. MCP servers are on by default
+(upstream behavior), so an MCP server passes the cap unless the entry (or the
+`cli` fallback) lists `no_mcp`, or `agent.no_mcp` is set.
+
+### Turning MCP off everywhere
+
+`no_mcp` in a platform's `platform_toolsets` entry keeps MCP server tools off
+that platform. A platform with no entry of its own follows `no_mcp` in the
+`cli` entry. To keep them off every platform, whatever their entries say, set:
+
+```yaml
+agent:
+  no_mcp: true
+```
+
+With either form, MCP toolsets are also removed from webhook route toolset
+lists, cron per-job toolset lists (`no_mcp` under `platform_toolsets.cron`
+or `agent.no_mcp`), the TUI toolset pin, and ACP sessions (both configured
+servers and servers the ACP client supplies). MCP server processes may still
+start; only their tools are withheld from the agent.
+
 ## Git Worktree Isolation
 
 Enable isolated git worktrees for running multiple agents in parallel on the same repo:
@@ -1929,10 +1989,10 @@ Example footer when writes are blocked:
 ```
 ⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
   • ~/.hermes/cron/jobs.json — [patch] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
-  • ~/.hermes/scripts/monitor.py — [write_file] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
+  • ~/.hermes/skills/monitor/SKILL.md — [write_file] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
 ```
 
-If writes to Hermes state (cron jobs, skills, scripts under `~/.hermes/`) are failing, check whether `HERMES_WRITE_SAFE_ROOT` is set in your environment. For cron changes, use the `cronjob` tool or `hermes cron edit` instead of patching `jobs.json` directly.
+If writes to Hermes state (cron jobs, skills under `~/.hermes/`) are failing, check whether `HERMES_WRITE_SAFE_ROOT` is set in your environment. For cron changes, use the `cronjob` tool or `hermes cron edit` instead of patching `jobs.json` directly.
 
 ### UI language for static messages
 

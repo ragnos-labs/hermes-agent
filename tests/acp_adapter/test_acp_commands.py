@@ -89,6 +89,10 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
             setattr(module, key, value)
         return module
 
+    # _make_agent reads toolset bounds through hermes_cli.tools_config. Import
+    # it before the config stub below so it binds to the real config module.
+    import hermes_cli.tools_config  # noqa: F401
+
     monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=CapturingAgent))
     monkeypatch.setitem(
         sys.modules,

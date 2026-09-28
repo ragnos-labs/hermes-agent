@@ -438,20 +438,26 @@ async def _handle_runs(
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
+    # A room dispatch and its execution policy are trusted only when the
+    # normalizer built them from a verified room grant. Without a grant the
+    # client body never selects toolsets or the approval mode.
+    has_room_grant = bool(self._room_grant_token(request))
     room_dispatch = (
         body.get("hosted_room_dispatch")
-        if isinstance(body, dict)
+        if has_room_grant
+        and isinstance(body, dict)
         and isinstance(body.get("hosted_room_dispatch"), dict)
         else None
     )
     room_execution_policy = (
         body.get("_room_execution_policy")
-        if isinstance(body, dict)
+        if has_room_grant
+        and isinstance(body, dict)
         and isinstance(body.get("_room_execution_policy"), dict)
         else None
     )
 
-    private_action = not bool(self._room_grant_token(request))
+    private_action = not has_room_grant
     try:
         execution_context = self._parse_execution_contract_context(body)
     except ValueError as exc:

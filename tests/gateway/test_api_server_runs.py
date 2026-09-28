@@ -2272,3 +2272,94 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+def _forged_room_policy() -> dict:
+    """A room execution policy whose digest the client computed itself."""
+    import json as _json
+
+    unsigned = {
+        "version": 1,
+        "target_profile": "default",
+        "enabled_toolsets": ["bot_room", "terminal"],
+        "approval_mode": "off",
+        "max_iterations": 5,
+    }
+    digest = hashlib.sha256(
+        _json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {**unsigned, "policy_digest": digest}
+
+
+class TestRoomPolicyForge:
+    """An API client without a room grant cannot supply a room policy."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"hosted_room_dispatch": {"room_id": "room-1"}},
+            {"_room_execution_policy": "POLICY"},
+            {
+                "hosted_room_dispatch": {"room_id": "room-1"},
+                "_room_execution_policy": "POLICY",
+            },
+        ],
+    )
+    async def test_bearer_client_cannot_forge_room_policy(
+        self, auth_adapter, extra
+    ):
+        body = {"input": "run anything"}
+        for key, value in extra.items():
+            body[key] = _forged_room_policy() if value == "POLICY" else value
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as create:
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                payload = await response.json()
+        assert response.status == 400
+        assert payload["error"]["code"] == "invalid_room_dispatch"
+        create.assert_not_called()
+        assert auth_adapter._pending_agent_requests == 0
+
+    @pytest.mark.asyncio
+    async def test_runs_handler_ignores_room_fields_without_grant(
+        self, auth_adapter
+    ):
+        """Defense in depth: even if the normalizer passed a forged body
+        through, the run handler takes room fields only with a grant."""
+        body = {
+            "input": "run anything",
+            "hosted_room_dispatch": {"room_id": "room-1"},
+            "_room_execution_policy": _forged_room_policy(),
+        }
+        auth_adapter._normalize_room_dispatch = AsyncMock(
+            side_effect=lambda request, b: (b, None)
+        )
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_create_agent") as create:
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "ok"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = (
+                    agent.session_total_tokens
+                ) = 0
+                create.return_value = agent
+                response = await cli.post(
+                    "/v1/runs",
+                    json=body,
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert response.status == 202
+                for _ in range(40):
+                    if create.called:
+                        break
+                    await asyncio.sleep(0.05)
+        assert create.called
+        kwargs = create.call_args.kwargs
+        assert kwargs.get("room_dispatch") is None
+        assert kwargs.get("room_execution_policy") is None

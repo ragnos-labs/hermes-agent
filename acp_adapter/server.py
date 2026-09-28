@@ -1133,10 +1133,62 @@ class HermesACPAgent(acp.Agent):
             return
 
         try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import (
+                bound_enabled_toolsets,
+                mcp_disabled_for_platform,
+            )
+
+            cfg = load_config()
+            mcp_off = mcp_disabled_for_platform(cfg, "acp")
+            enabled_toolsets = None
+            if not mcp_off:
+                # Client MCP servers pass through the same allowlist cap as
+                # every other ACP toolset: a server survives only when the
+                # ``acp`` (or ``cli``) cap names it, and an empty cap stays
+                # empty.
+                enabled_toolsets = bound_enabled_toolsets(
+                    _expand_acp_enabled_toolsets(
+                        getattr(state.agent, "enabled_toolsets", None),
+                        mcp_server_names=[server.name for server in mcp_servers],
+                    ),
+                    cfg,
+                    "acp",
+                )
+        except Exception:
+            # Fail closed: without the settings, client-supplied MCP servers
+            # stay unregistered.
+            logger.warning("ACP: could not read toolset settings; ignoring client MCP servers", exc_info=True)
+            mcp_off = True
+            enabled_toolsets = None
+        if mcp_off:
+            # ``agent.no_mcp`` / ``platform_toolsets.acp: [no_mcp]`` also covers
+            # servers the ACP client supplies: do not register or expose them.
+            logger.info(
+                "Session %s: ignoring %d ACP-provided MCP server(s) because MCP is disabled",
+                state.session_id,
+                len(mcp_servers),
+            )
+            return
+        allowed_toolsets = set(enabled_toolsets or [])
+        allowed_servers = [
+            server
+            for server in mcp_servers
+            if f"mcp-{server.name}" in allowed_toolsets
+        ]
+        if not allowed_servers:
+            logger.info(
+                "Session %s: ignoring %d ACP-provided MCP server(s) outside the acp toolset cap",
+                state.session_id,
+                len(mcp_servers),
+            )
+            return
+
+        try:
             from tools.mcp_tool import register_mcp_servers
 
             config_map: dict[str, dict] = {}
-            for server in mcp_servers:
+            for server in allowed_servers:
                 name = server.name
                 if isinstance(server, McpServerStdio):
                     config = {
@@ -1164,10 +1216,6 @@ class HermesACPAgent(acp.Agent):
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
-            enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
-            )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
             state.agent.tools = get_tool_definitions(
@@ -2349,10 +2397,31 @@ class HermesACPAgent(acp.Agent):
             from types import SimpleNamespace
             from agent.memory_manager import inject_memory_provider_tools
 
-            toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import (
+                bound_enabled_toolsets,
+                load_disabled_toolsets,
+                merge_disabled_toolsets,
             )
-            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+
+            # List what the session agent may actually call: the same
+            # allowlist cap and denylist its tool snapshot was built with.
+            _cfg = load_config()
+            toolsets = bound_enabled_toolsets(
+                _expand_acp_enabled_toolsets(
+                    getattr(state.agent, "enabled_toolsets", None)
+                ),
+                _cfg,
+                "acp",
+            )
+            tools = get_tool_definitions(
+                enabled_toolsets=toolsets,
+                disabled_toolsets=merge_disabled_toolsets(
+                    getattr(state.agent, "disabled_toolsets", None),
+                    load_disabled_toolsets(_cfg),
+                ),
+                quiet_mode=True,
+            )
             tool_view = SimpleNamespace(
                 tools=list(tools or []),
                 valid_tool_names={

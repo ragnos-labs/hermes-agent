@@ -1152,16 +1152,11 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     )
 
 
-@pytest.mark.asyncio
-async def test_session_hygiene_honors_configurable_hard_message_limit(
-    monkeypatch, tmp_path
-):
-    """compression.hygiene_hard_message_limit overrides the default.
+async def _run_hard_limit_hygiene(monkeypatch, tmp_path):
+    """Drive one gateway turn whose transcript exceeds a lowered hard limit.
 
-    Regression for user-reported fix: a gateway session with a small
-    transcript (12 messages) should not hit hygiene compression by default,
-    but WILL when the user lowers the hard-limit to 10.  Verifies the new
-    config key is actually read and applied at the force-compress gate.
+    Returns the fake compression agent class; ``last_instance.init_kwargs``
+    holds the kwargs the hygiene path built it with.
     """
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -1171,6 +1166,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
         last_instance = None
 
         def __init__(self, **kwargs):
+            self.init_kwargs = kwargs
             self.model = kwargs.get("model")
             self.session_id = kwargs.get("session_id", "fake-session")
             self._print_fn = None
@@ -1262,12 +1258,45 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     result = await runner._handle_message(event)
 
     assert result == "ok"
+    return FakeCompressAgent
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_honors_configurable_hard_message_limit(
+    monkeypatch, tmp_path
+):
+    """compression.hygiene_hard_message_limit overrides the default.
+
+    Regression for user-reported fix: a gateway session with a small
+    transcript (12 messages) should not hit hygiene compression by default,
+    but WILL when the user lowers the hard-limit to 10.  Verifies the new
+    config key is actually read and applied at the force-compress gate.
+    """
+    agent_cls = await _run_hard_limit_hygiene(monkeypatch, tmp_path)
     # The compression agent was instantiated → hard-limit fired on the
     # configured value (10), not the hardcoded 400 default.
-    assert FakeCompressAgent.last_instance is not None, (
+    assert agent_cls.last_instance is not None, (
         "Expected hygiene compression to fire when message count (12) "
         "exceeds configured hygiene_hard_message_limit (10)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cap", "expected"),
+    [(["file"], []), (["file", "memory"], ["memory"])],
+)
+async def test_session_hygiene_agent_toolsets_are_capped(
+    monkeypatch, tmp_path, cap, expected
+):
+    """The hygiene compression agent gets memory only when the cap allows it."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"platform_toolsets": {"telegram": list(cap)}},
+    )
+    agent_cls = await _run_hard_limit_hygiene(monkeypatch, tmp_path)
+    assert agent_cls.last_instance is not None
+    assert agent_cls.last_instance.init_kwargs["enabled_toolsets"] == expected
 
 
 # ---------------------------------------------------------------------------
