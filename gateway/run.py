@@ -2471,6 +2471,81 @@ class _HygieneWaitTimeout(asyncio.TimeoutError):
     """
 
 
+class _HygieneWorkerCancelled(Exception):
+    """The hygiene worker's executor future was cancelled.
+
+    The host task itself was not cancelled, so the user turn must continue
+    without compression. Raising ``asyncio.CancelledError`` from
+    ``future.result()`` instead would escape the ``except Exception`` guard
+    around hygiene and cancel the whole turn.
+    """
+
+
+def _hygiene_unwind_cooldown_reason(exc: BaseException) -> str:
+    """Return the cooldown reason recorded when the hygiene wait unwinds.
+
+    Host cancellation (restart drain, task cancel, ``KeyboardInterrupt``)
+    keeps the fence-cancel label: the unwind revokes commit admission. Any
+    ``Exception`` is a failure, labelled with its class name only, because
+    the recorded reason reaches users and provider exception text may carry
+    credentials.
+    """
+    if isinstance(exc, _HygieneWorkerCancelled):
+        return "session hygiene compression worker was cancelled"
+    if isinstance(exc, Exception):
+        return f"session hygiene compression failed: {type(exc).__name__}"
+    return "session hygiene compression cancelled at commit fence"
+
+
+class _HygieneWorkerLifecycle:
+    """Track the hygiene worker thread apart from its asyncio future.
+
+    Cancelling the future that ``run_in_executor`` returns does not stop a
+    worker thread that is already running, and the cancelled future no longer
+    reports when that thread exits. Deferred agent cleanup must not close the
+    agent under a live worker, so the worker resolves ``exited`` itself. A
+    worker abandoned before it started never touches the agent.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._started = False
+        self._abandoned = False
+        self.exited: asyncio.Future = loop.create_future()
+
+    def run(self, fn: Callable[[], Any]) -> Any:
+        """Run ``fn`` on the worker thread unless the host abandoned it."""
+        with self._lock:
+            if self._abandoned:
+                return None
+            self._started = True
+        try:
+            return fn()
+        finally:
+            try:
+                self._loop.call_soon_threadsafe(self._resolve_exited)
+            except RuntimeError:
+                # The loop closed; nothing is left to clean up on it.
+                pass
+
+    def abandon(self) -> None:
+        """Keep a worker that has not started from ever running.
+
+        Call on the loop thread. When the worker never started, ``exited``
+        resolves at once because no thread can still be using the agent.
+        """
+        with self._lock:
+            self._abandoned = True
+            started = self._started
+        if not started:
+            self._resolve_exited()
+
+    def _resolve_exited(self) -> None:
+        if not self.exited.done():
+            self.exited.set_result(None)
+
+
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
@@ -21268,12 +21343,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_commit_fence = CompressionCommitFence(
                                         total_ceiling_seconds=_hyg_total_ceiling_seconds
                                     )
+                                    _hyg_worker = _HygieneWorkerLifecycle(loop)
                                     _hyg_future = loop.run_in_executor(
                                         None,
-                                        lambda: _hyg_agent._compress_context(
-                                            _hyg_msgs, "",
-                                            approx_tokens=_approx_tokens,
-                                            commit_fence=_hyg_commit_fence,
+                                        lambda: _hyg_worker.run(
+                                            lambda: _hyg_agent._compress_context(
+                                                _hyg_msgs, "",
+                                                approx_tokens=_approx_tokens,
+                                                commit_fence=_hyg_commit_fence,
+                                            )
                                         ),
                                     )
                                     try:
@@ -21360,6 +21438,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # future, so the worker stays shielded.
                                             await asyncio.wait({_hyg_future}, timeout=_slice)
                                             if _hyg_future.done():
+                                                if _hyg_future.cancelled():
+                                                    # result() would raise
+                                                    # CancelledError and cancel
+                                                    # the whole turn. Unwind as
+                                                    # an ordinary failure.
+                                                    raise _HygieneWorkerCancelled(
+                                                        "hygiene compression worker "
+                                                        "future was cancelled"
+                                                    )
                                                 # Success breaks out. Any worker
                                                 # exception, including its own
                                                 # ``TimeoutError``, takes the
@@ -21679,7 +21766,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                         _werr,
                                                     )
                                             raise
-                                    except BaseException:
+                                    except BaseException as _hyg_unwind_exc:
                                         # #76354 F2: non-timeout unwind while the
                                         # detached hygiene worker may still run —
                                         # KeyboardInterrupt, task cancellation, or
@@ -21690,8 +21777,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # worker can never commit later.
                                         _hyg_commit_fence.revoke_commit_admission()
                                         if not _hyg_cleanup_deferred:
+                                            _hyg_cleanup_after = _hyg_future
+                                            if _hyg_future.cancelled():
+                                                # A cancelled future never
+                                                # reports the worker's exit, so
+                                                # cleanup would never run. Wait
+                                                # on the worker's own signal.
+                                                _hyg_worker.abandon()
+                                                _hyg_cleanup_after = _hyg_worker.exited
                                             self._defer_agent_cleanup_until_future_done(
-                                                _hyg_future,
+                                                _hyg_cleanup_after,
                                                 _hyg_agent,
                                                 context="session hygiene unwind",
                                             )
@@ -21708,11 +21803,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     session_key,
                                                     _hyg_failure_cooldown_seconds,
                                                 )
+                                                # A worker failure is not a
+                                                # fence cancel or a timeout:
+                                                # label it by failure class.
                                                 _record_hygiene_cooldown(
                                                     self, session_entry.session_id,
                                                     _hyg_cooldown,
-                                                    "session hygiene compression "
-                                                    "cancelled at commit fence",
+                                                    _hygiene_unwind_cooldown_reason(
+                                                        _hyg_unwind_exc
+                                                    ),
                                                 )
                                             except Exception as _cd_err:
                                                 logger.debug(
