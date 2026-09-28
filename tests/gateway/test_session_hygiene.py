@@ -1843,3 +1843,186 @@ async def test_hygiene_unwind_records_cooldown(monkeypatch, tmp_path):
         await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# A worker that raises ``TimeoutError`` is not a hygiene wait timeout
+# ---------------------------------------------------------------------------
+
+
+class _ProviderReadTimeout(TimeoutError):
+    """Stands in for ``socket.timeout`` raised by the summary provider read."""
+
+
+class _SpinDetected(AssertionError):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_hygiene_worker_timeout_error_takes_error_path_without_spinning(
+    monkeypatch, tmp_path, caplog
+):
+    """Since Python 3.11 ``asyncio.TimeoutError`` is the builtin
+    ``TimeoutError``. The host loop used to ``wait_for(shield(future))`` and
+    catch it, so a worker that raised ``TimeoutError`` re-raised at once on
+    every pass. The loop spun without yielding, blocking the event loop until
+    the idle window closed, and then reported the worker's error as a hygiene
+    timeout with a "no output" toast.
+
+    The extend check runs once per pass. The stub raises after 50 passes so a
+    regressed spin fails this test instead of hanging it.
+    """
+    from hermes_state import SessionDB
+
+    gateway_run = importlib.import_module("gateway.run")
+    session_id = "sess-worker-timeout-error"
+    worker_error = _ProviderReadTimeout("summary provider read timed out")
+    cleanup_done = threading.Event()
+
+    class ProviderTimeoutCompressAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", session_id)
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock(side_effect=cleanup_done.set)
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            raise worker_error
+
+    real_extend = gateway_run.hygiene_wait_should_extend
+    extend_calls = []
+
+    def _counting_extend(**kwargs):
+        extend_calls.append(kwargs)
+        if len(extend_calls) > 50:
+            raise _SpinDetected(f"host wait loop ran {len(extend_calls)} passes")
+        return real_extend(**kwargs)
+
+    monkeypatch.setattr(
+        gateway_run, "hygiene_wait_should_extend", _counting_extend
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, ProviderTimeoutCompressAgent, db, session_id
+        )
+        caplog.set_level("WARNING", logger="gateway.run")
+        started = time.monotonic()
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+        elapsed = time.monotonic() - started
+
+        assert result == "ok"
+        assert runner._run_agent.await_count == 1
+        assert elapsed < 2.0
+        assert len(extend_calls) <= 1, (
+            f"host wait loop spun {len(extend_calls)} passes on a finished "
+            "worker that raised TimeoutError"
+        )
+        failures = [
+            r.getMessage()
+            for r in caplog.records
+            if "Session hygiene auto-compress failed" in r.getMessage()
+        ]
+        assert failures and "summary provider read timed out" in failures[0], (
+            f"the worker's own error must reach the error path; got {failures!r}"
+        )
+        sent = [s["content"].lower() for s in adapter.sent]
+        assert not any("timed out" in c or "no output" in c for c in sent), (
+            f"a worker error is not a summary-model timeout; sent {sent!r}"
+        )
+        assert not any(
+            "no progress" in r.getMessage() or "total ceiling" in r.getMessage()
+            for r in caplog.records
+        )
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_point", ["before_first_wait", "during_wait"])
+async def test_hygiene_fence_cancel_still_takes_the_timeout_path(
+    monkeypatch, tmp_path, caplog, cancel_point
+):
+    """Guards the private timeout type: only host-side expiries reach the
+    timeout path. A fence cancel seen before the first wait slice, or after
+    one, must still be handled there (fence-cancel warning and provenance),
+    not fall through to the generic unwind path.
+    """
+    from hermes_state import SessionDB
+    import agent.conversation_compression as conversation_compression
+
+    session_id = f"sess-fence-{cancel_point}"
+    release_worker = threading.Event()
+    cleanup_done = threading.Event()
+
+    if cancel_point == "before_first_wait":
+        real_fence_cls = conversation_compression.CompressionCommitFence
+
+        class PreCancelledFence(real_fence_cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                assert self.try_cancel_before_commit() is True
+
+        monkeypatch.setattr(
+            conversation_compression, "CompressionCommitFence", PreCancelledFence
+        )
+
+    class FenceCancelAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", session_id)
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock(side_effect=cleanup_done.set)
+
+        def _compress_context(
+            self, messages, *_args, commit_fence=None, **_kwargs
+        ):
+            if cancel_point == "during_wait":
+                # The host is already inside its first 0.25s wait slice.
+                time.sleep(0.1)
+                assert commit_fence.try_cancel_before_commit() is True
+            release_worker.wait(timeout=2)
+            return (messages, None)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, FenceCancelAgent, db, session_id
+        )
+        caplog.set_level("WARNING", logger="gateway.run")
+        started = time.monotonic()
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+        elapsed = time.monotonic() - started
+
+        assert result == "ok"
+        assert elapsed < 2.0
+        assert any(
+            "was cancelled at the commit fence" in r.getMessage()
+            for r in caplog.records
+        ), "fence cancel must take the timeout path's fence-cancel branch"
+        assert not any(
+            "no output" in s["content"].lower() for s in adapter.sent
+        )
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None and state["remaining_seconds"] > 0
+        release_worker.set()
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=3)
+    finally:
+        release_worker.set()
+        db.close()

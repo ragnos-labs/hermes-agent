@@ -2460,6 +2460,17 @@ class HygieneTurnHoldExceeded(Exception):
     """
 
 
+class _HygieneWaitTimeout(asyncio.TimeoutError):
+    """The gateway host stopped waiting on the hygiene compression worker.
+
+    Raised only by the host-side wait loop: an idle window or total ceiling
+    elapsed, or the commit fence was cancelled. The timeout path catches this
+    type alone. A ``TimeoutError`` raised by the worker itself (a provider
+    read timeout, ``socket.timeout``) is a worker failure and must take the
+    ordinary error path, not be reported as a hygiene timeout.
+    """
+
+
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
@@ -21280,7 +21291,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         _hyg_wait_started = time.monotonic()
                                         while True:
                                             if _hyg_commit_fence.is_cancelled:
-                                                raise asyncio.TimeoutError
+                                                raise _HygieneWaitTimeout
                                             # #76354 S3: charge the idle budget
                                             # from the LAST PROGRESS event, not
                                             # from the start of this wait slice —
@@ -21335,68 +21346,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 0.005,
                                             )
                                             _slice = min(_slice, 0.25)
-                                            try:
-                                                _compressed, _ = await asyncio.wait_for(
-                                                    asyncio.shield(_hyg_future),
-                                                    timeout=_slice,
-                                                )
+                                            # Wait on completion, not on
+                                            # ``wait_for(shield(future))``. Since
+                                            # Python 3.11 ``asyncio.TimeoutError``
+                                            # is the builtin ``TimeoutError``, so a
+                                            # worker that raised it (a provider
+                                            # read timeout) re-raised at once on
+                                            # every pass: a hot spin that blocked
+                                            # the event loop until the idle window
+                                            # closed, and then the real error was
+                                            # reported as a hygiene timeout.
+                                            # ``asyncio.wait`` never cancels the
+                                            # future, so the worker stays shielded.
+                                            await asyncio.wait({_hyg_future}, timeout=_slice)
+                                            if _hyg_future.done():
+                                                # Success breaks out. Any worker
+                                                # exception, including its own
+                                                # ``TimeoutError``, takes the
+                                                # ordinary unwind path below.
+                                                _compressed, _ = _hyg_future.result()
                                                 break
-                                            except asyncio.TimeoutError:
-                                                if _hyg_commit_fence.is_cancelled:
-                                                    raise
-                                                _hyg_waited = time.monotonic() - _hyg_wait_started
-                                                _idle = _hyg_commit_fence.seconds_since_progress()
-                                                # Bounded turn-hold (#TKT-0029):
-                                                # never hold the user's TURN
-                                                # longer than
-                                                # _hyg_max_turn_hold_seconds,
-                                                # even if the summary model is
-                                                # still streaming. Past the
-                                                # budget we stop waiting and
-                                                # fall through to the timeout
-                                                # path below, which revokes
-                                                # commit admission and proceeds
-                                                # on the uncompressed
-                                                # transcript — the wire never
-                                                # stays silent long enough to
-                                                # trip a transport idle-timeout.
-                                                if (
-                                                    _hyg_waited
-                                                    >= _hyg_max_turn_hold_seconds
-                                                ):
+                                            if _hyg_commit_fence.is_cancelled:
+                                                raise _HygieneWaitTimeout
+                                            _hyg_waited = time.monotonic() - _hyg_wait_started
+                                            _idle = _hyg_commit_fence.seconds_since_progress()
+                                            # Bounded turn-hold (#TKT-0029):
+                                            # never hold the user's TURN
+                                            # longer than
+                                            # _hyg_max_turn_hold_seconds,
+                                            # even if the summary model is
+                                            # still streaming. Past the
+                                            # budget we stop waiting and
+                                            # fall through to the timeout
+                                            # path below, which revokes
+                                            # commit admission and proceeds
+                                            # on the uncompressed
+                                            # transcript — the wire never
+                                            # stays silent long enough to
+                                            # trip a transport idle-timeout.
+                                            if (
+                                                _hyg_waited
+                                                >= _hyg_max_turn_hold_seconds
+                                            ):
+                                                logger.info(
+                                                    "Session hygiene compression for "
+                                                    "session %s exceeded the turn-hold "
+                                                    "budget (%.1fs >= %.1fs) — "
+                                                    "abandoning inline wait, proceeding "
+                                                    "without compression this turn",
+                                                    session_entry.session_id,
+                                                    _hyg_waited,
+                                                    _hyg_max_turn_hold_seconds,
+                                                )
+                                                raise HygieneTurnHoldExceeded(
+                                                    f"turn-hold budget {_hyg_max_turn_hold_seconds:.1f}s "
+                                                    f"elapsed after {_hyg_waited:.1f}s"
+                                                )
+                                            if hygiene_wait_should_extend(
+                                                    idle=_idle,
+                                                    timeout=_hyg_timeout_seconds,
+                                                    waited=_hyg_waited,
+                                                    ceiling=_hyg_total_ceiling_seconds,
+                                                    fence_cancelled=_hyg_commit_fence.is_cancelled,
+                                            ):
+                                                if _slice >= _idle_left - 1e-9:
                                                     logger.info(
                                                         "Session hygiene compression for "
-                                                        "session %s exceeded the turn-hold "
-                                                        "budget (%.1fs >= %.1fs) — "
-                                                        "abandoning inline wait, proceeding "
-                                                        "without compression this turn",
+                                                        "session %s still streaming after "
+                                                        "%.0fs (last progress %.1fs ago) — "
+                                                        "extending wait (ceiling %.0fs)",
                                                         session_entry.session_id,
-                                                        _hyg_waited,
-                                                        _hyg_max_turn_hold_seconds,
+                                                        _hyg_waited, _idle,
+                                                        _hyg_total_ceiling_seconds,
                                                     )
-                                                    raise HygieneTurnHoldExceeded(
-                                                        f"turn-hold budget {_hyg_max_turn_hold_seconds:.1f}s "
-                                                        f"elapsed after {_hyg_waited:.1f}s"
-                                                    )
-                                                if hygiene_wait_should_extend(
-                                                        idle=_idle,
-                                                        timeout=_hyg_timeout_seconds,
-                                                        waited=_hyg_waited,
-                                                        ceiling=_hyg_total_ceiling_seconds,
-                                                        fence_cancelled=_hyg_commit_fence.is_cancelled,
-                                                ):
-                                                    if _slice >= _idle_left - 1e-9:
-                                                        logger.info(
-                                                            "Session hygiene compression for "
-                                                            "session %s still streaming after "
-                                                            "%.0fs (last progress %.1fs ago) — "
-                                                            "extending wait (ceiling %.0fs)",
-                                                            session_entry.session_id,
-                                                            _hyg_waited, _idle,
-                                                            _hyg_total_ceiling_seconds,
-                                                        )
-                                                    continue
-                                                raise
+                                                continue
+                                            raise _HygieneWaitTimeout
                                     except HygieneTurnHoldExceeded:
                                         # Turn-hold expiry is an availability boundary,
                                         # not a failure. The compressor is healthy and
@@ -21487,7 +21511,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     _werr,
                                                 )
                                             raise
-                                    except asyncio.TimeoutError:
+                                    except _HygieneWaitTimeout:
                                         _hyg_waited = time.monotonic() - _hyg_wait_started
                                         _hyg_total_exhausted = (
                                             _hyg_waited >= _hyg_total_ceiling_seconds
