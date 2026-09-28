@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 from agent.acp_openai_bridge import build_openai_tool_call, completion_to_stream_chunks
 
-BASE_URL = "codex-exec://local"
+BASE_URL = "codex-exec://codex-exec"
 _MAX_BYTES = 8_000_000
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _INSTRUCTIONS = (
@@ -221,13 +221,13 @@ def _stop(process: subprocess.Popen) -> None:
         if os.name == "nt":
             process.terminate()
         else:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGTERM)  # windows-footgun: ok - POSIX-only branch (nt handled above)
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         if os.name == "nt":
             process.kill()
         else:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX-only branch (nt handled above)
         process.wait(timeout=3)
     except ProcessLookupError:
         pass

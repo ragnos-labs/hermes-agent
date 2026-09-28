@@ -309,7 +309,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="codex_exec",
         name="Codex CLI (exec)",
         auth_type="external_process",
-        inference_base_url="codex-exec://local",
+        inference_base_url="codex-exec://codex-exec",
     ),
     "gemini": ProviderConfig(
         id="gemini",

@@ -499,6 +499,7 @@ httpx = false
 httpx2 = false
 huggingface_hub = false
 jinja2 = false
+jsonschema = false
 lark-oapi = false
 markdown = false
 maturin = false
