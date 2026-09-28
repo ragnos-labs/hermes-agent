@@ -136,3 +136,148 @@ def test_cli_subcommand_exits_with_report_status(jobs_file, capsys):
 
     _write(jobs_file, {"jobs": []})
     assert args.func(args) == 0
+
+
+# -- derived names are payload text and are never printed ----------------------
+
+SECRET_PROMPT = "sk-live-7f3a9c SECRET_PROMPT_MARKER rotate the vault token and post it"
+
+
+def test_unnamed_job_prompt_never_in_output(jobs_file, capsys):
+    """An unnamed job is named after its prompt; the audit withholds it."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    # The store derives the name from the prompt: this is what could leak.
+    assert get_job(job["id"])["name"] == SECRET_PROMPT[:50].strip()
+
+    assert cron_unbound_jobs() == 1
+    out = capsys.readouterr().out
+    report = json.loads(out)
+    (entry,) = report["jobs"]
+    assert entry["id"] == job["id"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+    for fragment in ("sk-live", "SECRET_PROMPT_MARKER", "rotate the vault"):
+        assert fragment not in out
+
+
+def test_derived_name_stays_redacted_after_prompt_edit(jobs_file):
+    """``update_job`` keeps a derived name when the prompt changes, so the
+    name no longer matches the prompt; it is still withheld."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    update_job(job["id"], {"prompt": "harmless replacement prompt"})
+    assert get_job(job["id"])["name"] == SECRET_PROMPT[:50].strip()
+
+    text = json.dumps(cron_unbound_jobs_report())
+    assert "SECRET_PROMPT_MARKER" not in text
+    assert '"name_redacted": true' in text
+
+
+def test_explicit_name_is_reported(jobs_file):
+    from cron.jobs import create_job, get_job, update_job
+
+    named = create_job(prompt=SECRET_PROMPT, schedule="every 1h", name="nightly vault check")
+    unnamed = create_job(prompt="another prompt body", schedule="every 1h")
+    update_job(unnamed["id"], {"name": "renamed by operator"})
+    # A later edit without a name keeps the marker.
+    update_job(named["id"], {"prompt": "new prompt"})
+    assert get_job(named["id"])["name_explicit"] is True
+
+    by_id = {job["id"]: job for job in cron_unbound_jobs_report()["jobs"]}
+    assert by_id[named["id"]]["name"] == "nightly vault check"
+    assert by_id[named["id"]]["name_redacted"] is False
+    assert by_id[unnamed["id"]]["name"] == "renamed by operator"
+    assert by_id[unnamed["id"]]["name_redacted"] is False
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        # Legacy job: no marker, so the name is withheld whatever it holds.
+        {"id": "legacy", "name": "legacy name", "prompt": "p"},
+        # A caller cannot mark a derived name explicit by writing the key.
+        {"id": "prefix", "name": "sk-live-7f3a9c", "prompt": SECRET_PROMPT,
+         "name_explicit": True},
+        {"id": "script", "name": "backup.sh --token", "no_agent": True,
+         "script": "backup.sh --token abc", "name_explicit": True},
+        {"id": "truthy", "name": "n", "prompt": "p", "name_explicit": "yes"},
+        {"id": "nonstr", "name": 7, "prompt": "p", "name_explicit": True},
+    ],
+    ids=["no_marker", "prompt_prefix", "script_prefix", "truthy_marker", "non_string"],
+)
+def test_name_redacted_unless_explicit(jobs_file, job):
+    _write(jobs_file, {"jobs": [job]})
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+
+
+def test_update_job_ignores_caller_supplied_marker(jobs_file):
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    update_job(job["id"], {"name_explicit": True})
+    assert "name_explicit" not in get_job(job["id"])
+    update_job(job["id"], {"name": "set"})
+    assert get_job(job["id"])["name_explicit"] is True
+    update_job(job["id"], {"name": ""})
+    assert "name_explicit" not in get_job(job["id"])
+
+
+# -- the audit reads every store the scheduler reads ---------------------------
+
+CONTROL_CHAR_STORE = '{"jobs": [{"id": "ctl", "prompt": "line one\nline two"}]}'
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        json.dumps(MIXED),
+        json.dumps(MIXED["jobs"]),
+        json.dumps({"version": 1}),
+        json.dumps({}),
+        CONTROL_CHAR_STORE,
+        "﻿" + json.dumps(MIXED),
+    ],
+    ids=["wrapped", "bare_list", "dict_without_jobs", "empty_dict", "control_chars", "bom"],
+)
+def test_audit_agrees_with_load_jobs(jobs_file, raw):
+    """The audit counts the jobs ``load_jobs()`` (the scheduler's reader)
+    returns, without writing the store the way ``load_jobs()`` may."""
+    from cron.jobs import load_jobs
+
+    jobs_file.write_text(raw, encoding="utf-8")
+    before = _fingerprint(jobs_file)
+    report = cron_unbound_jobs_report()
+    assert _fingerprint(jobs_file) == before
+    assert report["status"] != "unreadable"
+    assert report["total_jobs"] == len(load_jobs())
+
+
+def test_control_character_store_is_audited(jobs_file, capsys):
+    jobs_file.write_text(CONTROL_CHAR_STORE, encoding="utf-8")
+    assert cron_unbound_jobs() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "unbound_jobs_found"
+    assert [job["id"] for job in out["jobs"]] == ["ctl"]
+    assert "line one" not in json.dumps(out)
+
+
+def test_cron_doctor_warns_about_unbound_jobs(jobs_file, capsys):
+    from cron.jobs import create_job
+    from hermes_cli.cron import cron_doctor
+
+    create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    assert cron_doctor() == 0
+    out = capsys.readouterr().out
+    assert "1 job(s) have no recorded toolset bound" in out
+    assert "hermes cron unbound-jobs" in out
+    assert "SECRET_PROMPT_MARKER" not in out
+
+    _write(jobs_file, {"jobs": [{"id": "x", "toolset_bound": ["web"],
+                                 "schedule": {"kind": "interval", "minutes": 60}}]})
+    cron_doctor()
+    assert "no recorded toolset bound" not in capsys.readouterr().out

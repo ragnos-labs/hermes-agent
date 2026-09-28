@@ -2451,6 +2451,12 @@ def create_job(
         job["toolset_bound"] = sorted(
             {str(t).strip() for t in toolset_bound if str(t).strip()}
         )
+    # Mark a name the caller set. Without it the name was derived from the
+    # prompt, skills or script, and readers that must not expose the payload
+    # (``hermes cron unbound-jobs``) withhold it. Absent key = derived or
+    # unknown, so existing and unnamed jobs stay byte-identical.
+    if name and str(name).strip():
+        job["name_explicit"] = True
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2587,6 +2593,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            # ``name_explicit`` follows the name, never the caller: a new
+            # non-empty name sets it, clearing the name clears it, and an
+            # update without a name keeps the stored marker.
+            updated.pop("name_explicit", None)
+            if "name" in updates:
+                _name_explicit = bool(str(updates.get("name") or "").strip())
+            else:
+                _name_explicit = job.get("name_explicit") is True
+            if _name_explicit:
+                updated["name_explicit"] = True
 
             if (
                 is_terminal_job(job)
