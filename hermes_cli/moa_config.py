@@ -488,7 +488,14 @@ def encode_moa_turn(prompt: str, config: Any = None, preset: str | None = None) 
 
 
 def decode_moa_turn(message: Any) -> tuple[str, dict[str, Any] | None]:
-    """Decode a hidden /moa one-shot marker."""
+    """Decode a /moa one-shot marker built by :func:`encode_moa_turn`.
+
+    The payload names its own reference and aggregator providers, and any
+    sender can type the marker. Never apply this to inbound message text:
+    ``run_conversation`` takes a MoA request only through its in-process
+    ``moa_config`` argument, and the CLI, gateway, and TUI ``/moa`` commands
+    switch to the ``moa`` virtual provider using the local config.
+    """
     if not isinstance(message, str) or not message.startswith(MOA_MARKER_PREFIX):
         return message, None
     encoded = message[len(MOA_MARKER_PREFIX):].strip()
@@ -501,7 +508,8 @@ def decode_moa_turn(message: Any) -> tuple[str, dict[str, Any] | None]:
 
 
 def build_moa_turn_prompt(user_prompt: str, config: Any = None, preset: str | None = None) -> str:
-    """Build the hidden one-shot payload used by TUI/gateway routing."""
+    """Build the one-shot marker text. No runtime path decodes it; see
+    :func:`decode_moa_turn`."""
     return encode_moa_turn(user_prompt, config, preset=preset)
 
 
