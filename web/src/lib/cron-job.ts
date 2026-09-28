@@ -39,9 +39,23 @@ function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+export interface CronJobPayloadOptions {
+  /** Edit only: the name the form was pre-filled with. When set, the payload
+   * carries `name` only if the user changed it. */
+  shownName?: string;
+}
+
 /** Build the create/update payload. Optional fields collapse to null so an
- * update explicitly clears them rather than leaving stale values. */
-export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
+ * update explicitly clears them rather than leaving stale values.
+ *
+ * On an edit, pass `shownName`. The shown name of an unnamed job is derived
+ * from its prompt; re-sending it would mark prompt text as an operator-chosen
+ * name, and after another surface changed the prompt the server cannot tell
+ * a stale shown name from a rename. */
+export function buildCronJobPayload(
+  form: CronJobFormState,
+  options: CronJobPayloadOptions = {},
+): CronJobMutation {
   // The `continuity` toggle is stored as the reserved "self" entry in
   // context_from (the job's own previous output). Users never type "self" —
   // the checkbox is the surface; strip any hand-typed variant first.
@@ -50,8 +64,11 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
   );
   if (form.continuity) contextFrom.push("self");
   const enabledToolsets = form.enabled_toolsets.filter(Boolean);
+  const name = form.name.trim();
+  const sendName =
+    options.shownName === undefined || name !== options.shownName.trim();
   return {
-    name: form.name.trim(),
+    ...(sendName ? { name } : {}),
     prompt: form.prompt.trim(),
     schedule: form.schedule.trim(),
     deliver: form.deliver.trim() || "local",

@@ -64,11 +64,10 @@ describe('cronEditorUpdates', () => {
     expect(
       cronEditorUpdates(
         { deliver: 'local', model: '', name: 'Weekly', prompt: '', provider: '', schedule: '0 9 * * 1' },
-        { scriptOnlyJob: true }
+        { scriptOnlyJob: true, shownName: 'Weekly' }
       )
     ).toEqual({
       deliver: 'local',
-      name: 'Weekly',
       schedule: '0 9 * * 1'
     })
   })
@@ -77,7 +76,7 @@ describe('cronEditorUpdates', () => {
     expect(
       cronEditorUpdates(
         { deliver: 'email', model: '', name: 'Weekly', prompt: 'note', provider: '', schedule: '0 9 * * 1' },
-        { scriptOnlyJob: true }
+        { scriptOnlyJob: true, shownName: 'Weekly' }
       ).prompt
     ).toBe('note')
   })
@@ -92,7 +91,7 @@ describe('cronEditorUpdates', () => {
         provider: 'anthropic',
         schedule: '0 9 * * *'
       },
-      { scriptOnlyJob: false }
+      { scriptOnlyJob: false, shownName: 'Daily' }
     )
 
     expect(updates.model).toBe('claude-sonnet-4')
@@ -102,7 +101,7 @@ describe('cronEditorUpdates', () => {
   it('clears a previous pin when the override is reset to default', () => {
     const updates = cronEditorUpdates(
       { deliver: 'local', model: '', name: 'Daily', prompt: 'go', provider: '', schedule: '0 9 * * *' },
-      { scriptOnlyJob: false }
+      { scriptOnlyJob: false, shownName: 'Daily' }
     )
 
     expect(updates.model).toBe(null)
@@ -112,10 +111,42 @@ describe('cronEditorUpdates', () => {
   it('never touches model fields on script-only jobs', () => {
     const updates = cronEditorUpdates(
       { deliver: 'local', model: 'x', name: 'Weekly', prompt: '', provider: 'y', schedule: '0 9 * * 1' },
-      { scriptOnlyJob: true }
+      { scriptOnlyJob: true, shownName: 'Weekly' }
     )
 
     expect('model' in updates).toBe(false)
     expect('provider' in updates).toBe(false)
+  })
+
+  // The shown name of an unnamed job is the first 50 characters of its prompt.
+  const derived = 'sk-live-7f3a9c SECRET_PROMPT_MARKER rotate the va'
+
+  const edit = (name: string, shownName: string) =>
+    cronEditorUpdates(
+      { deliver: 'local', model: '', name, prompt: 'edited prompt', provider: '', schedule: '0 9 * * *' },
+      { scriptOnlyJob: false, shownName }
+    )
+
+  it('omits an unedited name, so a stale derived name is never re-sent', () => {
+    const updates = edit(derived, derived)
+
+    expect('name' in updates).toBe(false)
+    expect(updates.prompt).toBe('edited prompt')
+  })
+
+  it('omits a name that differs from the shown one only by trimmed edges', () => {
+    // JavaScript trim removes U+FEFF; Python str.strip does not.
+    expect('name' in edit(derived, `\ufeff${derived}`)).toBe(false)
+    expect('name' in edit(derived, `  ${derived}\u3000`)).toBe(false)
+    expect('name' in edit(` ${derived} `, derived)).toBe(false)
+  })
+
+  it('sends a real rename, including a case-only one', () => {
+    expect(edit('vault rotation', derived).name).toBe('vault rotation')
+    expect(edit('Vault Rotation', 'vault rotation').name).toBe('Vault Rotation')
+  })
+
+  it('sends a cleared name so the server can clear the marker', () => {
+    expect(edit('', 'vault rotation').name).toBe('')
   })
 })

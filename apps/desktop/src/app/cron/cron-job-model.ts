@@ -68,12 +68,30 @@ export function toggleCronDeliveryTarget(value: string, target: string, checked:
   return targets.filter(candidate => candidate !== target).join(',')
 }
 
-/** Build the API update payload, preserving an empty prompt on script-only jobs. */
-export function cronEditorUpdates(values: CronEditorSaveValues, options: { scriptOnlyJob: boolean }): CronJobUpdates {
+export interface CronEditorUpdateOptions {
+  scriptOnlyJob: boolean
+  /** The name the editor was pre-filled with (the job's shown name). */
+  shownName: string
+}
+
+/**
+ * Build the API update payload, preserving an empty prompt on script-only jobs.
+ *
+ * `name` is sent only when the user changed the name field. The shown name of
+ * an unnamed job is derived from its prompt; re-sending it would mark prompt
+ * text as an operator-chosen name, and after another surface changed the
+ * prompt the server cannot tell a stale shown name from a rename.
+ */
+export function cronEditorUpdates(values: CronEditorSaveValues, options: CronEditorUpdateOptions): CronJobUpdates {
   const updates: CronJobUpdates = {
     deliver: values.deliver,
-    name: values.name,
     schedule: values.schedule.trim()
+  }
+
+  const name = values.name.trim()
+
+  if (name !== options.shownName.trim()) {
+    updates.name = name
   }
 
   const trimmedPrompt = values.prompt.trim()

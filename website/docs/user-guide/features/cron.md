@@ -384,9 +384,9 @@ suppressed until you explicitly `ack`.
 `hermes cron doctor` is a health check over every active job. It is not
 strictly read-only: loading the jobs can create the cron `output/` directory,
 `executions.db` and `.jobs.lock`, and can rewrite `jobs.json` when the store
-is not in the standard wrapped shape. It prints grouped, per-job issues and exits `1` when anything actionable is
-found (`0` when healthy), so it works from a terminal, a watchdog script, or
-a CI-style smoke check:
+is not in the standard wrapped shape. It prints grouped, per-job issues and
+exits `1` when anything actionable is found (`0` when healthy), so it works
+from a terminal, a watchdog script, or a CI-style smoke check:
 
 ```bash
 hermes cron doctor

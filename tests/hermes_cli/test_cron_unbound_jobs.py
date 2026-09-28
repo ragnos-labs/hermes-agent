@@ -363,7 +363,158 @@ def test_desktop_rename_of_unnamed_job_is_shown(jobs_file):
     assert entry["name_redacted"] is False
 
 
-AGENT_PROMPT = "Summarize the deploy notes for AGENT_PROMPT_MARKER each hour"
+# The characters JavaScript's String.prototype.trim removes. The desktop and
+# dashboard editors trim with it, and it removes U+FEFF, which str.strip keeps.
+JS_TRIM_CHARS = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006"
+    "\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+)
+
+
+def _js_editor_edit(job_id, prompt):
+    """An editor that re-sends the shown name trimmed the JavaScript way.
+
+    The desktop and dashboard now send the name only when it was edited,
+    but an older client, or one that opened the job before this change,
+    still re-sends it with every save.
+    """
+    from cron.jobs import get_job, update_job
+
+    shown = get_job(job_id)["name"]
+    update_job(job_id, {"prompt": prompt.strip(JS_TRIM_CHARS),
+                        "name": shown.strip(JS_TRIM_CHARS)})
+
+
+@pytest.mark.parametrize("raw_name", [None, "keep"], ids=["null", "stored"])
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "\ufeff" + SECRET_PROMPT,
+        "\ufeff \ufeff" + SECRET_PROMPT,
+        SECRET_PROMPT[:49] + "\ufeff" + SECRET_PROMPT[49:],
+        SECRET_PROMPT[:48] + " \ufeff" + SECRET_PROMPT[50:],
+    ],
+    ids=["leading_bom", "mixed_leading", "bom_at_49", "space_bom_at_48"],
+)
+def test_bom_edge_in_derived_name_stays_redacted(jobs_file, prompt, raw_name):
+    """U+FEFF at either edge of the derived name is trimmed like whitespace,
+    so the name a JavaScript editor trims and sends back compares equal."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt=prompt, schedule="every 1h")
+    if raw_name is None:
+        _set_raw_name(jobs_file, job["id"], None)
+    shown = get_job(job["id"])["name"]
+    assert shown == shown.strip(JS_TRIM_CHARS)
+    assert "sk-live" in shown
+
+    _js_editor_edit(job["id"], "harmless replacement prompt")
+    _assert_secret_redacted(job["id"])
+
+
+@pytest.mark.parametrize("blank", ["\ufeff", " \ufeff\u3000"], ids=["bom", "mixed"])
+def test_bom_only_name_counts_as_blank(jobs_file, blank):
+    """A name of only U+FEFF and whitespace is blank: it is not marked on
+    create, it clears the marker on update, and the audit withholds it."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h", name=blank)
+    assert "name_explicit" not in get_job(job["id"])
+    assert get_job(job["id"])["name"] == SECRET_PROMPT[:50].strip()
+
+    update_job(job["id"], {"name": "vault rotation"})
+    assert get_job(job["id"])["name_explicit"] is True
+    update_job(job["id"], {"name": blank})
+    assert "name_explicit" not in get_job(job["id"])
+    _assert_secret_redacted(job["id"])
+
+
+def test_audit_withholds_marked_bom_only_name(jobs_file):
+    """A legacy record marked explicit with a U+FEFF-only name, or with a
+    name the BOM-prefixed prompt starts with, is still withheld."""
+    _write(jobs_file, {"jobs": [
+        {"id": "a", "name": "\ufeff ", "prompt": "p", "name_explicit": True},
+        {"id": "b", "name": "sk-live-7f3a9c", "prompt": "\ufeff" + SECRET_PROMPT,
+         "name_explicit": True},
+    ]})
+    for entry in cron_unbound_jobs_report()["jobs"]:
+        assert entry["name"] is None
+        assert entry["name_redacted"] is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [SECRET_PROMPT[:49] + " " + SECRET_PROMPT[49:], "   " + SECRET_PROMPT],
+    ids=["space_at_49", "leading_space"],
+)
+def test_derived_name_is_trimmed(jobs_file, prompt):
+    """Whitespace at the 50-character cut or before the prompt is not part
+    of the derived name, so a trimmed re-send is not a rename. The prompt
+    is written raw because ``create_job`` strips it; a hand-edited or
+    older store can still hold leading whitespace."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    data = json.loads(jobs_file.read_text(encoding="utf-8"))
+    data["jobs"][0].update(prompt=prompt, name=None)
+    jobs_file.write_text(json.dumps(data), encoding="utf-8")
+    assert get_job(job["id"])["name"] == prompt[:50].strip()
+    assert get_job(job["id"])["name"] != prompt[:50]
+
+    _js_editor_edit(job["id"], "harmless replacement prompt")
+    _assert_secret_redacted(job["id"])
+
+
+def test_padded_agent_name_is_shown_trimmed_and_stays_unmarked(jobs_file):
+    """Readers show a stored name trimmed. An editor that re-sends it does
+    not rename, so a padded agent-chosen name is not marked explicit."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h",
+                     name=" vault ", mark_name_explicit=False)
+    assert get_job(job["id"])["name"] == "vault"
+
+    _js_editor_edit(job["id"], "harmless replacement prompt")
+    assert "name_explicit" not in get_job(job["id"])
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+
+
+def test_case_only_rename_is_a_rename(jobs_file):
+    """The name comparison is case-sensitive: a case-only operator rename
+    sets the marker and a case-only agent rename clears it."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h",
+                     name="vault rotation", mark_name_explicit=False)
+    update_job(job["id"], {"name": "Vault Rotation"})
+    assert get_job(job["id"])["name_explicit"] is True
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] == "Vault Rotation"
+
+    update_job(job["id"], {"name": "VAULT ROTATION"}, mark_name_explicit=False)
+    assert "name_explicit" not in get_job(job["id"])
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] is None
+
+
+def test_edit_without_name_after_agent_prompt_change_stays_redacted(jobs_file):
+    """The stale-editor case. The editor opened an unnamed job, an agent
+    then replaced the prompt, and the operator saved a prompt edit. The
+    desktop and dashboard send ``name`` only when it was edited, so the
+    save carries no name and the old derived name is never marked."""
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    _set_raw_name(jobs_file, job["id"], None)
+    update_job(job["id"], {"prompt": "agent replacement prompt"},
+               mark_name_explicit=False)
+    update_job(job["id"], {"prompt": "agent replacement prompt, edited"})
+    _assert_secret_redacted(job["id"])
+
+
+AGENT_PROMPT ="Summarize the deploy notes for AGENT_PROMPT_MARKER each hour"
 
 
 def _agent_cronjob(monkeypatch, args):

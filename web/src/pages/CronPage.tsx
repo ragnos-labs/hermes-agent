@@ -23,6 +23,7 @@ import {
   cronJobHasExecutionContent,
   cronJobFormFromJob,
   type CronJobFormState,
+  type CronJobPayloadOptions,
 } from "@/lib/cron-job";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
 import {
@@ -157,12 +158,18 @@ function editorFormFromJob(job: CronJob): CronJobEditorState {
   return { ...form, scheduleState: parseScheduleString(form.schedule) };
 }
 
-function buildCronJobPayloadFromEditor(form: CronJobEditorState) {
+function buildCronJobPayloadFromEditor(
+  form: CronJobEditorState,
+  options?: CronJobPayloadOptions,
+) {
   const { scheduleState, ...payloadForm } = form;
-  return buildCronJobPayload({
-    ...payloadForm,
-    schedule: buildScheduleString(scheduleState),
-  });
+  return buildCronJobPayload(
+    {
+      ...payloadForm,
+      schedule: buildScheduleString(scheduleState),
+    },
+    options,
+  );
 }
 
 function selectOptions(
@@ -724,7 +731,10 @@ export default function CronPage() {
 
   const handleEdit = async () => {
     if (!editJob) return;
-    const payload = buildCronJobPayloadFromEditor(editForm);
+    // Send the name only when the user edited it (see buildCronJobPayload).
+    const payload = buildCronJobPayloadFromEditor(editForm, {
+      shownName: cronJobFormFromJob(editJob).name,
+    });
     if (
       !payload.schedule ||
       (!payload.no_agent && !cronJobHasExecutionContent(payload))

@@ -650,8 +650,8 @@ def cron_doctor() -> int:
     Not read-only. Loading jobs through ``list_jobs()`` can create the cron
     ``output/`` directory, ``executions.db`` and ``.jobs.lock``, and can
     rewrite ``jobs.json`` when the store is not in the standard wrapped
-    shape. The
-    unbound-jobs warning at the end reads the store without writing.
+    shape. The unbound-jobs warning at the end reads the store without
+    writing.
     """
     from cron.jobs import list_jobs
 
@@ -756,18 +756,21 @@ def _explicit_job_name(job: Dict[str, Any]) -> Optional[str]:
     its name, and a later prompt edit keeps that derived name, so the name
     can carry payload text that no longer matches the prompt. Only a name
     marked ``name_explicit`` by ``create_job`` or ``update_job`` is returned.
-    Anything else (no marker, a legacy job, a non-string name, or a name that
-    is still a prefix of the prompt or script) returns ``None``.
+    Anything else (no marker, a legacy job, a non-string name, a name that
+    is blank after stripping whitespace and U+FEFF, or a name that is still
+    a prefix of the prompt or script) returns ``None``.
     """
+    from cron.jobs import strip_job_name
+
     name = job.get("name")
     if job.get("name_explicit") is not True or not isinstance(name, str):
         return None
-    stripped = name.strip()
+    stripped = strip_job_name(name)
     if not stripped:
         return None
     for field in ("prompt", "script"):
         payload = job.get(field)
-        if isinstance(payload, str) and payload.lstrip().startswith(stripped):
+        if isinstance(payload, str) and strip_job_name(payload).startswith(stripped):
             return None
     return name
 
