@@ -893,18 +893,25 @@ def _run_sequential_tool_execution_middleware(
                     timed_out = True
                     break
                 wait_slice = min(wait_slice, remaining)
-            try:
-                return future.result(timeout=wait_slice)
-            except concurrent.futures.TimeoutError:
-                if agent._interrupt_requested:
-                    interrupted = True
-                    break
-                elapsed = int(time.monotonic() - started)
-                if elapsed - _last_heartbeat >= 30:
-                    _last_heartbeat = elapsed
-                    agent._touch_activity(
-                        f"sequential tool running ({elapsed}s): {function_name}"
-                    )
+            # Wait on completion, not on ``future.result(timeout=...)``. Since
+            # Python 3.11 ``concurrent.futures.TimeoutError`` is the builtin
+            # ``TimeoutError``, so a tool that raised it (a provider read
+            # timeout, ``socket.timeout``) looked like a wait timeout: the loop
+            # spun hot until the deadline and then reported a tool timeout, or
+            # spun forever when no deadline was set. A finished worker now
+            # returns its result or raises its own exception.
+            concurrent.futures.wait([future], timeout=wait_slice)
+            if future.done():
+                return future.result()
+            if agent._interrupt_requested:
+                interrupted = True
+                break
+            elapsed = int(time.monotonic() - started)
+            if elapsed - _last_heartbeat >= 30:
+                _last_heartbeat = elapsed
+                agent._touch_activity(
+                    f"sequential tool running ({elapsed}s): {function_name}"
+                )
 
         if interrupted:
             # Belt-and-braces: interrupt() already fans out to tracked worker
