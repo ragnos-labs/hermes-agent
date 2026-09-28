@@ -147,8 +147,14 @@ class TestF1CommitOverrunWhileHung:
         assert fence.commit_in_flight is False
 
 
-class _KIOnFirstResultFuture:
-    """Future proxy raising on the host's first result() call."""
+class _KIOnFirstPollFuture:
+    """Future proxy raising on the host's first poll of the future.
+
+    The host waits with ``concurrent.futures.wait`` (which reads the inner
+    future's state through ``__getattr__``) and then polls ``done()``, so the
+    injected exception fires from whichever of ``done()`` or ``result()`` the
+    host calls first.
+    """
 
     def __init__(self, inner, exc, gate=None):
         self._inner = inner
@@ -156,7 +162,7 @@ class _KIOnFirstResultFuture:
         self._raised = False
         self._gate = gate
 
-    def result(self, timeout=None):
+    def _raise_once(self):
         if not self._raised:
             self._raised = True
             if self._gate is not None:
@@ -165,6 +171,13 @@ class _KIOnFirstResultFuture:
                 # worker" rather than the queued-job skip path.
                 assert self._gate.wait(timeout=5)
             raise self._exc
+
+    def done(self):
+        self._raise_once()
+        return self._inner.done()
+
+    def result(self, timeout=None):
+        self._raise_once()
         return self._inner.result(timeout=timeout)
 
     def __getattr__(self, name):
@@ -178,7 +191,7 @@ class _InjectingExecutor:
         self._gate = gate
 
     def submit(self, fn, *args, **kwargs):
-        return _KIOnFirstResultFuture(
+        return _KIOnFirstPollFuture(
             self._inner.submit(fn, *args, **kwargs), self._exc, self._gate
         )
 
@@ -222,7 +235,11 @@ class TestF2HostUnwindRevokesAdmission:
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="fallback",
-                idle_timeout_seconds=5.0,
+                # The injected exception fires on the host's first poll,
+                # which follows the first wait slice. A short idle keeps
+                # that slice short; the 5s ceiling keeps the worker's
+                # pre-start deadline gate out of reach on a loaded runner.
+                idle_timeout_seconds=0.2,
                 total_ceiling_seconds=5.0,
             )
 

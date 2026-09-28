@@ -994,6 +994,16 @@ _COMMIT_OVERRUN_WAIT_SLICE_SECONDS = 30.0
 _CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS = 5.0
 
 
+class _CompressionDeadlineBeforeStartError(concurrent.futures.TimeoutError):
+    """Raised by the pre-start gate when the shared deadline already passed.
+
+    A distinct subclass so the host wait loop can route this one expected
+    worker exit onto the timeout path while every other worker exception,
+    including a provider ``TimeoutError`` (``concurrent.futures.TimeoutError``
+    is the builtin since 3.11), propagates to the caller unchanged.
+    """
+
+
 def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
     """Best-effort bounded join of a fence-cancelled compression worker.
 
@@ -1003,6 +1013,15 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
     False for a worker that is still running; the caller must treat it as an
     orphan behind the poison fence.
     """
+    if future.cancelled():
+        # Never started; nothing can be in flight. Checked BEFORE waiting:
+        # when ``future.cancel()`` wins while the item is still queued, the
+        # future stays ``CANCELLED`` (not ``CANCELLED_AND_NOTIFIED``) until
+        # a pool thread dequeues it, and ``concurrent.futures.wait`` does not
+        # count that state as done. With every pool thread busy the wait
+        # would run the full grace and misreport a never-started job as an
+        # orphan.
+        return True
     try:
         grace = max(float(grace_seconds), 0.0)
     except (TypeError, ValueError):
@@ -1017,7 +1036,7 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
     if not done:
         return False
     if future.cancelled():
-        # Never started; nothing can be in flight.
+        # Defensive: another caller cancelled it while this join waited.
         return True
     exc = future.exception()
     if exc is not None:
@@ -1497,7 +1516,7 @@ def run_compress_context_with_progress_timeout(
         # summary work so a stale job never burns an LLM call; its return
         # value is discarded by the already-departed host.
         if worker_fence.deadline_exceeded:
-            raise concurrent.futures.TimeoutError(
+            raise _CompressionDeadlineBeforeStartError(
                 "compression deadline expired before worker start"
             )
         if worker_fence.is_cancelled:
@@ -1573,28 +1592,42 @@ def run_compress_context_with_progress_timeout(
             wait_slice = min(
                 max(idle - since_progress, 0.005), remaining_ceiling
             )
-            try:
-                result = future.result(timeout=wait_slice)
+            # Wait on completion, not on ``future.result(timeout=...)``: a
+            # worker that exits by raising ``TimeoutError`` (a provider read
+            # timeout, ``socket.timeout``) is indistinguishable from a wait
+            # timeout when caught from ``result()``. That made this loop spin
+            # hot until the idle window closed and then report the real
+            # error as a stall.
+            concurrent.futures.wait([future], timeout=wait_slice)
+            if future.done():
+                if not future.cancelled() and isinstance(
+                    future.exception(), _CompressionDeadlineBeforeStartError
+                ):
+                    # The pre-start gate: the shared deadline passed before
+                    # the worker ran. That is a timeout, not a worker error.
+                    break
+                # Success returns; any worker exception propagates through
+                # the ``finally`` below, which revokes commit admission.
+                result = future.result()
                 handled_exit = True
                 return result
-            except concurrent.futures.TimeoutError:
-                waited = time.monotonic() - wait_started
-                since_progress = fence.seconds_since_progress()
-                if (
-                    not fence.deadline_exceeded
-                    and since_progress < idle
-                    and waited < ceiling
-                ):
-                    logger.info(
-                        "Context compression still streaming after %.0fs "
-                        "(last progress %.1fs ago) — extending wait "
-                        "(ceiling %.0fs)",
-                        waited,
-                        since_progress,
-                        ceiling,
-                    )
-                    continue
-                break
+            waited = time.monotonic() - wait_started
+            since_progress = fence.seconds_since_progress()
+            if (
+                not fence.deadline_exceeded
+                and since_progress < idle
+                and waited < ceiling
+            ):
+                logger.info(
+                    "Context compression still streaming after %.0fs "
+                    "(last progress %.1fs ago) — extending wait "
+                    "(ceiling %.0fs)",
+                    waited,
+                    since_progress,
+                    ceiling,
+                )
+                continue
+            break
 
         # F6: a not-yet-started future must not linger as a stale queued job.
         # cancel() is a no-op for a running worker (fence handles that path).
@@ -1685,15 +1718,21 @@ def run_compress_context_with_progress_timeout(
                                 "failed",
                                 exc_info=True,
                             )
-                try:
-                    result = future.result(timeout=remaining)
-                    handled_exit = True
-                    return result
-                except concurrent.futures.TimeoutError:
+                # Same completion-based wait as the pre-commit loop: a commit
+                # that exits by raising ``TimeoutError`` made
+                # ``future.result(timeout=...)`` raise immediately on every
+                # pass, so this loop spun forever logging overrun errors.
+                concurrent.futures.wait([future], timeout=remaining)
+                if not future.done():
                     # Fence progress (commit-phase touch_progress) is
                     # informative only — the commit must complete regardless;
                     # loop and re-report with the updated overrun window.
                     continue
+                # Success returns; a failed commit's exception propagates
+                # through the ``finally`` below.
+                result = future.result()
+                handled_exit = True
+                return result
 
         # Idle-timeout path: cancellation won before the commit boundary.
         # The fence already blocks any future commit; F4 additionally frees
