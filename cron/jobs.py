@@ -2737,6 +2737,11 @@ def update_job(
                 _shown_name = _job_display_name(job)
                 if _job_display_name(updated) != _shown_name:
                     updated["name"] = _shown_name
+                    # The pinned name is derived, never chosen. Drop a stale
+                    # marker (a hand edit or a foreign writer can leave one
+                    # on a blank name) so readers do not treat the old
+                    # prompt prefix as a name the user picked.
+                    updated.pop("name_explicit", None)
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
