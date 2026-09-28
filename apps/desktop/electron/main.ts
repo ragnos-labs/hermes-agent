@@ -12743,9 +12743,7 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
   // vector: a sandboxed iframe with no `allow-popups` and no user gesture can
   // force the OS browser to an attacker URL. No fixed 40.x Electron exists, so
   // we close it at the seam. See electron/window-open-policy.ts.
-  win.webContents.setWindowOpenHandler(
-    createWindowOpenHandler(() => rememberLog('[window-open] denied'))
-  )
+  win.webContents.setWindowOpenHandler(createWindowOpenHandler(() => rememberLog('[window-open] denied')))
   win.webContents.on('will-navigate', (event, url) => {
     if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
       return

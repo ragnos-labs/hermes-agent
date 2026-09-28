@@ -28,16 +28,11 @@ export interface WindowOpenDecision {
 }
 
 export interface WindowOpenWebContentsLike {
-  setWindowOpenHandler(
-    handler: (details: WindowOpenRequestLike) => WindowOpenDecision
-  ): void
+  setWindowOpenHandler(handler: (details: WindowOpenRequestLike) => WindowOpenDecision): void
 }
 
 export interface WindowOpenAppLike {
-  on(
-    event: 'web-contents-created',
-    listener: (event: unknown, contents: WindowOpenWebContentsLike) => void
-  ): unknown
+  on(event: 'web-contents-created', listener: (event: unknown, contents: WindowOpenWebContentsLike) => void): unknown
 }
 
 /**
@@ -72,10 +67,7 @@ export function createWindowOpenHandler(
  * This covers hidden and auxiliary BrowserWindows that do not use the common
  * window wiring, including windows that load arbitrary external pages.
  */
-export function installGlobalWindowOpenPolicy(
-  app: WindowOpenAppLike,
-  onDenied?: (url: string) => void
-): void {
+export function installGlobalWindowOpenPolicy(app: WindowOpenAppLike, onDenied?: (url: string) => void): void {
   app.on('web-contents-created', (_event, contents) => {
     contents.setWindowOpenHandler(createWindowOpenHandler(onDenied))
   })
