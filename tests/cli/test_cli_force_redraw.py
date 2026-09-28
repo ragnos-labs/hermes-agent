@@ -418,6 +418,18 @@ class TestFocusRegainRedraw:
 
         assert calls == ["redraw"]
 
+    def test_first_focus_regain_redraw_fires_on_a_young_clock(self, bare_cli, monkeypatch):
+        """The first report repaints even when the monotonic clock is below
+        ``min_interval`` (a freshly booted CI runner)."""
+        calls = []
+        bare_cli._force_full_redraw = lambda: calls.append("redraw")
+        monkeypatch.setattr(cli_mod.time, "monotonic", lambda: 5.0)
+
+        bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
+        bare_cli._schedule_focus_regain_redraw(min_interval=60.0)
+
+        assert calls == ["redraw"]
+
     def test_focus_regain_redraw_fires_again_after_interval(self, bare_cli):
         calls = []
         bare_cli._force_full_redraw = lambda: calls.append("redraw")

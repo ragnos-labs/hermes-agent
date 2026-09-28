@@ -5990,7 +5990,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         per ``min_interval`` seconds.
         """
         now = time.monotonic()
-        last = getattr(self, "_last_focus_regain_redraw", 0.0)
+        last = getattr(self, "_last_focus_regain_redraw", float("-inf"))
         if now - last < min_interval:
             return
         self._last_focus_regain_redraw = now

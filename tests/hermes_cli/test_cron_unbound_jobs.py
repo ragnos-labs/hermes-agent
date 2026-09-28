@@ -287,6 +287,82 @@ def test_operator_rename_is_shown(jobs_file):
     assert entry["name_redacted"] is False
 
 
+def _set_raw_name(path, job_id, name):
+    """Store ``name`` exactly as given, bypassing ``update_job``. Readers
+    (``get_job``, ``list_jobs``) show a derived name for null or blank."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for job in data["jobs"]:
+        if job["id"] == job_id:
+            job["name"] = name
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _desktop_edit(job_id, prompt):
+    """The desktop editor pre-fills the name ``get_job`` shows and sends it
+    back with the edited prompt."""
+    from cron.jobs import get_job, update_job
+
+    prefilled = get_job(job_id)["name"]
+    update_job(job_id, {"prompt": prompt, "name": prefilled})
+
+
+def _assert_secret_redacted(job_id):
+    from cron.jobs import get_job
+
+    assert "name_explicit" not in get_job(job_id)
+    report = cron_unbound_jobs_report()
+    (entry,) = report["jobs"]
+    assert entry["name"] is None
+    assert entry["name_redacted"] is True
+    text = json.dumps(report)
+    for fragment in ("sk-live", "SECRET_PROMPT_MARKER", "rotate the vault"):
+        assert fragment not in text
+
+
+@pytest.mark.parametrize("raw_name", [None, "", "  "], ids=["null", "empty", "blank"])
+def test_desktop_edit_of_unnamed_job_stays_redacted(jobs_file, raw_name):
+    """A null or blank stored name is shown as the first 50 characters of
+    the prompt. Re-sending that shown name with a new prompt is not a
+    rename, so the old prompt never reaches the audit."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    _set_raw_name(jobs_file, job["id"], raw_name)
+    assert get_job(job["id"])["name"] == SECRET_PROMPT[:50].strip()
+
+    _desktop_edit(job["id"], "harmless replacement prompt")
+    _assert_secret_redacted(job["id"])
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["unnamed", "named"])
+def test_clear_then_desktop_edit_stays_redacted(jobs_file, named):
+    """Clearing the name and then editing the prompt from the desktop
+    editor must not mark the derived name explicit."""
+    from cron.jobs import create_job, update_job
+
+    job = create_job(
+        prompt=SECRET_PROMPT, schedule="every 1h",
+        **({"name": "vault rotation"} if named else {}),
+    )
+    update_job(job["id"], {"name": ""})
+    _desktop_edit(job["id"], "harmless replacement prompt")
+    _assert_secret_redacted(job["id"])
+
+
+def test_desktop_rename_of_unnamed_job_is_shown(jobs_file):
+    """A real rename from the desktop editor is still reported."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    _set_raw_name(jobs_file, job["id"], None)
+    update_job(job["id"], {"prompt": "harmless replacement prompt",
+                           "name": "vault rotation"})
+    assert get_job(job["id"])["name_explicit"] is True
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] == "vault rotation"
+    assert entry["name_redacted"] is False
+
+
 AGENT_PROMPT = "Summarize the deploy notes for AGENT_PROMPT_MARKER each hour"
 
 

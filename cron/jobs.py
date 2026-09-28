@@ -580,6 +580,29 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+def _job_display_name(job: Dict[str, Any]) -> str:
+    """Return the name readers show for ``job`` (``get_job``, ``list_jobs``).
+
+    A stored name that is missing, null or blank is replaced by the first 50
+    characters of the prompt, first skill, script or id. A non-blank stored
+    name is returned stripped. Editors pre-fill this name and send it back,
+    so ``update_job`` compares a new name against it.
+    """
+    normalized = _apply_skill_fields(job)
+    name = _coerce_job_text(normalized.get("name")).strip()
+    if name:
+        return name
+    script = _coerce_job_text(normalized.get("script")).strip()
+    label_source = (
+        _coerce_job_text(normalized.get("prompt"))
+        or (normalized["skills"][0] if normalized.get("skills") else "")
+        or script
+        or _coerce_job_text(normalized.get("id"), "unknown")
+        or "cron job"
+    )
+    return label_source[:50].strip() or "cron job"
+
+
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-safe cron job shape for UI/API/tool/scheduler consumers.
 
@@ -593,18 +616,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized["id"] = job_id
     normalized["prompt"] = prompt
 
-    name = _coerce_job_text(normalized.get("name")).strip()
-    if not name:
-        script = _coerce_job_text(normalized.get("script")).strip()
-        label_source = (
-            prompt
-            or (normalized["skills"][0] if normalized.get("skills") else "")
-            or script
-            or job_id
-            or "cron job"
-        )
-        name = label_source[:50].strip() or "cron job"
-    normalized["name"] = name
+    normalized["name"] = _job_display_name(normalized)
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
 
     # Display state is derived from the scheduler-honoured ``enabled`` flag so a
@@ -2615,18 +2627,21 @@ def update_job(
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
             # ``name_explicit`` follows the name, never the payload. Editors
-            # re-send the stored name with every edit, so only a name that
-            # differs from the stored one counts as a rename: an operator
-            # rename sets the marker, an agent rename clears it, and clearing
-            # the name clears it. Re-sending the stored name, or omitting
-            # the name, keeps the stored marker.
+            # re-send the name they were shown with every edit: the stored
+            # name (stripped), or the name ``get_job`` derives from the
+            # prompt when the stored one is missing, null or blank.
+            # ``_job_display_name`` returns exactly that shown name. Only a
+            # name that differs from it counts as a rename: an operator
+            # rename sets the marker, an agent rename clears it, and
+            # clearing the name clears it. Re-sending the shown name, or
+            # omitting the name, keeps the stored marker.
             updated.pop("name_explicit", None)
             _stored_explicit = job.get("name_explicit") is True
             if "name" in updates:
                 _new_name = str(updates.get("name") or "").strip()
                 if not _new_name:
                     _name_explicit = False
-                elif _new_name == str(job.get("name") or "").strip():
+                elif _new_name == _job_display_name(job):
                     _name_explicit = _stored_explicit
                 else:
                     _name_explicit = bool(mark_name_explicit)
