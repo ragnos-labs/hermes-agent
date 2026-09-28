@@ -1138,8 +1138,10 @@ class HermesACPAgent(acp.Agent):
 
             mcp_off = mcp_disabled_for_platform(load_config(), "acp")
         except Exception:
-            logger.debug("ACP: could not read no_mcp setting", exc_info=True)
-            mcp_off = False
+            # Fail closed: without the setting, client-supplied MCP servers
+            # stay unregistered.
+            logger.warning("ACP: could not read no_mcp setting; ignoring client MCP servers", exc_info=True)
+            mcp_off = True
         if mcp_off:
             # ``agent.no_mcp`` / ``platform_toolsets.acp: [no_mcp]`` also covers
             # servers the ACP client supplies: do not register or expose them.
@@ -2367,10 +2369,31 @@ class HermesACPAgent(acp.Agent):
             from types import SimpleNamespace
             from agent.memory_manager import inject_memory_provider_tools
 
-            toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import (
+                bound_enabled_toolsets,
+                load_disabled_toolsets,
+                merge_disabled_toolsets,
             )
-            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+
+            # List what the session agent may actually call: the same
+            # allowlist cap and denylist its tool snapshot was built with.
+            _cfg = load_config()
+            toolsets = bound_enabled_toolsets(
+                _expand_acp_enabled_toolsets(
+                    getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+                ),
+                _cfg,
+                "acp",
+            )
+            tools = get_tool_definitions(
+                enabled_toolsets=toolsets,
+                disabled_toolsets=merge_disabled_toolsets(
+                    getattr(state.agent, "disabled_toolsets", None),
+                    load_disabled_toolsets(_cfg),
+                ),
+                quiet_mode=True,
+            )
             tool_view = SimpleNamespace(
                 tools=list(tools or []),
                 valid_tool_names={

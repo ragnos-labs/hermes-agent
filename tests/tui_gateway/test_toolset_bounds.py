@@ -107,3 +107,22 @@ def test_preview_agent_default_toolsets(kwargs_env):
     kwargs = server._ephemeral_preview_agent_kwargs(_parent_agent(disabled_toolsets=None), "task-1")
 
     assert kwargs["enabled_toolsets"] == ["terminal", "file"]
+
+
+def test_enabled_toolsets_fail_closed_when_config_unreadable(env):
+    def broken():
+        raise RuntimeError("config unreadable")
+
+    env.setattr(server, "_load_cfg", broken)
+    assert server._load_enabled_toolsets("tui") == []
+
+
+def test_disabled_toolsets_fail_closed_when_config_unreadable(env):
+    import hermes_cli.tools_config as tc
+
+    def broken(*a, **k):
+        raise RuntimeError("config unreadable")
+
+    env.setattr(tc, "load_disabled_toolsets", broken)
+    with pytest.raises(RuntimeError):
+        server._tui_disabled_toolsets()

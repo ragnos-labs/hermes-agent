@@ -24417,7 +24417,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         than trusted. When absent, falls back to standard
         ``platform_toolsets.<platform>`` resolution.
         """
-        from hermes_cli.tools_config import _get_platform_tools, mcp_disabled_for_platform
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            bound_enabled_toolsets,
+            mcp_disabled_for_platform,
+        )
 
         override = None
         try:
@@ -24441,7 +24445,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 route_toolsets.append("no_mcp")
             pts[platform_key] = route_toolsets
             cfg["platform_toolsets"] = pts
-            return sorted(_get_platform_tools(cfg, platform_key))
+            # The route list is still capped by the platform's configured
+            # allowlist (its own entry, else ``cli``): a route cannot grant a
+            # toolset the platform itself may not have.
+            return sorted(
+                bound_enabled_toolsets(
+                    sorted(_get_platform_tools(cfg, platform_key)),
+                    user_config,
+                    platform_key,
+                )
+                or []
+            )
 
         return sorted(_get_platform_tools(user_config, platform_key))
 
@@ -32609,6 +32623,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # platforms. Set here (not at module import) so incidental imports of
     # gateway.run from CLI/tool code do not poison HERMES_EXEC_ASK.
     os.environ["HERMES_EXEC_ASK"] = "1"
+
+    # Refuse to start when governance is required but its plugin is not loaded.
+    from hermes_cli.governance_startup import governance_startup_error
+
+    _governance_error = governance_startup_error()
+    if _governance_error is not None:
+        logger.error("Gateway refused to start: %s", _governance_error["message"])
+        print(f"Gateway refused to start: {_governance_error['message']}", file=sys.stderr)
+        return False
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
 

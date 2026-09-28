@@ -159,7 +159,7 @@ class TestWebhookRouteBounds:
         assert "file" in res
 
     def test_route_keeps_platform_no_mcp(self):
-        cfg = dict(MCP_CFG, platform_toolsets={"webhook": ["web", "no_mcp"]})
+        cfg = dict(MCP_CFG, platform_toolsets={"webhook": ["web", "file", "no_mcp"]})
         res = _resolve_route(cfg, ["file", "finnhub"])
         assert "file" in res
         assert not (MCP_NAMES & set(res))
@@ -172,6 +172,11 @@ class TestWebhookRouteBounds:
     def test_route_gets_mcp_without_no_mcp(self):
         res = _resolve_route(_cfg(), ["file", "finnhub"])
         assert "finnhub" in res
+
+    def test_route_capped_by_platform_allowlist(self):
+        cfg = dict(MCP_CFG, platform_toolsets={"webhook": ["web", "no_mcp"]})
+        res = _resolve_route(cfg, ["file", "web"])
+        assert res == ["web"]
 
     def test_route_does_not_mutate_config(self):
         cfg = dict(MCP_CFG, platform_toolsets={"webhook": ["web", "no_mcp"]})
@@ -188,8 +193,12 @@ class TestCronPerJobBounds:
         assert got == ["web"]
 
     def test_cron_platform_no_mcp_applies_to_per_job_list(self):
-        cfg = dict(MCP_CFG, platform_toolsets={"cron": ["web", "no_mcp"]})
+        cfg = dict(MCP_CFG, platform_toolsets={"cron": ["web", "file", "no_mcp"]})
         assert _merge_mcp_into_per_job_toolsets(["file"], cfg) == ["file"]
+
+    def test_cron_per_job_list_capped_by_platform_allowlist(self):
+        cfg = dict(MCP_CFG, platform_toolsets={"cron": ["web", "no_mcp"]})
+        assert _merge_mcp_into_per_job_toolsets(["file", "web"], cfg) == ["web"]
 
     def test_disabled_toolsets_removed_when_mcp_off(self):
         got = _merge_mcp_into_per_job_toolsets(

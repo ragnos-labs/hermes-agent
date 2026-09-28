@@ -1933,19 +1933,28 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     result_meta["model"] = _model_name
     result_meta["provider"] = _resolved_provider or ""
 
-    # ``agent.disabled_toolsets`` binds the curator like every other agent.
-    # The curator's only toolset is ``skills``; when that is disabled there is
-    # nothing it may do, so skip the model pass instead of running it toolless.
+    # The configured toolset bounds bind the curator like every other agent:
+    # ``agent.disabled_toolsets`` and the allowlist cap (the ``curator``
+    # entry in ``platform_toolsets``, else ``cli``). The curator's only
+    # toolset is ``skills``; when the bounds remove it there is nothing it may
+    # do, so skip the model pass instead of running it toolless.
     try:
-        from hermes_cli.tools_config import load_disabled_toolsets
+        from hermes_cli.config import load_config as _load_curator_config
+        from hermes_cli.tools_config import bound_enabled_toolsets, load_disabled_toolsets
 
-        _disabled_toolsets = load_disabled_toolsets()
+        _curator_cfg = _load_curator_config()
+        _disabled_toolsets = load_disabled_toolsets(_curator_cfg)
+        _enabled_toolsets = bound_enabled_toolsets(["skills"], _curator_cfg, "curator")
     except Exception as e:
-        result_meta["error"] = f"could not load agent.disabled_toolsets: {e}"
+        result_meta["error"] = f"could not load the configured toolset bounds: {e}"
         result_meta["summary"] = result_meta["error"]
         return result_meta
     if "skills" in (_disabled_toolsets or []):
         result_meta["error"] = "skipped: the skills toolset is in agent.disabled_toolsets"
+        result_meta["summary"] = result_meta["error"]
+        return result_meta
+    if "skills" not in (_enabled_toolsets or []):
+        result_meta["error"] = "skipped: the skills toolset is outside the configured toolset allowlist"
         result_meta["summary"] = result_meta["error"]
         return result_meta
 
@@ -1966,7 +1975,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
             **_agent_kwargs,
-            enabled_toolsets=["skills"],
+            enabled_toolsets=_enabled_toolsets,
             disabled_toolsets=_disabled_toolsets,
             # ``terminal`` was deliberately removed from this fork (issue
             # #96962): a terminal ``mv``/``cp``/``rm`` under the skills tree

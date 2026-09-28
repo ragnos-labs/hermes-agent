@@ -6010,34 +6010,41 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
 
 
 def _tui_disabled_toolsets() -> list[str] | None:
-    """``agent.disabled_toolsets`` for agents this gateway builds."""
+    """``agent.disabled_toolsets`` for agents this gateway builds.
+
+    Fails closed: when the list cannot be read, no agent is built rather than
+    one that silently ignores the denylist.
+    """
     try:
         from hermes_cli.tools_config import load_disabled_toolsets
 
         return load_disabled_toolsets(_load_cfg())
-    except Exception:
-        logger.debug("[tui] could not load agent.disabled_toolsets", exc_info=True)
-        return None
+    except Exception as exc:
+        logger.warning("[tui] could not load agent.disabled_toolsets", exc_info=True)
+        raise RuntimeError(
+            f"could not load agent.disabled_toolsets; refusing to build an agent: {exc}"
+        ) from exc
 
 
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
     """Resolve the session's toolsets, then apply the configured bounds.
 
-    The bounds (``agent.disabled_toolsets`` and ``no_mcp``) are applied AFTER
-    the client-surface toolsets, the coding posture and any
-    ``HERMES_TUI_TOOLSETS`` pin are folded in, so none of those additions can
-    bring back a toolset the config removed. ``None`` (every toolset) is left
-    as is; the agent still receives ``disabled_toolsets`` and subtracts those
-    tools itself.
+    The bounds (the ``cli`` allowlist cap, ``agent.disabled_toolsets`` and
+    ``no_mcp``) are applied AFTER the client-surface toolsets, the coding
+    posture and any ``HERMES_TUI_TOOLSETS`` pin are folded in, so none of
+    those additions can bring back a toolset the config removed. ``None``
+    (every toolset, e.g. ``HERMES_TUI_TOOLSETS=all``) is capped to the
+    allowlist too. Fails closed: when the bounds cannot be applied the
+    session gets no toolsets.
     """
-    enabled = _load_enabled_toolsets_unbounded(platform)
     try:
         from hermes_cli.tools_config import bound_enabled_toolsets
 
+        enabled = _load_enabled_toolsets_unbounded(platform)
         return bound_enabled_toolsets(enabled, _load_cfg(), "cli")
     except Exception:
-        logger.debug("[tui] could not apply toolset bounds", exc_info=True)
-        return enabled
+        logger.warning("[tui] could not apply toolset bounds; no toolsets enabled", exc_info=True)
+        return []
 
 
 def _load_enabled_toolsets_unbounded(platform: str | None = None) -> list[str] | None:

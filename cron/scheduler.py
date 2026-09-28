@@ -591,20 +591,19 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     )
 
     result = [t for t in per_job if t != "no_mcp"]
-    if "no_mcp" in per_job:
-        return result
-    # The per-job list replaces the ``cron`` platform list, but the platform's
-    # ``no_mcp`` opt-out and the global ``agent.no_mcp`` still apply: strip
-    # MCP servers (including any the job names) instead of merging them in.
-    if mcp_disabled_for_platform(cfg, "cron"):
+    # The per-job list replaces the ``cron`` platform list, but it stays
+    # inside the configured allowlist (the ``cron`` entry, else ``cli``) and
+    # the platform's ``no_mcp`` opt-out and the global ``agent.no_mcp`` still
+    # apply: strip MCP servers (including any the job names) instead of
+    # merging them in.
+    if "no_mcp" in per_job or mcp_disabled_for_platform(cfg, "cron"):
         return bound_enabled_toolsets(result, cfg, "cron") or []
     enabled_mcp = enabled_mcp_server_names(cfg)
-    if set(result) & enabled_mcp:
-        return result
-    for name in sorted(enabled_mcp):
-        if name not in result:
-            result.append(name)
-    return result
+    if not set(result) & enabled_mcp:
+        for name in sorted(enabled_mcp):
+            if name not in result:
+                result.append(name)
+    return bound_enabled_toolsets(result, cfg, "cron") or []
 
 
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:

@@ -100,3 +100,46 @@ async def test_mcp_refresh_keeps_disabled_toolsets(monkeypatch):
         await agent._register_session_mcp_servers(state, [server])
 
     assert mock_defs.call_args.kwargs["disabled_toolsets"] == ["web"]
+
+
+@pytest.mark.asyncio
+async def test_client_mcp_servers_ignored_when_setting_unreadable(monkeypatch):
+    """Fail closed: an unreadable no_mcp setting keeps client MCP servers off."""
+    from acp.schema import McpServerStdio
+
+    def broken_config():
+        raise RuntimeError("config unreadable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", broken_config)
+    manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd="/tmp")
+    state.agent.enabled_toolsets = ["hermes-acp"]
+    state.agent.disabled_toolsets = None
+
+    server = McpServerStdio(name="srv", command="/bin/test", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register:
+        await agent._register_session_mcp_servers(state, [server])
+
+    mock_register.assert_not_called()
+
+
+def test_tools_command_lists_only_bounded_tools(monkeypatch):
+    """/tools uses the same allowlist cap and denylist as the session agent."""
+    cfg = {
+        "agent": {"disabled_toolsets": ["memory"]},
+        "platform_toolsets": {"cli": ["file", "memory"]},
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd="/tmp")
+    state.agent.enabled_toolsets = ["hermes-acp"]
+    state.agent.disabled_toolsets = ["search"]
+
+    with patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+        agent._cmd_tools("", state)
+
+    kwargs = mock_defs.call_args.kwargs
+    assert kwargs["enabled_toolsets"] == ["file"]
+    assert set(kwargs["disabled_toolsets"]) == {"memory", "search"}

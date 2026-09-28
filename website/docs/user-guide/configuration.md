@@ -839,11 +839,34 @@ refresh, the TUI and desktop gateway (after the surface toolsets are added),
 background and preview agents, the API server, the gateway `/compress` agent and the
 skills curator. The curator skips its run when `skills` is in the list.
 
+### Allowlist cap
+
+A platform's `platform_toolsets` entry is also a cap. Every agent Hermes
+builds for that platform gets at most the toolsets its entry lists, whatever
+else asks for more: a `hermes-<platform>` default, a composite such as
+`hermes-acp`, a webhook route's own toolset list, a cron job's per-job list,
+the `HERMES_TUI_TOOLSETS` pin (including `all`) or an unbounded ("all
+toolsets") request. A platform with no entry of its own is capped by the
+`cli` entry. When neither the platform nor `cli` has an entry, nothing is
+capped. The skills curator is capped by the `cli` entry and skips its run
+when `skills` falls outside it.
+
+```yaml
+platform_toolsets:
+  cli: [file, search, todo]     # caps cli and every platform without its own entry
+  webhook: [file, search]       # a route asking for web or terminal gets neither
+```
+
+A composite is kept only when the cap covers all of its tools; otherwise it is
+replaced by the cap toolsets it fully contains. MCP servers are on by default
+(upstream behavior), so an MCP server passes the cap unless the entry (or the
+`cli` fallback) lists `no_mcp`, or `agent.no_mcp` is set.
+
 ### Turning MCP off everywhere
 
 `no_mcp` in a platform's `platform_toolsets` entry keeps MCP server tools off
-that platform. To keep them off every platform, including plugin platforms
-that have no `platform_toolsets` entry, set:
+that platform. A platform with no entry of its own follows `no_mcp` in the
+`cli` entry. To keep them off every platform, whatever their entries say, set:
 
 ```yaml
 agent:
@@ -1954,10 +1977,10 @@ Example footer when writes are blocked:
 ```
 ⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
   • ~/.hermes/cron/jobs.json — [patch] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
-  • ~/.hermes/scripts/monitor.py — [write_file] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
+  • ~/.hermes/skills/monitor/SKILL.md — [write_file] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
 ```
 
-If writes to Hermes state (cron jobs, skills, scripts under `~/.hermes/`) are failing, check whether `HERMES_WRITE_SAFE_ROOT` is set in your environment. For cron changes, use the `cronjob` tool or `hermes cron edit` instead of patching `jobs.json` directly.
+If writes to Hermes state (cron jobs, skills under `~/.hermes/`) are failing, check whether `HERMES_WRITE_SAFE_ROOT` is set in your environment. For cron changes, use the `cronjob` tool or `hermes cron edit` instead of patching `jobs.json` directly.
 
 ### UI language for static messages
 
