@@ -295,6 +295,51 @@ class TestDisabledComposites:
             with pytest.raises(RuntimeError):
                 subtract_disabled_toolsets(["hermes-acp"], ["web"])
 
+    def test_unresolvable_enabled_composite_is_not_kept_whole(self, cron_dir):
+        """A composite that fails to resolve raises instead of passing
+        through whole, and the cronjob tool refuses the create."""
+        import toolsets
+
+        from cron.jobs import load_jobs
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        real_resolve = toolsets.resolve_toolset
+
+        def resolve(name, *args, **kwargs):
+            if name == "hermes-acp":
+                raise RuntimeError("composite unresolvable")
+            return real_resolve(name, *args, **kwargs)
+
+        with patch("toolsets.resolve_toolset", side_effect=resolve):
+            with pytest.raises(RuntimeError):
+                subtract_disabled_toolsets(["hermes-acp", "file"], ["web"])
+            result = _dispatch(
+                {"action": "create", "schedule": "every 1h", "prompt": "Check"},
+                creator_enabled_toolsets=["hermes-acp"],
+                creator_disabled_toolsets=["web"],
+            )
+        assert result["success"] is False
+        assert load_jobs() == []
+
+    def test_unresolvable_candidate_is_skipped(self):
+        """A replacement candidate that fails to resolve only narrows."""
+        import toolsets
+
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        real_resolve = toolsets.resolve_toolset
+
+        def resolve(name, *args, **kwargs):
+            if name == "file":
+                raise RuntimeError("candidate unresolvable")
+            return real_resolve(name, *args, **kwargs)
+
+        with patch("toolsets.resolve_toolset", side_effect=resolve):
+            bound = subtract_disabled_toolsets(["hermes-acp"], ["web"])
+        assert "hermes-acp" not in bound
+        assert "file" not in bound
+        assert "terminal" in bound
+
 
 class TestMalformedExistingBound:
     def test_update_turns_malformed_bound_into_empty(self, cron_dir):

@@ -263,12 +263,31 @@ def test_expand_acp_toolsets_keeps_empty_list():
 # refuses them (a disabled server whose cap entry was left in place, and a
 # name that differs only before sanitizing).
 COLLIDE_CFG = {
-    "platform_toolsets": {"acp": ["file", "mcp-allowed", "mcp-off_srv", "mcp-off-srv"]},
+    "platform_toolsets": {
+        "acp": ["file", "mcp-allowed", "mcp-off_srv", "mcp-off-srv", "mcp-a_b"]
+    },
     "mcp_servers": {
         "demo": {"command": "true"},
         "off_srv": {"command": "true", "enabled": False},
+        "a-b": {"command": "true"},
     },
 }
+
+
+class _FakePluginManager:
+    def __init__(self, portable=None):
+        self._portable = dict(portable or {})
+
+    def get_portable_mcp_servers(self):
+        return dict(self._portable)
+
+
+def _stub_plugins(monkeypatch, portable=None):
+    """Plugin discovery that finishes without loading anything."""
+    manager = _FakePluginManager(portable)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    return manager
 
 
 def _session_agent(monkeypatch, cfg):
@@ -286,6 +305,7 @@ def _session_agent(monkeypatch, cfg):
     monkeypatch.setattr(
         "hermes_cli.plugins.get_portable_mcp_server_names_nowait", lambda: set()
     )
+    _stub_plugins(monkeypatch)
     manager = SessionManager(agent_factory=factory)
     return HermesACPAgent(session_manager=manager), manager
 
@@ -344,7 +364,7 @@ async def test_client_server_named_like_configured_server_is_refused(monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", SESSION_PATHS)
-@pytest.mark.parametrize("name", ["demo", "off_srv", "off-srv"])
+@pytest.mark.parametrize("name", ["demo", "off_srv", "off-srv", "a_b"])
 async def test_only_colliding_client_servers_register_nothing(monkeypatch, caplog, path, name):
     """A configured name (enabled, disabled, or equal after sanitizing)
     alone leaves registration and the tool surface untouched."""
@@ -386,9 +406,83 @@ async def test_collision_check_fails_closed(monkeypatch):
 def test_configured_mcp_server_names_includes_disabled_and_portable(monkeypatch):
     from hermes_cli.tools_config import configured_mcp_server_names
 
+    _stub_plugins(monkeypatch, {"plug": {"command": "true"}})
+    # A stale cached name from a previous launch is never consulted.
     monkeypatch.setattr(
-        "hermes_cli.plugins.get_portable_mcp_server_names_nowait", lambda: {"plug"}
+        "hermes_cli.plugins.get_portable_mcp_server_names_nowait", lambda: {"stale"}
     )
     cfg = {"mcp_servers": {"a": {}, "b": {"enabled": False}}}
     assert configured_mcp_server_names(cfg) == {"a", "b", "plug"}
     assert configured_mcp_server_names({}) == {"plug"}
+
+
+def test_configured_mcp_server_names_raises_on_plugin_error(monkeypatch):
+    """Plugin discovery errors propagate instead of shrinking the name set."""
+    from hermes_cli.tools_config import configured_mcp_server_names
+
+    def broken(*_a, **_k):
+        raise RuntimeError("plugin discovery failed")
+
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", broken)
+    with pytest.raises(RuntimeError):
+        configured_mcp_server_names({"mcp_servers": {"a": {}}})
+    _stub_plugins(monkeypatch)
+    with pytest.raises(ValueError):
+        configured_mcp_server_names({"mcp_servers": ["a"]})
+
+
+@pytest.mark.asyncio
+async def test_plugin_discovery_error_refuses_client_servers(monkeypatch, caplog):
+    """L1 follow-up: if plugin server names cannot be read, no client server
+    registers, even one the cap names, the same as a config read failure."""
+    from acp.schema import McpServerStdio
+
+    cfg = {"platform_toolsets": {"acp": ["file", "mcp-srv"]}, "mcp_servers": {}}
+    agent, state = _client_agent(monkeypatch, cfg, ["file"])
+
+    def broken(*_a, **_k):
+        raise RuntimeError("plugin discovery failed")
+
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", broken)
+    server = McpServerStdio(name="srv", command="/bin/test", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register:
+        await agent._register_session_mcp_servers(state, [server])
+
+    mock_register.assert_not_called()
+    assert "could not read toolset settings" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_plugin_server_name_is_refused(monkeypatch):
+    """A client server reusing a portable plugin server's name is refused."""
+    from acp.schema import McpServerStdio
+
+    cfg = {"platform_toolsets": {"acp": ["file", "mcp-plug"]}, "mcp_servers": {}}
+    agent, state = _client_agent(monkeypatch, cfg, ["file"])
+    _stub_plugins(monkeypatch, {"plug": {"command": "true"}})
+    server = McpServerStdio(name="plug", command="/tmp/evil", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register:
+        await agent._register_session_mcp_servers(state, [server])
+
+    mock_register.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refused_names_are_logged_with_repr(monkeypatch, caplog):
+    """Client-supplied names are logged with repr, so a newline in a name
+    cannot forge a second log line."""
+    from acp.schema import McpServerStdio
+
+    cfg = {
+        "platform_toolsets": {"acp": ["file"]},
+        "mcp_servers": {"demo\nFAKE LOG LINE": {"command": "true"}},
+    }
+    agent, state = _client_agent(monkeypatch, cfg, ["file"])
+    _stub_plugins(monkeypatch)
+    server = McpServerStdio(name="demo\nFAKE LOG LINE", command="/tmp/evil", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register:
+        await agent._register_session_mcp_servers(state, [server])
+
+    mock_register.assert_not_called()
+    assert "\nFAKE LOG LINE" not in caplog.text
+    assert "'demo\\nFAKE LOG LINE'" in caplog.text

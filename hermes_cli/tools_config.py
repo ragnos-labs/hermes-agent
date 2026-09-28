@@ -2645,11 +2645,20 @@ def configured_mcp_server_names(config: dict) -> Set[str]:
     client supplies must not reuse one of these names: the allowlist cap
     admits configured server names, so a reused name would carry the
     client's own command or URL through the cap.
+
+    Fails closed: unlike ``enabled_mcp_server_names``, plugin discovery runs
+    to completion (no cached names from a previous launch) and its errors
+    propagate, as does an ``mcp_servers`` value that is not a mapping, so the
+    caller refuses client servers instead of checking against a partial set.
     """
-    names = set(enabled_mcp_server_names(config))
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
     mcp_servers = (config or {}).get("mcp_servers") or {}
-    if isinstance(mcp_servers, dict):
-        names |= {str(name) for name in mcp_servers}
+    if not isinstance(mcp_servers, dict):
+        raise ValueError("mcp_servers is not a mapping")
+    names = {str(name) for name in mcp_servers}
+    discover_plugins()
+    names |= {str(name) for name in get_plugin_manager().get_portable_mcp_servers()}
     return names
 
 
@@ -2709,8 +2718,13 @@ def subtract_disabled_toolsets(
     by every known toolset it fully covers once the disabled tools are
     removed, so a composite never carries a disabled tool through by name.
     Names that resolve to no tools (MCP servers not yet registered, unknown
-    names) are kept unless disabled by name.
+    names) are kept unless disabled by name. An enabled name that is a known
+    toolset but fails to resolve raises, so the caller refuses instead of
+    keeping the composite whole. A replacement candidate that fails to
+    resolve is skipped, which only narrows the result.
     """
+    from toolsets import resolve_toolset, validate_toolset
+
     drop_names = {str(t) for t in disabled_toolsets or []}
     enabled = [str(t) for t in enabled_toolsets]
     if not drop_names:
@@ -2721,7 +2735,7 @@ def subtract_disabled_toolsets(
     for name in enabled:
         if name in drop_names:
             continue
-        tools = _toolset_tools(name)
+        tools = set(resolve_toolset(name)) if validate_toolset(name) else set()
         if not (tools & drop_tools):
             kept.add(name)
             continue

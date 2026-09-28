@@ -1146,7 +1146,9 @@ class HermesACPAgent(acp.Agent):
             # operator configured. The cap admits configured server names,
             # so a reused name would register the client's own command or
             # URL under the operator's server. Compare the sanitized form
-            # too, because tool names are built from it.
+            # too, because tool names are built from it. If configured or
+            # plugin server names cannot be read, this raises and the
+            # handler below refuses every client server.
             configured = configured_mcp_server_names(cfg)
             configured_keys = configured | {
                 sanitize_mcp_name_component(name) for name in configured
@@ -1161,13 +1163,15 @@ class HermesACPAgent(acp.Agent):
             )
             if colliding:
                 # Names only: the client's command, URL, env and headers
-                # can carry credentials and are never logged.
+                # can carry credentials and are never logged. The names are
+                # client-supplied, so they are logged with repr to keep
+                # control characters and newlines out of the log line.
                 logger.warning(
                     "Session %s: refusing %d ACP-provided MCP server(s) whose "
-                    "names match configured MCP servers: %s",
+                    "names match configured MCP servers: %r",
                     state.session_id,
                     len(colliding),
-                    ", ".join(colliding),
+                    colliding,
                 )
                 mcp_servers = [
                     server for server in mcp_servers if server.name not in colliding
