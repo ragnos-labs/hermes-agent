@@ -6009,7 +6009,45 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     return surfaces
 
 
+def _tui_disabled_toolsets() -> list[str] | None:
+    """``agent.disabled_toolsets`` for agents this gateway builds.
+
+    Fails closed: when the list cannot be read, no agent is built rather than
+    one that silently ignores the denylist.
+    """
+    try:
+        from hermes_cli.tools_config import load_disabled_toolsets
+
+        return load_disabled_toolsets(_load_cfg())
+    except Exception as exc:
+        logger.warning("[tui] could not load agent.disabled_toolsets", exc_info=True)
+        raise RuntimeError(
+            f"could not load agent.disabled_toolsets; refusing to build an agent: {exc}"
+        ) from exc
+
+
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
+    """Resolve the session's toolsets, then apply the configured bounds.
+
+    The bounds (the ``cli`` allowlist cap, ``agent.disabled_toolsets`` and
+    ``no_mcp``) are applied AFTER the client-surface toolsets, the coding
+    posture and any ``HERMES_TUI_TOOLSETS`` pin are folded in, so none of
+    those additions can bring back a toolset the config removed. ``None``
+    (every toolset, e.g. ``HERMES_TUI_TOOLSETS=all``) is capped to the
+    allowlist too. Fails closed: when the bounds cannot be applied the
+    session gets no toolsets.
+    """
+    try:
+        from hermes_cli.tools_config import bound_enabled_toolsets
+
+        enabled = _load_enabled_toolsets_unbounded(platform)
+        return bound_enabled_toolsets(enabled, _load_cfg(), "cli")
+    except Exception:
+        logger.warning("[tui] could not apply toolset bounds; no toolsets enabled", exc_info=True)
+        return []
+
+
+def _load_enabled_toolsets_unbounded(platform: str | None = None) -> list[str] | None:
     session_platform = platform or _resolve_session_platform()
     explicit = [
         item.strip()
@@ -8604,6 +8642,12 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         # their toolsets against that same platform rather than the gateway
         # process's, so they never carry GUI schema they cannot use.
         or _load_enabled_toolsets("tui"),
+        # The parent's denylist plus the current config: a background or
+        # preview agent never gets a toolset the config disables.
+        "disabled_toolsets": _merge_disabled_toolsets(
+            getattr(agent, "disabled_toolsets", None),
+            _tui_disabled_toolsets(),
+        ),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -8628,11 +8672,30 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
     }
 
 
+def _merge_disabled_toolsets(*lists) -> list[str] | None:
+    from hermes_cli.tools_config import merge_disabled_toolsets
+
+    return merge_disabled_toolsets(*[x if isinstance(x, (list, tuple)) else None for x in lists])
+
+
 def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     kwargs = _background_agent_kwargs(agent, task_id)
+    disabled = set(kwargs.get("disabled_toolsets") or [])
+    wanted = [ts for ts in ("terminal", "file") if ts not in disabled]
+    try:
+        from hermes_cli.tools_config import bound_enabled_toolsets
+
+        # The preview agent gets no toolset the ``cli`` allowlist cap
+        # leaves out; fails closed to no toolsets.
+        enabled = bound_enabled_toolsets(wanted, _load_cfg(), "cli") or []
+    except Exception:
+        logger.warning("[tui] could not apply toolset bounds to preview agent", exc_info=True)
+        enabled = []
     kwargs.update(
         {
-            "enabled_toolsets": ["terminal", "file"],
+            # ``disabled_toolsets`` from _background_agent_kwargs still applies,
+            # so a config that disables ``terminal`` leaves this agent without it.
+            "enabled_toolsets": enabled,
             "session_db": None,
             "skip_memory": True,
         }
@@ -9104,6 +9167,7 @@ def _make_agent(
             else _load_service_tier()
         ),
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        disabled_toolsets=_tui_disabled_toolsets(),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.

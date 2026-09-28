@@ -3116,7 +3116,11 @@ class APIServerAdapter(BasePlatformAdapter):
             _load_gateway_config,
             GatewayRunner,
         )
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            bound_enabled_toolsets,
+            load_disabled_toolsets,
+        )
 
         # Catch RuntimeError ONLY around this call, not the wider
         # _create_agent()+run_conversation() span --
@@ -3344,7 +3348,15 @@ class APIServerAdapter(BasePlatformAdapter):
             from gateway.hosted_room_execution_policy import RoomExecutionPolicy
 
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
-            enabled_toolsets = list(policy.enabled_toolsets)
+            # A room policy never widens past the api_server cap. The
+            # zero-tool ``bot_room`` marker is dropped unless the cap names
+            # it, which removes no callable tool.
+            enabled_toolsets = (
+                bound_enabled_toolsets(
+                    list(policy.enabled_toolsets), user_config, "api_server"
+                )
+                or []
+            )
             max_iterations = policy.max_iterations
 
         # Load fallback provider chain so the API server platform has the
@@ -3378,6 +3390,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": load_disabled_toolsets(user_config),
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,

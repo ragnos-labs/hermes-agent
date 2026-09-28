@@ -21187,11 +21187,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 from hermes_cli.config import load_config as _load_cfg
                                 from utils import is_truthy_value as _is_truthy
 
+                                from hermes_cli.tools_config import bound_enabled_toolsets
+
+                                _hyg_cfg = _load_cfg() or {}
                                 _hyg_checkpoint_required = _is_truthy(
-                                    ((_load_cfg() or {}).get("compression") or {}).get(
+                                    (_hyg_cfg.get("compression") or {}).get(
                                         "checkpoint_required"
                                     ),
                                     default=False,
+                                )
+                                # Memory only when the source platform's
+                                # allowlist cap permits it.
+                                _hyg_toolsets = (
+                                    bound_enabled_toolsets(
+                                        ["memory"],
+                                        _hyg_cfg,
+                                        _platform_config_key(source.platform)
+                                        if source.platform
+                                        else None,
+                                    )
+                                    or []
                                 )
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
@@ -21199,7 +21214,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     max_iterations=4,
                                     quiet_mode=True,
                                     skip_memory=not _hyg_checkpoint_required,
-                                    enabled_toolsets=["memory"],
+                                    enabled_toolsets=_hyg_toolsets,
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
                                 )
@@ -24417,7 +24432,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         than trusted. When absent, falls back to standard
         ``platform_toolsets.<platform>`` resolution.
         """
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import (
+            _get_platform_tools,
+            bound_enabled_toolsets,
+            mcp_disabled_for_platform,
+        )
 
         override = None
         try:
@@ -24430,9 +24449,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if override and isinstance(override, list):
             cfg = dict(user_config)
             pts = dict(cfg.get("platform_toolsets") or {})
-            pts[platform_key] = [str(t) for t in override]
+            route_toolsets = [str(t) for t in override]
+            # The override replaces the platform's list, but the platform's
+            # ``no_mcp`` opt-out (or the global ``agent.no_mcp``) still holds:
+            # a per-route list must not bring MCP servers back.
+            if (
+                mcp_disabled_for_platform(user_config, platform_key)
+                and "no_mcp" not in route_toolsets
+            ):
+                route_toolsets.append("no_mcp")
+            pts[platform_key] = route_toolsets
             cfg["platform_toolsets"] = pts
-            return sorted(_get_platform_tools(cfg, platform_key))
+            # The route list is still capped by the platform's configured
+            # allowlist (its own entry, else ``cli``): a route cannot grant a
+            # toolset the platform itself may not have.
+            return sorted(
+                bound_enabled_toolsets(
+                    sorted(_get_platform_tools(cfg, platform_key)),
+                    user_config,
+                    platform_key,
+                )
+                or []
+            )
 
         return sorted(_get_platform_tools(user_config, platform_key))
 
@@ -32600,6 +32638,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # platforms. Set here (not at module import) so incidental imports of
     # gateway.run from CLI/tool code do not poison HERMES_EXEC_ASK.
     os.environ["HERMES_EXEC_ASK"] = "1"
+
+    # Refuse to start when governance is required but its plugin is not loaded.
+    from hermes_cli.governance_startup import governance_startup_error
+
+    _governance_error = governance_startup_error()
+    if _governance_error is not None:
+        logger.error("Gateway refused to start: %s", _governance_error["message"])
+        print(f"Gateway refused to start: {_governance_error['message']}", file=sys.stderr)
+        return False
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
 

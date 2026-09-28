@@ -420,6 +420,20 @@ def ensure_mcp_discovery_started() -> None:
 
 
 def main():
+    # Refuse to start when governance is required but its plugin is not
+    # loaded; report it as a JSON event on the protocol stream.
+    from hermes_cli.governance_startup import governance_startup_error
+
+    governance_error = governance_startup_error()
+    if governance_error is not None:
+        write_json({
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {"type": "gateway.start_failed", "payload": governance_error},
+        })
+        _log_exit(f"governance check failed: {governance_error['error']}")
+        sys.exit(1)
+
     _install_sidecar_publisher()
 
     # Cross-backend liveness (#94895): register a heartbeat row so the

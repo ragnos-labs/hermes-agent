@@ -31,6 +31,7 @@ else:
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -240,6 +241,16 @@ def main(argv: list[str] | None = None) -> None:
 
     logger = logging.getLogger(__name__)
     logger.info("Starting hermes-agent ACP adapter")
+
+    # Refuse to start when governance is required but its plugin is not
+    # loaded. stdout carries the ACP protocol, so the error goes to stderr.
+    from hermes_cli.governance_startup import governance_startup_error
+
+    governance_error = governance_startup_error()
+    if governance_error is not None:
+        logger.error("ACP adapter refused to start: %s", governance_error["message"])
+        print(json.dumps(governance_error), file=sys.stderr)
+        sys.exit(1)
 
     # Ensure the project root is on sys.path so ``from run_agent import AIAgent`` works
     project_root = str(Path(__file__).resolve().parent.parent)

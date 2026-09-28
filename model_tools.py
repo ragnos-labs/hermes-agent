@@ -1549,6 +1549,18 @@ def handle_function_call(
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
+            elif function_name == "cronjob":
+                # The cronjob tool records the calling agent's toolsets on
+                # the job so a scheduled run is never wider than its author.
+                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    return registry.dispatch(
+                        function_name, next_args,
+                        task_id=task_id,
+                        session_id=session_id,
+                        user_task=user_task,
+                        creator_enabled_toolsets=enabled_toolsets,
+                        creator_disabled_toolsets=disabled_toolsets,
+                    )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(

@@ -268,12 +268,14 @@ therefore runs shell commands on the host without prompting. I asked one to run
 Selecting `Anyone` hands that same shell access to every author who can reach
 the channel. Buzz does not warn when you pick it.
 
-Neither of the obvious mitigations works today:
+Mitigations:
 
 - `approvals.mode: manual` does make Hermes raise the permission request, but
   Buzz auto-approves it and the command still runs.
-- `platform_toolsets.acp` does not narrow the ACP toolset, so it cannot be used
-  to drop `terminal`.
+- `platform_toolsets.acp` caps the ACP toolset (see
+  [Allowlist cap](../configuration.md#allowlist-cap)), so an entry without
+  `terminal` and `code_execution` drops them. `agent.disabled_toolsets`
+  removes them too.
 
 `!shutdown` from the owner stops the agent in any mode, and Buzz ignores that
 command from everyone else.

@@ -194,6 +194,96 @@ def test_room_agent_uses_target_policy_toolsets_and_turn_limit(monkeypatch):
     assert captured["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
+def _self_signed_policy(toolsets: list[str], *, approval_mode: str = "off") -> dict:
+    """A policy with a digest computed by the caller, as any client can."""
+    unsigned = {
+        "version": 1,
+        "target_profile": "default",
+        "enabled_toolsets": sorted(toolsets),
+        "approval_mode": approval_mode,
+        "max_iterations": 5,
+    }
+    digest = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {**unsigned, "policy_digest": digest}
+
+
+def _capture_create_agent(monkeypatch, config: dict) -> tuple[object, dict]:
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.platforms.base import PlatformConfig
+
+    captured: dict = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {"provider": "openai-codex", "base_url": "https://example.test/v1"},
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-test")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: config)
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        staticmethod(lambda model="": {"enabled": True, "effort": "high"}),
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 999)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    return adapter, captured
+
+
+def test_room_policy_toolsets_are_capped_by_api_server_entry(monkeypatch):
+    """A room policy never widens the agent past the api_server cap."""
+    adapter, captured = _capture_create_agent(
+        monkeypatch, {"platform_toolsets": {"api_server": ["file", "bot_room"]}}
+    )
+    policy = _self_signed_policy(["bot_room", "file", "terminal", "web"])
+
+    adapter._create_agent(
+        session_id="room-session",
+        room_dispatch={"room_id": "room-1"},
+        room_execution_policy=policy,
+    )
+
+    assert sorted(captured["enabled_toolsets"]) == ["bot_room", "file"]
+
+
+def test_room_policy_toolsets_capped_by_cli_fallback(monkeypatch):
+    adapter, captured = _capture_create_agent(
+        monkeypatch, {"platform_toolsets": {"cli": ["file"]}}
+    )
+    policy = _self_signed_policy(["bot_room", "file", "terminal"])
+
+    adapter._create_agent(
+        session_id="room-session",
+        room_dispatch={"room_id": "room-1"},
+        room_execution_policy=policy,
+    )
+
+    assert captured["enabled_toolsets"] == ["file"]
+
+
+def test_api_server_agent_default_toolsets_are_capped(monkeypatch):
+    """The ordinary api_server agent (no room) is capped by the cli entry
+    when api_server has no entry of its own."""
+    adapter, captured = _capture_create_agent(
+        monkeypatch, {"platform_toolsets": {"cli": ["file"]}}
+    )
+
+    adapter._create_agent(session_id="plain-session")
+
+    assert captured["enabled_toolsets"] == ["file"]
+    assert captured["platform"] == "api_server"
+
+
 def test_policy_drift_requires_reauthorization_without_retry():
     old_policy = _policy(max_turns=7)
     dispatch = _dispatch(old_policy)

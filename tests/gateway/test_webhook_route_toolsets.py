@@ -72,6 +72,21 @@ class TestWebhookAdapterToolsetsForSource:
 
 class TestGatewayResolveEnabledToolsetsForSource:
     def test_override_replaces_platform_resolution(self):
+        # Without a webhook (or cli) allowlist entry the route list is used
+        # as is, replacing the platform default rather than merging with it.
+        wa = _make_adapter(
+            {"mon": {"secret": "x", "toolsets": ["terminal", "file", "web"]}}
+        )
+        gr = _make_runner(wa)
+        res = GatewayRunner._resolve_enabled_toolsets_for_source(
+            gr, {}, _Src("webhook:mon:d"), "webhook"
+        )
+        assert "terminal" in res and "file" in res and "web" in res
+        assert "vision" not in res  # platform default fully replaced, not merged
+
+    def test_override_capped_by_platform_allowlist(self):
+        # The platform_toolsets.webhook entry is a cap: a route cannot grant
+        # a toolset the platform itself may not have.
         wa = _make_adapter(
             {"mon": {"secret": "x", "toolsets": ["terminal", "file", "web"]}}
         )
@@ -79,17 +94,17 @@ class TestGatewayResolveEnabledToolsetsForSource:
         res = GatewayRunner._resolve_enabled_toolsets_for_source(
             gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
         )
-        assert "terminal" in res and "file" in res and "web" in res
-        assert "vision" not in res  # platform list fully replaced, not merged
+        assert res == ["web"]
 
     def test_override_validated_like_platform_config(self):
-        # Contract: resolving with an override is byte-identical to resolving
-        # the same list configured as platform_toolsets.webhook.
+        # Contract: with no allowlist entry, resolving with an override is
+        # byte-identical to resolving the same list configured as
+        # platform_toolsets.webhook.
         override = ["terminal", "file", "web", "discord_admin"]
         wa = _make_adapter({"mon": {"secret": "x", "toolsets": override}})
         gr = _make_runner(wa)
         res = GatewayRunner._resolve_enabled_toolsets_for_source(
-            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
+            gr, {}, _Src("webhook:mon:d"), "webhook"
         )
         expected = sorted(
             _get_platform_tools(

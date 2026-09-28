@@ -62,6 +62,10 @@ async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
     return await asyncio.to_thread(ensure)
 
 
+#: Body fields that only a verified room grant may set.
+_ROOM_ONLY_FIELDS = frozenset({"hosted_room_dispatch", "_room_execution_policy"})
+
+
 async def _normalize_room_dispatch(
     self,
     request: "web.Request",
@@ -75,6 +79,21 @@ async def _normalize_room_dispatch(
 
     room_token = self._room_grant_token(request)
     if not room_token:
+        # Only a verified room grant may carry a room dispatch or an
+        # execution policy. The policy digest is a plain sha256 that any
+        # client can compute, so a policy supplied without a grant would
+        # choose its own toolsets and approval mode. Refuse it.
+        if isinstance(body, dict) and (
+            _ROOM_ONLY_FIELDS & set(body)
+        ):
+            return body, web.json_response(
+                _openai_error(
+                    "hosted_room_dispatch and _room_execution_policy require "
+                    "a room grant (Authorization: HermesRoom <token>).",
+                    code="invalid_room_dispatch",
+                ),
+                status=400,
+            )
         return body, None
 
     allowed_room_fields = {"input", "hosted_room_dispatch"}
