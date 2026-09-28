@@ -580,16 +580,33 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+# Unicode whitespace plus U+FEFF at either end of a string. JavaScript's
+# ``String.prototype.trim`` (used by the desktop and dashboard editors)
+# removes U+FEFF, but ``str.strip`` keeps it. Every other character trim
+# removes is whitespace to ``str.strip`` as well.
+_NAME_EDGE_RE = re.compile(r"^[\s\ufeff]+|[\s\ufeff]+$")
+
+
+def strip_job_name(text: str) -> str:
+    """Strip whitespace and U+FEFF from both ends of a job name or prompt.
+
+    Name comparisons use this so a name that an editor trimmed with
+    JavaScript's ``trim`` compares equal to the name readers show.
+    """
+    return _NAME_EDGE_RE.sub("", text)
+
+
 def _job_display_name(job: Dict[str, Any]) -> str:
     """Return the name readers show for ``job`` (``get_job``, ``list_jobs``).
 
     A stored name that is missing, null or blank is replaced by the first 50
-    characters of the prompt, first skill, script or id. A non-blank stored
-    name is returned stripped. Editors pre-fill this name and send it back,
-    so ``update_job`` compares a new name against it.
+    characters of the prompt, first skill, script or id. Either one is
+    returned with whitespace and U+FEFF stripped (``strip_job_name``).
+    Editors pre-fill this name and send it back, so ``update_job`` compares
+    a new name against it.
     """
     normalized = _apply_skill_fields(job)
-    name = _coerce_job_text(normalized.get("name")).strip()
+    name = strip_job_name(_coerce_job_text(normalized.get("name")))
     if name:
         return name
     script = _coerce_job_text(normalized.get("script")).strip()
@@ -600,7 +617,7 @@ def _job_display_name(job: Dict[str, Any]) -> str:
         or _coerce_job_text(normalized.get("id"), "unknown")
         or "cron job"
     )
-    return label_source[:50].strip() or "cron job"
+    return strip_job_name(label_source[:50]) or "cron job"
 
 
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -2477,7 +2494,7 @@ def create_job(
     # (``hermes cron unbound-jobs``) withhold it. Absent key = derived,
     # agent-chosen or unknown, so existing and unnamed jobs stay
     # byte-identical.
-    if mark_name_explicit and name and str(name).strip():
+    if mark_name_explicit and name and strip_job_name(str(name)):
         job["name_explicit"] = True
 
     with _jobs_lock():
@@ -2560,7 +2577,7 @@ def update_job(
     """Update a job by ID, refreshing derived schedule fields when needed.
 
     ``mark_name_explicit`` says whether a rename (a non-empty name that
-    differs from the stored one) records ``name_explicit``. Operator
+    differs from the name readers show) records ``name_explicit``. Operator
     surfaces keep the default; the agent-facing ``cronjob`` tool passes
     False. Re-sending the stored name never changes the marker.
     """
@@ -2626,19 +2643,24 @@ def update_job(
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
-            # ``name_explicit`` follows the name, never the payload. Editors
-            # re-send the name they were shown with every edit: the stored
-            # name (stripped), or the name ``get_job`` derives from the
-            # prompt when the stored one is missing, null or blank.
-            # ``_job_display_name`` returns exactly that shown name. Only a
-            # name that differs from it counts as a rename: an operator
-            # rename sets the marker, an agent rename clears it, and
-            # clearing the name clears it. Re-sending the shown name, or
-            # omitting the name, keeps the stored marker.
+            # ``name_explicit`` follows the name, never the payload. The
+            # desktop and dashboard send ``name`` only when the operator
+            # edited it, but older clients and the ``cronjob`` tool re-send
+            # the name they were shown: the stored name, or the name
+            # ``get_job`` derives from the prompt when the stored one is
+            # missing, null or blank. ``_job_display_name`` returns exactly
+            # that shown name. Only a name that differs from it, compared
+            # case-sensitively after ``strip_job_name`` on both sides, counts
+            # as a rename: an operator rename sets the marker, an agent
+            # rename clears it, and clearing the name clears it. Re-sending
+            # the shown name, or omitting the name, keeps the stored marker.
+            # A client cannot be told apart from a stale editor that
+            # re-sends a name derived from an older prompt, which is why
+            # the editors omit an unedited name.
             updated.pop("name_explicit", None)
             _stored_explicit = job.get("name_explicit") is True
             if "name" in updates:
-                _new_name = str(updates.get("name") or "").strip()
+                _new_name = strip_job_name(str(updates.get("name") or ""))
                 if not _new_name:
                     _name_explicit = False
                 elif _new_name == _job_display_name(job):

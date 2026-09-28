@@ -40,6 +40,53 @@ describe("splitCronList", () => {
 });
 
 describe("buildCronJobPayload", () => {
+  // The shown name of an unnamed job is the first 50 characters of its prompt.
+  const derived = "sk-live-7f3a9c SECRET_PROMPT_MARKER rotate the va";
+
+  it("sends the name on create", () => {
+    expect(buildCronJobPayload(form({ name: " nightly " })).name).toBe(
+      "nightly",
+    );
+  });
+
+  it("omits an unedited name on edit so a stale name is not re-sent", () => {
+    const payload = buildCronJobPayload(
+      form({ name: derived, prompt: "edited prompt" }),
+      { shownName: derived },
+    );
+    expect("name" in payload).toBe(false);
+    expect(payload.prompt).toBe("edited prompt");
+  });
+
+  it("omits a name that differs from the shown one only at the edges", () => {
+    // The form is pre-filled with the raw shown name. JavaScript trim removes
+    // U+FEFF, which Python str.strip keeps.
+    const shown = `\ufeff${derived}`;
+    const options = { shownName: shown };
+    const unchanged = buildCronJobPayload(form({ name: shown }), options);
+    const trimmed = buildCronJobPayload(form({ name: derived }), options);
+    expect("name" in unchanged).toBe(false);
+    expect("name" in trimmed).toBe(false);
+  });
+
+  it("sends a real rename on edit, including a case-only one", () => {
+    const renamed = buildCronJobPayload(form({ name: "vault rotation" }), {
+      shownName: derived,
+    });
+    const recased = buildCronJobPayload(form({ name: "Vault Rotation" }), {
+      shownName: "vault rotation",
+    });
+    expect(renamed.name).toBe("vault rotation");
+    expect(recased.name).toBe("Vault Rotation");
+  });
+
+  it("sends a cleared name on edit so the server can clear the marker", () => {
+    const cleared = buildCronJobPayload(form({ name: "" }), {
+      shownName: "vault rotation",
+    });
+    expect(cleared.name).toBe("");
+  });
+
   it("normalizes list fields and base URLs", () => {
     const payload = buildCronJobPayload(
       form({
