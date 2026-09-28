@@ -4685,10 +4685,15 @@ class GatewaySlashCommandsMixin:
             # pre-compression checkpoint; otherwise keep the historical fast
             # path (no provider init, no best-effort hook) for this helper.
             from hermes_cli.config import load_config as _load_cfg
-            from hermes_cli.tools_config import load_disabled_toolsets
+            from hermes_cli.tools_config import bound_enabled_toolsets, load_disabled_toolsets
             from utils import is_truthy_value as _is_truthy
 
             _hyg_cfg = _load_cfg() or {}
+            # The compression helper gets the memory toolset only when the
+            # source platform's allowlist cap permits it.
+            _compress_toolsets = (
+                bound_enabled_toolsets(["memory"], _hyg_cfg, platform_key) or []
+            )
             _checkpoint_required = _is_truthy(
                 (_hyg_cfg.get("compression") or {}).get(
                     "checkpoint_required"
@@ -4701,7 +4706,7 @@ class GatewaySlashCommandsMixin:
                 max_iterations=4,
                 quiet_mode=True,
                 skip_memory=not _checkpoint_required,
-                enabled_toolsets=["memory"],
+                enabled_toolsets=_compress_toolsets,
                 disabled_toolsets=load_disabled_toolsets(_hyg_cfg),
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),

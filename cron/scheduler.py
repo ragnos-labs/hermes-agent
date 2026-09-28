@@ -617,8 +617,11 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     2. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
        so users can gate cron toolsets globally without recreating every job.
-    3. ``None`` on any lookup failure — AIAgent loads the full default set
-       (legacy behavior before this change, preserved as the safety net).
+    3. ``[]`` (no toolsets) on any lookup failure: fails closed.
+
+    Either result is then intersected with the job's ``toolset_bound``, the
+    effective toolsets of the agent that created the job with the
+    ``cronjob`` tool (see :func:`_apply_job_toolset_bound`).
 
     _DEFAULT_OFF_TOOLSETS ({moa, homeassistant, rl}) are removed by
     ``_get_platform_tools`` for unconfigured platforms, so fresh installs
@@ -627,16 +630,38 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        result = _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        return _apply_job_toolset_bound(result, job, cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        result = sorted(_get_platform_tools(cfg or {}, "cron"))
+        return _apply_job_toolset_bound(result, job, cfg or {})
     except Exception as exc:
+        # Fail closed: a job whose toolsets cannot be resolved runs with none,
+        # never with the full default set.
         logger.warning(
-            "Cron toolset resolution failed, falling back to full default toolset: %s",
+            "Cron toolset resolution failed; running the job with no toolsets: %s",
             exc,
         )
-        return None
+        return []
+
+
+def _apply_job_toolset_bound(result: list[str], job: dict, cfg: dict) -> list[str]:
+    """Intersect a job's toolsets with the bound recorded by its creator.
+
+    ``toolset_bound`` holds the effective toolsets of the agent that created
+    or last updated the job through the ``cronjob`` tool. A job never runs
+    wider than that agent could. Jobs created by the user carry no bound. A
+    malformed bound fails closed to no toolsets.
+    """
+    if "toolset_bound" not in job or job.get("toolset_bound") is None:
+        return result
+    bound = job.get("toolset_bound")
+    if not isinstance(bound, list):
+        return []
+    from hermes_cli.tools_config import _cap_toolsets
+
+    return _cap_toolsets(list(result), {str(t) for t in bound}, cfg)
 
 
 def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:

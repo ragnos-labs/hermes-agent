@@ -141,9 +141,13 @@ def _expand_acp_enabled_toolsets(
     toolsets: List[str] | None = None,
     mcp_server_names: List[str] | None = None,
 ) -> List[str]:
-    """Return ACP toolsets plus explicit MCP server toolsets for this session."""
+    """Return ACP toolsets plus explicit MCP server toolsets for this session.
+
+    ``None`` means the ACP default (``hermes-acp``). An empty list stays
+    empty: a cap that allows no toolsets is not widened back to the default.
+    """
     expanded: List[str] = []
-    for name in list(toolsets or ["hermes-acp"]):
+    for name in list(["hermes-acp"] if toolsets is None else toolsets):
         if name and name not in expanded:
             expanded.append(name)
 

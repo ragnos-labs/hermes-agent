@@ -69,3 +69,32 @@ def test_review_fails_closed_when_disabled_list_unreadable(real_review, monkeypa
 
     assert captured["calls"] == 0
     assert "bad config" in meta["error"]
+
+
+@pytest.mark.parametrize(
+    "caps",
+    [{"curator": ["file"]}, {"cli": ["file"]}],
+)
+def test_review_skipped_when_cap_excludes_skills(real_review, monkeypatch, caps):
+    curator, captured = real_review
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda *a, **k: {"platform_toolsets": dict(caps)}
+    )
+
+    meta = curator._run_llm_review("review prompt")
+
+    assert captured["calls"] == 0
+    assert "allowlist" in meta["error"]
+
+
+def test_review_agent_runs_when_cap_allows_skills(real_review, monkeypatch):
+    curator, captured = real_review
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda *a, **k: {"platform_toolsets": {"curator": ["skills", "file"]}},
+    )
+
+    meta = curator._run_llm_review("review prompt")
+
+    assert meta.get("error") is None, meta.get("error")
+    assert captured["kwargs"]["enabled_toolsets"] == ["skills"]

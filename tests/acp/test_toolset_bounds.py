@@ -143,3 +143,112 @@ def test_tools_command_lists_only_bounded_tools(monkeypatch):
     kwargs = mock_defs.call_args.kwargs
     assert kwargs["enabled_toolsets"] == ["file"]
     assert set(kwargs["disabled_toolsets"]) == {"memory", "search"}
+
+
+def _client_agent(monkeypatch, cfg, enabled):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd="/tmp")
+    state.agent.enabled_toolsets = enabled
+    state.agent.disabled_toolsets = None
+    state.agent.tools = []
+    state.agent.valid_tool_names = set()
+    return agent, state
+
+
+@pytest.mark.asyncio
+async def test_empty_cap_stays_empty_with_client_mcp_server(monkeypatch):
+    """Regression: an empty cap plus a client MCP server used to end with
+    ['hermes-acp', 'mcp-evil']."""
+    from acp.schema import McpServerStdio
+
+    cfg = {"platform_toolsets": {"cli": [], "acp": []}}
+    session = _make_session(monkeypatch, cfg)
+    assert session.agent.kwargs["enabled_toolsets"] == []
+
+    agent, state = _client_agent(monkeypatch, cfg, [])
+    server = McpServerStdio(name="evil", command="/bin/test", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register, \
+         patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+        await agent._register_session_mcp_servers(state, [server])
+
+    mock_register.assert_not_called()
+    mock_defs.assert_not_called()
+    assert state.agent.enabled_toolsets == []
+
+
+@pytest.mark.asyncio
+async def test_client_mcp_server_outside_cap_is_not_registered(monkeypatch):
+    from acp.schema import McpServerStdio
+
+    cfg = {"platform_toolsets": {"acp": ["file"]}}
+    agent, state = _client_agent(monkeypatch, cfg, ["file"])
+    server = McpServerStdio(name="evil", command="/bin/test", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers") as mock_register:
+        await agent._register_session_mcp_servers(state, [server])
+
+    mock_register.assert_not_called()
+    assert state.agent.enabled_toolsets == ["file"]
+
+
+@pytest.mark.asyncio
+async def test_client_mcp_server_named_by_cap_is_registered_alone(monkeypatch):
+    from acp.schema import McpServerStdio
+
+    cfg = {"platform_toolsets": {"acp": ["file", "mcp-allowed"]}}
+    agent, state = _client_agent(monkeypatch, cfg, ["file"])
+    servers = [
+        McpServerStdio(name="allowed", command="/bin/test", args=[], env=[]),
+        McpServerStdio(name="evil", command="/bin/test", args=[], env=[]),
+    ]
+    with patch("tools.mcp_tool.register_mcp_servers", return_value=[]) as mock_register, \
+         patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+        await agent._register_session_mcp_servers(state, servers)
+
+    assert set(mock_register.call_args.args[0]) == {"allowed"}
+    assert state.agent.enabled_toolsets == ["file", "mcp-allowed"]
+    assert mock_defs.call_args.kwargs["enabled_toolsets"] == ["file", "mcp-allowed"]
+
+
+@pytest.mark.asyncio
+async def test_client_mcp_server_kept_without_cap(monkeypatch):
+    from acp.schema import McpServerStdio
+
+    agent, state = _client_agent(monkeypatch, {}, ["hermes-acp"])
+    server = McpServerStdio(name="srv", command="/bin/test", args=[], env=[])
+    with patch("tools.mcp_tool.register_mcp_servers", return_value=[]) as mock_register, \
+         patch("model_tools.get_tool_definitions", return_value=[]):
+        await agent._register_session_mcp_servers(state, [server])
+
+    assert set(mock_register.call_args.args[0]) == {"srv"}
+    assert state.agent.enabled_toolsets == ["hermes-acp", "mcp-srv"]
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [{"platform_toolsets": {"cli": [], "acp": []}}, {}],
+    ids=["empty-cap", "no-cap"],
+)
+def test_tools_command_reports_empty_cap(monkeypatch, cfg):
+    """/tools reports what is enabled; an empty list is not the default,
+    with or without a cap."""
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+    manager = SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    agent = HermesACPAgent(session_manager=manager)
+    state = manager.create_session(cwd="/tmp")
+    state.agent.enabled_toolsets = []
+    state.agent.disabled_toolsets = None
+
+    with patch("model_tools.get_tool_definitions", return_value=[]) as mock_defs:
+        agent._cmd_tools("", state)
+
+    assert mock_defs.call_args.kwargs["enabled_toolsets"] == []
+
+
+def test_expand_acp_toolsets_keeps_empty_list():
+    from acp_adapter.session import _expand_acp_enabled_toolsets
+
+    assert _expand_acp_enabled_toolsets([]) == []
+    assert _expand_acp_enabled_toolsets(None) == ["hermes-acp"]
+    assert _expand_acp_enabled_toolsets([], mcp_server_names=["x"]) == ["mcp-x"]

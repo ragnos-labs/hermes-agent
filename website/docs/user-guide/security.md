@@ -292,7 +292,7 @@ These categories are always denied, even when `HERMES_WRITE_SAFE_ROOT` is unset:
 | Hermes credential stores | `auth.json`, `.env`, `.anthropic_oauth.json`, `mcp-tokens/`, `pairing/` under HERMES_HOME (active profile and global root) |
 | Project secret files | `.env`, `.env.local`, `.env.production`, `.envrc` anywhere on disk |
 | Hermes control state | `config.yaml`, `plugins/`, `hooks/`, `scripts/`, `cron/jobs.json`, `webhook_subscriptions.json`, `profile.yaml`, `governance.env` and other profiles under HERMES_HOME |
-| Startup code | the running Hermes install's source directory, its Python environment (`sys.prefix` of a virtual environment and every site-packages directory, where a `.pth` file runs at interpreter start), `~/.config/systemd/user/` and `~/Library/LaunchAgents/` |
+| Startup code | the running Hermes install's source directory, its Python environment (`sys.prefix` of a virtual environment and every site-packages directory, where a `.pth` file runs at interpreter start), the executable directories under HERMES_HOME (`bin/`, `node/`, `node_modules/`, `lsp/`, `hermes-agent/`), `~/.config/systemd/user/` and `~/Library/LaunchAgents/` |
 
 On case-insensitive filesystems (macOS and Windows defaults) these checks ignore
 case, so `PLUGINS/x.py` is denied like `plugins/x.py`. The startup-code

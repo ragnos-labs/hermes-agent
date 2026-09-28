@@ -8681,11 +8681,21 @@ def _merge_disabled_toolsets(*lists) -> list[str] | None:
 def _ephemeral_preview_agent_kwargs(agent, task_id: str) -> dict:
     kwargs = _background_agent_kwargs(agent, task_id)
     disabled = set(kwargs.get("disabled_toolsets") or [])
+    wanted = [ts for ts in ("terminal", "file") if ts not in disabled]
+    try:
+        from hermes_cli.tools_config import bound_enabled_toolsets
+
+        # The preview agent gets no toolset the ``cli`` allowlist cap
+        # leaves out; fails closed to no toolsets.
+        enabled = bound_enabled_toolsets(wanted, _load_cfg(), "cli") or []
+    except Exception:
+        logger.warning("[tui] could not apply toolset bounds to preview agent", exc_info=True)
+        enabled = []
     kwargs.update(
         {
             # ``disabled_toolsets`` from _background_agent_kwargs still applies,
             # so a config that disables ``terminal`` leaves this agent without it.
-            "enabled_toolsets": [ts for ts in ("terminal", "file") if ts not in disabled],
+            "enabled_toolsets": enabled,
             "session_db": None,
             "skip_memory": True,
         }

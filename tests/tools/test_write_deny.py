@@ -91,8 +91,10 @@ class TestWriteAllowed:
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        # webhook_subscriptions.json is Hermes control state in this fork
-        # (a route carries its own toolset list), so it is write-denied; see
+        # webhook_subscriptions.json and config.yaml are Hermes control state
+        # in this fork (a route carries its own toolset list, config.yaml
+        # holds the toolset caps), so they are write-denied; see
         # tests/agent/test_file_safety_hermes_control.py.
-        for name in ["auth.json", "config.yaml"]:
+        for name in ["auth.json"]:
             assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+        assert _is_write_denied(str(home / "config.yaml")) is True

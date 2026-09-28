@@ -126,3 +126,35 @@ def test_disabled_toolsets_fail_closed_when_config_unreadable(env):
     env.setattr(tc, "load_disabled_toolsets", broken)
     with pytest.raises(RuntimeError):
         server._tui_disabled_toolsets()
+
+
+def test_preview_agent_capped_by_cli_allowlist(kwargs_env):
+    """preview.restart builds its agent inside the cli cap: a cap without
+    terminal leaves the preview agent with file only."""
+    _use_config(kwargs_env, {"platform_toolsets": {"cli": ["file", "web"]}})
+
+    kwargs = server._ephemeral_preview_agent_kwargs(_parent_agent(disabled_toolsets=None), "task-1")
+
+    assert kwargs["enabled_toolsets"] == ["file"]
+
+
+def test_preview_agent_empty_cap_gets_no_toolsets(kwargs_env):
+    _use_config(kwargs_env, {"platform_toolsets": {"cli": []}})
+
+    kwargs = server._ephemeral_preview_agent_kwargs(_parent_agent(disabled_toolsets=None), "task-1")
+
+    assert kwargs["enabled_toolsets"] == []
+
+
+def test_preview_agent_fails_closed_when_bounds_fail(kwargs_env):
+    import hermes_cli.tools_config as tc
+
+    _use_config(kwargs_env, {})
+
+    def broken(*a, **k):
+        raise RuntimeError("bounds unavailable")
+
+    kwargs_env.setattr(tc, "bound_enabled_toolsets", broken)
+    kwargs = server._ephemeral_preview_agent_kwargs(_parent_agent(disabled_toolsets=None), "task-1")
+
+    assert kwargs["enabled_toolsets"] == []

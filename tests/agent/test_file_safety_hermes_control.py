@@ -45,6 +45,7 @@ def profile_home(tmp_path, monkeypatch):
         "webhook_subscriptions.json",
         "profile.yaml",
         "governance.env",
+        "config.yaml",
         "profiles/coder/config.yaml",
         "profiles/coder/plugins/x.py",
         "profiles/new/profile.yaml",
@@ -106,3 +107,11 @@ def test_file_tools_sensitive_check_refuses_control_paths(root_home, monkeypatch
     assert ft._check_sensitive_path(str(root_home / "webhook_subscriptions.json"))
     assert ft._check_sensitive_path(str(root_home / "skills" / "s" / "SKILL.md")) is None
     assert ft._check_sensitive_path(str(Path("/tmp") / "safe.txt")) is None
+
+
+def test_config_yaml_denied_by_shared_classifier(root_home):
+    """config.yaml holds the toolset caps, so the shared classifier denies it
+    for every writer, not only the file tools' own config check."""
+    target = str(root_home / "config.yaml")
+    assert fs._classify_write_denial(target) == "hermes_control"
+    assert fs.is_write_denied(target) is True

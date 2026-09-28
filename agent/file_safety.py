@@ -139,10 +139,12 @@ def build_write_approval_paths(home: str) -> set[str]:
 # gateway hooks run any handler, cron job scripts run on the next tick, a
 # cron job or webhook route carries its own toolset list, a profile.yaml
 # marks the install as bot-managed, governance.env holds the tool-call gate
-# policy). They sit next to config.yaml and .env as write-denied control
-# state; change them with the ``hermes`` CLI instead.
+# policy, config.yaml holds the per-platform toolset lists and caps). They
+# sit next to .env as write-denied control state; change them with the
+# ``hermes`` CLI instead.
 _HERMES_CONTROL_DIRS = ("plugins", "hooks", "scripts")
 _HERMES_CONTROL_FILES = (
+    "config.yaml",
     os.path.join("cron", "jobs.json"),
     "webhook_subscriptions.json",
     "profile.yaml",
@@ -213,6 +215,30 @@ def _install_code_roots() -> tuple[str, ...]:
     return tuple(roots)
 
 
+# HERMES_HOME directories that hold executables Hermes runs or puts on the
+# terminal PATH: ``bin`` (managed uv, tirith and other helper binaries),
+# ``node`` (the managed Node.js runtime, ``node/bin`` on POSIX and
+# ``node.exe`` at its top on Windows), ``node_modules`` (including
+# ``node_modules/.bin``), ``lsp`` (installed language servers and
+# ``lsp/bin``) and ``hermes-agent`` (the default install directory). A write
+# there replaces code that runs outside the agent's tool bounds.
+_HERMES_EXECUTABLE_DIRS = ("bin", "node", "node_modules", "lsp", "hermes-agent")
+
+
+def _hermes_executable_dirs() -> list[str]:
+    dirs: list[str] = []
+    for base in (_hermes_home_path(), _hermes_root_path()):
+        try:
+            real = os.path.realpath(base)
+        except Exception:
+            continue
+        for name in _HERMES_EXECUTABLE_DIRS:
+            candidate = os.path.join(real, name)
+            if candidate not in dirs:
+                dirs.append(candidate)
+    return dirs
+
+
 def _autostart_dirs(home: str) -> list[str]:
     """User service directories whose entries start programs at login."""
     return [
@@ -227,12 +253,18 @@ def is_startup_code_path(path: str) -> bool:
     Covers the running install's source root, its interpreter's
     ``sys.prefix`` (virtual environments) and site-packages directories, and
     the per-user autostart directories (``~/.config/systemd/user`` and
-    ``~/Library/LaunchAgents``). A write there persists code that runs
+    ``~/Library/LaunchAgents``), and the executable directories under
+    HERMES_HOME and the Hermes root (``bin``, ``node``, ``node_modules``,
+    ``lsp`` and ``hermes-agent``). A write there persists code that runs
     outside the agent's tool bounds on the next start.
     """
     resolved = os.path.realpath(os.path.expanduser(str(path)))
     home = os.path.realpath(os.path.expanduser("~"))
-    for base in (*_install_code_roots(), *_autostart_dirs(home)):
+    for base in (
+        *_install_code_roots(),
+        *_autostart_dirs(home),
+        *_hermes_executable_dirs(),
+    ):
         if _is_under(resolved, base):
             return True
     return False
@@ -241,7 +273,7 @@ def is_startup_code_path(path: str) -> bool:
 def is_hermes_control_path(path: str) -> bool:
     """True when ``path`` is Hermes control state under HERMES_HOME or the root.
 
-    Covers ``plugins/``, ``hooks/``, ``cron/jobs.json``,
+    Covers ``config.yaml``, ``plugins/``, ``hooks/``, ``cron/jobs.json``,
     ``webhook_subscriptions.json``, ``profile.yaml`` and ``governance.env``
     in the active home and the Hermes root, plus every other profile under
     ``<root>/profiles/``. The active profile's own home stays writable apart

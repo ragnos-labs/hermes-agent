@@ -90,6 +90,38 @@ def test_ordinary_paths_stay_writable(tmp_path, monkeypatch):
         assert fs.is_startup_code_path(str(home / rel)) is False
 
 
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "bin/uv",
+        "bin/tirith",
+        "node/bin/node",
+        "node/bin/npx",
+        "node/node.exe",
+        "node_modules/.bin/agent-browser",
+        "node_modules/agent-browser/bin/cli.js",
+        "lsp/bin/pyright-langserver",
+        "lsp/node_modules/.bin/typescript-language-server",
+        "hermes-agent/run_agent.py",
+        "hermes-agent/venv/bin/python",
+    ],
+)
+def test_hermes_home_executable_dirs_are_denied(root_home, rel):
+    _assert_startup_denied(str(root_home / rel))
+
+
+def test_hermes_home_executable_dirs_denied_in_profile_root(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    active = root / "profiles" / "coder"
+    active.mkdir(parents=True)
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: active)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+    _assert_startup_denied(str(root / "bin" / "uv"))
+    _assert_startup_denied(str(active / "node" / "bin" / "node"))
+    assert fs.is_startup_code_path(str(active / "binaries.txt")) is False
+    assert fs.is_startup_code_path(str(root / "skills" / "bin" / "x")) is False
+
+
 def test_install_roots_never_include_filesystem_root():
     assert os.sep not in fs._install_code_roots()
 

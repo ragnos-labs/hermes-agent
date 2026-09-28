@@ -1484,8 +1484,16 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    toolset_bound: Optional[List[str]] = None,
 ) -> str:
-    """Unified cron job management tool."""
+    """Unified cron job management tool.
+
+    ``toolset_bound`` is the effective toolset list of the agent calling the
+    tool (see :func:`_cronjob_handler`). Create records it on the job and
+    update narrows the job's existing bound with it, so the scheduler never
+    runs an agent-authored job wider than its author. ``None`` (programmatic
+    and CLI callers) records no bound.
+    """
     del task_id  # unused but kept for handler signature compatibility
 
     try:
@@ -1598,6 +1606,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    toolset_bound=toolset_bound,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1935,6 +1944,12 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
+            if toolset_bound is not None:
+                # An agent that edits a job (including a wider job the user
+                # created) narrows the job to what that agent may use.
+                updates["toolset_bound"] = _narrow_toolset_bound(
+                    job.get("toolset_bound"), toolset_bound
+                )
             updated = update_job(job_id, updates)
             _notify_provider_jobs_changed_safe()
             _upd_result: Dict[str, Any] = {"success": True, "job": _format_job(updated)}
@@ -2061,16 +2076,72 @@ def check_cronjob_requirements() -> bool:
 from tools.registry import registry, tool_error
 
 
+def _narrow_toolset_bound(existing: Any, new_bound: List[str]) -> List[str]:
+    """Intersect a job's stored toolset bound with a new author's bound."""
+    new_sorted = sorted({str(t) for t in new_bound})
+    if existing is None:
+        return new_sorted
+    if not isinstance(existing, list):
+        return []
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import _cap_toolsets
+
+    return sorted(_cap_toolsets([str(t) for t in existing], set(new_sorted), load_config()))
+
+
+def _creator_toolset_bound(
+    creator_enabled: Optional[List[str]],
+    creator_disabled: Optional[List[str]],
+) -> Optional[List[str]]:
+    """Return the effective toolsets of the agent calling ``cronjob``.
+
+    Uses the agent's own enabled list when dispatch supplies it. Otherwise
+    falls back to the allowlist cap of the session's platform. ``None``
+    means the caller is unbounded (no enabled list and no cap).
+    """
+    disabled = {str(t) for t in (creator_disabled or [])}
+    if creator_enabled is not None:
+        return sorted({str(t) for t in creator_enabled} - disabled)
+    from gateway.session_context import get_session_env
+    from hermes_cli.config import load_config
+    from hermes_cli.tools_config import toolset_cap
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "") or "cli"
+    cap = toolset_cap(load_config(), platform)
+    if cap is None:
+        return None
+    return sorted({str(t) for t in cap} - disabled)
+
+
 def _cronjob_handler(args, **kw):
     """Model-tool dispatch for ``cronjob``.
 
     Resolves the one model-facing ``monitor`` field into the stored
     ``monitor_script``/``monitor_url`` pair (legacy field names still accepted
     as aliases so older transcripts/replays keep working).
+
+    For create and update it also records the calling agent's toolset bound
+    on the job, so a job cannot run with toolsets its author lacks. Failing
+    to compute the bound refuses the action.
     """
     _mon_script, _mon_url = _split_monitor_arg(
         args.get("monitor"), args.get("monitor_script"), args.get("monitor_url")
     )
+    _bound = None
+    _action = str(args.get("action", "") or "").strip().lower()
+    if _action in {"create", "update"}:
+        try:
+            _bound = _creator_toolset_bound(
+                kw.get("creator_enabled_toolsets"),
+                kw.get("creator_disabled_toolsets"),
+            )
+        except Exception as exc:
+            logger.warning("cronjob: could not resolve the caller's toolset bound: %s", exc)
+            return tool_error(
+                "Could not resolve this agent's toolset bound; refusing to "
+                "create or update a cron job.",
+                success=False,
+            )
     return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
@@ -2099,6 +2170,7 @@ def _cronjob_handler(args, **kw):
         monitor_url=_mon_url,
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
+        toolset_bound=_bound,
     )
 
 

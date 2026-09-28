@@ -836,8 +836,9 @@ gateway platforms (including plugin platforms that fall back to their
 `hermes-<platform>` toolset), webhook routes that carry their own toolset
 list, cron jobs with a per-job toolset list, ACP sessions and their MCP
 refresh, the TUI and desktop gateway (after the surface toolsets are added),
-background and preview agents, the API server, the gateway `/compress` agent and the
-skills curator. The curator skips its run when `skills` is in the list.
+background and preview agents, the API server, the gateway `/compress` and
+session hygiene compression agents, and the skills curator. The curator skips
+its run when `skills` is in the list.
 
 ### Allowlist cap
 
@@ -848,8 +849,19 @@ else asks for more: a `hermes-<platform>` default, a composite such as
 the `HERMES_TUI_TOOLSETS` pin (including `all`) or an unbounded ("all
 toolsets") request. A platform with no entry of its own is capped by the
 `cli` entry. When neither the platform nor `cli` has an entry, nothing is
-capped. The skills curator is capped by the `cli` entry and skips its run
-when `skills` falls outside it.
+capped. The skills curator is capped by its `curator` entry, else the `cli`
+entry, and skips its run when `skills` falls outside it.
+
+Two more bounds follow from the cap:
+
+- **Agent-created cron jobs.** When an agent creates or edits a cron job with
+  the `cronjob` tool, the job records that agent's toolsets and never runs
+  with more, whatever toolsets the job asks for. Jobs created with
+  `hermes cron` or the dashboard carry no such bound.
+- **Hosted rooms on the API server.** A room's execution policy is honored
+  only on a request that carries a room grant, and its toolsets are capped by
+  the `api_server` entry (else `cli`). A capped deployment that uses hosted
+  rooms should add `bot_room` to its `api_server` entry.
 
 ```yaml
 platform_toolsets:

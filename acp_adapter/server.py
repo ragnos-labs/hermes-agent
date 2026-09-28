@@ -1134,14 +1134,33 @@ class HermesACPAgent(acp.Agent):
 
         try:
             from hermes_cli.config import load_config
-            from hermes_cli.tools_config import mcp_disabled_for_platform
+            from hermes_cli.tools_config import (
+                bound_enabled_toolsets,
+                mcp_disabled_for_platform,
+            )
 
-            mcp_off = mcp_disabled_for_platform(load_config(), "acp")
+            cfg = load_config()
+            mcp_off = mcp_disabled_for_platform(cfg, "acp")
+            enabled_toolsets = None
+            if not mcp_off:
+                # Client MCP servers pass through the same allowlist cap as
+                # every other ACP toolset: a server survives only when the
+                # ``acp`` (or ``cli``) cap names it, and an empty cap stays
+                # empty.
+                enabled_toolsets = bound_enabled_toolsets(
+                    _expand_acp_enabled_toolsets(
+                        getattr(state.agent, "enabled_toolsets", None),
+                        mcp_server_names=[server.name for server in mcp_servers],
+                    ),
+                    cfg,
+                    "acp",
+                )
         except Exception:
-            # Fail closed: without the setting, client-supplied MCP servers
+            # Fail closed: without the settings, client-supplied MCP servers
             # stay unregistered.
-            logger.warning("ACP: could not read no_mcp setting; ignoring client MCP servers", exc_info=True)
+            logger.warning("ACP: could not read toolset settings; ignoring client MCP servers", exc_info=True)
             mcp_off = True
+            enabled_toolsets = None
         if mcp_off:
             # ``agent.no_mcp`` / ``platform_toolsets.acp: [no_mcp]`` also covers
             # servers the ACP client supplies: do not register or expose them.
@@ -1151,12 +1170,25 @@ class HermesACPAgent(acp.Agent):
                 len(mcp_servers),
             )
             return
+        allowed_toolsets = set(enabled_toolsets or [])
+        allowed_servers = [
+            server
+            for server in mcp_servers
+            if f"mcp-{server.name}" in allowed_toolsets
+        ]
+        if not allowed_servers:
+            logger.info(
+                "Session %s: ignoring %d ACP-provided MCP server(s) outside the acp toolset cap",
+                state.session_id,
+                len(mcp_servers),
+            )
+            return
 
         try:
             from tools.mcp_tool import register_mcp_servers
 
             config_map: dict[str, dict] = {}
-            for server in mcp_servers:
+            for server in allowed_servers:
                 name = server.name
                 if isinstance(server, McpServerStdio):
                     config = {
@@ -1184,10 +1216,6 @@ class HermesACPAgent(acp.Agent):
             from model_tools import get_tool_definitions
             from agent.memory_manager import inject_memory_provider_tools
 
-            enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
-            )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
             state.agent.tools = get_tool_definitions(
@@ -2381,7 +2409,7 @@ class HermesACPAgent(acp.Agent):
             _cfg = load_config()
             toolsets = bound_enabled_toolsets(
                 _expand_acp_enabled_toolsets(
-                    getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+                    getattr(state.agent, "enabled_toolsets", None)
                 ),
                 _cfg,
                 "acp",

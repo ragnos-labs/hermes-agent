@@ -120,7 +120,17 @@ def effective_env(env: Optional[Mapping[str, str]] = None) -> dict[str, str]:
 
 
 def is_required(env: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether governance enforcement is required.
+
+    Matches ``hermes_cli.governance_startup.governance_required``: when
+    ``RAGNOS_GOVERNANCE_REQUIRED`` is not set in the environment and
+    ``governance.env`` exists but could not be read (``ENV_FILE_ERROR_KEY``
+    from :func:`effective_env`), the setting may be in the unreadable file,
+    so enforcement is required and fails closed.
+    """
     env = os.environ if env is None else env
+    if REQUIRED_ENV not in env and env.get(ENV_FILE_ERROR_KEY):
+        return True
     return str(env.get(REQUIRED_ENV, "")).strip().lower() in _TRUTHY
 
 

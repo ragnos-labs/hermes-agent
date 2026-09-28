@@ -2225,6 +2225,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    toolset_bound: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2443,6 +2444,13 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # The creating agent's effective toolsets. The scheduler intersects the
+    # job's toolsets with it, so an agent cannot schedule a job wider than
+    # its own platform cap. Absent = created by the user (CLI, dashboard).
+    if toolset_bound is not None:
+        job["toolset_bound"] = sorted(
+            {str(t).strip() for t in toolset_bound if str(t).strip()}
+        )
 
     with _jobs_lock():
         jobs = load_jobs()

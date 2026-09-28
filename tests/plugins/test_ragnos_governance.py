@@ -162,3 +162,41 @@ def test_required_with_unreadable_env_file_fails_closed(plugin, monkeypatch):
     (plugin.home / "governance.env").mkdir()
     verdict = plugin._on_pre_tool_call(tool_name="read_file", args={})
     assert verdict is not None and "governance.env" in verdict["message"]
+
+
+@pytest.mark.parametrize(
+    "make_unreadable",
+    [
+        lambda path: path.mkdir(),  # a directory cannot be read as text
+        lambda path: path.write_bytes(b"RAGNOS_GOVERNANCE_REQUIRED=1\n\xff\xfe\n"),
+    ],
+    ids=["directory", "invalid-utf8"],
+)
+def test_required_only_in_unreadable_env_file_fails_closed(plugin, make_unreadable):
+    """REQUIRED set only in an unreadable governance.env: startup treats
+    governance as required, so the hook must block every tool call too."""
+    from hermes_cli import governance_startup
+
+    make_unreadable(plugin.home / "governance.env")
+    assert governance_startup.governance_required() is True
+    verdict = plugin._on_pre_tool_call(tool_name="read_file", args={})
+    assert verdict is not None and verdict["action"] == "block"
+    assert "governance.env" in verdict["message"]
+
+
+def test_unreadable_env_file_with_required_off_in_environment(plugin, monkeypatch):
+    """An explicit environment value wins over the unreadable file in both
+    the startup check and the hook."""
+    from hermes_cli import governance_startup
+
+    monkeypatch.setenv("RAGNOS_GOVERNANCE_REQUIRED", "0")
+    (plugin.home / "governance.env").mkdir()
+    assert governance_startup.governance_required() is False
+    assert plugin._on_pre_tool_call(tool_name="read_file", args={}) is None
+
+
+def test_is_required_matches_startup_for_unreadable_file(governance):
+    error_key = governance.ENV_FILE_ERROR_KEY
+    assert governance.is_required({error_key: "x"}) is True
+    assert governance.is_required({error_key: "x", "RAGNOS_GOVERNANCE_REQUIRED": "0"}) is False
+    assert governance.is_required({}) is False

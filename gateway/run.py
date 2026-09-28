@@ -21187,11 +21187,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 from hermes_cli.config import load_config as _load_cfg
                                 from utils import is_truthy_value as _is_truthy
 
+                                from hermes_cli.tools_config import bound_enabled_toolsets
+
+                                _hyg_cfg = _load_cfg() or {}
                                 _hyg_checkpoint_required = _is_truthy(
-                                    ((_load_cfg() or {}).get("compression") or {}).get(
+                                    (_hyg_cfg.get("compression") or {}).get(
                                         "checkpoint_required"
                                     ),
                                     default=False,
+                                )
+                                # Memory only when the source platform's
+                                # allowlist cap permits it.
+                                _hyg_toolsets = (
+                                    bound_enabled_toolsets(
+                                        ["memory"],
+                                        _hyg_cfg,
+                                        _platform_config_key(source.platform)
+                                        if source.platform
+                                        else None,
+                                    )
+                                    or []
                                 )
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
@@ -21199,7 +21214,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     max_iterations=4,
                                     quiet_mode=True,
                                     skip_memory=not _hyg_checkpoint_required,
-                                    enabled_toolsets=["memory"],
+                                    enabled_toolsets=_hyg_toolsets,
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
                                 )
