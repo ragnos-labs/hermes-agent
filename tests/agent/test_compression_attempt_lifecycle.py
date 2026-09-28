@@ -189,6 +189,46 @@ class TestWorkerTeardownOnCeiling:
         still_running.set_running_or_notify_cancel()
         assert _join_cancelled_worker(still_running, 0.05) is False
 
+    def test_join_counts_queued_cancelled_future_as_exited(self):
+        """A future cancelled before any pool thread dequeued it is exited.
+
+        ``future.cancel()`` on a queued item leaves the state ``CANCELLED``
+        (not ``CANCELLED_AND_NOTIFIED``) until a pool thread takes it off
+        the queue, and ``concurrent.futures.wait`` does not count that state
+        as done. Without the ``cancelled()`` check before the wait, the join
+        ran the whole grace and returned False for a job that never started.
+        """
+        queued = concurrent.futures.Future()
+        assert queued.cancel()
+        started = time.monotonic()
+        assert _join_cancelled_worker(queued, 1.0) is True
+        assert time.monotonic() - started < 0.5, (
+            "join waited out the grace on a never-started cancelled future"
+        )
+
+    def test_join_counts_cancelled_job_behind_busy_pool_thread_as_exited(
+        self,
+    ):
+        """Same race on a real daemon pool whose only thread is busy."""
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        pool = DaemonThreadPoolExecutor(max_workers=1)
+        release = threading.Event()
+        try:
+            blocker = pool.submit(release.wait, 10)
+            queued = pool.submit(lambda: "never runs")
+            assert queued.cancel(), "queued job must cancel before it starts"
+            started = time.monotonic()
+            assert _join_cancelled_worker(queued, 1.0) is True
+            assert time.monotonic() - started < 0.5, (
+                "join waited out the grace on a job the busy pool never "
+                "dequeued"
+            )
+            assert not blocker.done(), "precondition: pool thread still busy"
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
     def test_uninterruptible_worker_is_orphaned_with_lease_retained(self):
         """A worker stuck in an uninterruptible provider call is orphaned:
         the host returns after the grace, the poison fence discards its late
@@ -357,3 +397,159 @@ class TestTransientBlockIsNotExhaustion:
         mock_agent = MagicMock()
         # MagicMock auto-attributes are truthy but not str.
         assert compression_blocked_transiently(mock_agent) is False
+
+
+class _ProviderReadTimeout(TimeoutError):
+    """A worker-side timeout, like ``socket.timeout`` from a provider read."""
+
+
+class TestWorkerTimeoutErrorIsNotAWaitTimeout:
+    """A worker that exits by raising ``TimeoutError`` must not be mistaken
+    for a host wait slice expiring.
+
+    ``concurrent.futures.TimeoutError`` is the builtin ``TimeoutError`` since
+    3.11, so catching it around ``future.result(timeout=...)`` also catches
+    the worker's own exception, which ``result()`` re-raises immediately on
+    every call.
+    """
+
+    def test_pre_commit_worker_timeout_error_propagates_without_spinning(
+        self, monkeypatch
+    ):
+        """Before the fix the host spun on the re-raised exception until the
+        idle window closed, then returned the fallback as if the worker had
+        stalled, swallowing the real error."""
+        import agent.conversation_compression as cc
+
+        still_streaming = []
+        real_info = cc.logger.info
+
+        def counting_info(msg, *args, **kwargs):
+            if str(msg).startswith("Context compression still streaming"):
+                still_streaming.append(time.monotonic())
+            return real_info(msg, *args, **kwargs)
+
+        monkeypatch.setattr(cc.logger, "info", counting_info)
+        raised = _ProviderReadTimeout("provider read timed out")
+
+        def raising_worker(fence: CompressionCommitFence):
+            fence.touch_progress()
+            raise raised
+
+        fence = CompressionCommitFence()
+        started = time.monotonic()
+        with pytest.raises(_ProviderReadTimeout) as excinfo:
+            run_compress_context_with_progress_timeout(
+                worker=raising_worker,
+                messages=[{"role": "user", "content": "keep"}],
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=2.0,
+                total_ceiling_seconds=5.0,
+                fence=fence,
+                stall_fallback=False,
+            )
+        assert excinfo.value is raised
+        assert time.monotonic() - started < 1.5, (
+            "host waited out the idle window instead of surfacing the "
+            "worker error"
+        )
+        assert len(still_streaming) <= 1, (
+            f"host spun {len(still_streaming)} times on the worker's "
+            "TimeoutError"
+        )
+        # The error path revoked commit admission like any worker failure.
+        assert fence.is_cancelled
+
+    def test_pre_start_deadline_gate_still_takes_the_timeout_path(self):
+        """The gate's own ``TimeoutError`` subclass is a timeout, not a
+        worker error: the host returns the fallback instead of raising."""
+        causes = []
+
+        class ExpiredFence(CompressionCommitFence):
+            @property
+            def deadline_exceeded(self) -> bool:
+                return True
+
+        worker_ran = threading.Event()
+
+        def worker(fence: CompressionCommitFence):
+            worker_ran.set()
+            return ([{"role": "assistant", "content": "x"}], "x")
+
+        original = [{"role": "user", "content": "keep"}]
+        msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=original,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=1.0,
+            total_ceiling_seconds=1.0,
+            on_timeout_cause=lambda total, progress: causes.append(total),
+            fence=ExpiredFence(),
+            stall_fallback=False,
+        )
+        assert msgs is original and prompt == "fallback"
+        assert causes == [True]
+        assert not worker_ran.is_set()
+
+    def test_commit_phase_timeout_error_propagates_without_spinning(
+        self, monkeypatch
+    ):
+        """A commit that overruns the ceiling and then fails with
+        ``TimeoutError`` must surface that error. Before the fix the overrun
+        loop re-raised it from ``result()`` on every pass and logged an
+        overrun line each time, forever (202,250 ERROR lines in 3 seconds in
+        review). The logging stub stops a regressed loop so this test fails
+        instead of hanging."""
+        import agent.conversation_compression as cc
+
+        class SpinDetected(BaseException):
+            pass
+
+        overrun_lines = []
+
+        def make_counter(real):
+            def counting(msg, *args, **kwargs):
+                if str(msg).startswith(
+                    "Context compression SessionDB commit still running"
+                ):
+                    overrun_lines.append(time.monotonic())
+                    if len(overrun_lines) > 50:
+                        raise SpinDetected(
+                            f"{len(overrun_lines)} overrun lines"
+                        )
+                return real(msg, *args, **kwargs)
+
+            return counting
+
+        monkeypatch.setattr(
+            cc.logger, "warning", make_counter(cc.logger.warning)
+        )
+        monkeypatch.setattr(cc.logger, "error", make_counter(cc.logger.error))
+        raised = _ProviderReadTimeout("SessionDB write timed out")
+        overruns = []
+
+        def committing_worker(fence: CompressionCommitFence):
+            assert fence.begin_commit()
+            try:
+                # Hold the commit past the 0.15s ceiling so the host reaches
+                # the overrun loop, then fail the commit with TimeoutError.
+                time.sleep(0.4)
+                raise raised
+            finally:
+                fence.finish_commit()
+
+        with pytest.raises(_ProviderReadTimeout) as excinfo:
+            run_compress_context_with_progress_timeout(
+                worker=committing_worker,
+                messages=[{"role": "user", "content": "keep"}],
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.15,
+                on_commit_overrun=lambda waited, ceil: overruns.append(waited),
+                fence=CompressionCommitFence(),
+                stall_fallback=False,
+            )
+        assert excinfo.value is raised
+        # Precondition: the host really was in the overrun loop.
+        assert len(overruns) == 1
+        assert 1 <= len(overrun_lines) <= 10, len(overrun_lines)
