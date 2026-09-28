@@ -514,6 +514,211 @@ def test_edit_without_name_after_agent_prompt_change_stays_redacted(jobs_file):
     _assert_secret_redacted(job["id"])
 
 
+# -- a client that loaded the job before a payload edit ----------------------
+#
+# Older desktop builds and third-party API clients re-send the name they
+# showed with every save. When the stored name was blank, that name was
+# derived from the prompt, and it used to follow every prompt edit, so a
+# client that loaded the job before an agent changed the prompt re-sent the
+# old prompt's first 50 characters, which counted as a rename. The shown name
+# is now pinned, so the re-sent name is the stored name.
+
+
+def _blank_stored_name(path, job_id, how):
+    from cron.jobs import update_job
+
+    if how == "cleared":
+        update_job(job_id, {"name": ""})
+        return
+    # A legacy record: blank name and no marker.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for job in data["jobs"]:
+        if job["id"] == job_id:
+            job["name"] = {"null": None, "empty": "", "blank": " \ufeff "}[how]
+            job.pop("name_explicit", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize("how", ["cleared", "null", "empty", "blank"])
+@pytest.mark.parametrize(
+    "resend",
+    [{}, {"prompt": "operator edit of the stale form"}, {"enabled": False}],
+    ids=["name_only", "with_prompt", "with_other_field"],
+)
+def test_stale_resend_after_agent_prompt_change_stays_redacted(jobs_file, how, resend):
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h", name="vault rotation")
+    _blank_stored_name(jobs_file, job["id"], how)
+    shown = get_job(job["id"])["name"]
+    assert shown == SECRET_PROMPT[:50].strip()
+
+    update_job(job["id"], {"prompt": "agent replacement prompt"},
+               mark_name_explicit=False)
+    assert get_job(job["id"])["name"] == shown
+    update_job(job["id"], {"name": shown, **resend})
+    _assert_secret_redacted(job["id"])
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [{"prompt": "new prompt"}, {"prompt": "", "skills": ["daily-digest"]}],
+    ids=["prompt", "skills"],
+)
+def test_payload_edit_pins_a_blank_name(jobs_file, updates):
+    """A payload edit that would change the derived name stores the name
+    readers showed before it, without the marker."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    _set_raw_name(jobs_file, job["id"], None)
+    update_job(job["id"], updates)
+    stored = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+    assert stored["name"] == SECRET_PROMPT[:50].strip()
+    assert "name_explicit" not in stored
+    assert get_job(job["id"])["name"] == SECRET_PROMPT[:50].strip()
+
+
+def test_edit_that_keeps_the_derived_name_leaves_a_blank_name_alone(jobs_file):
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    _set_raw_name(jobs_file, job["id"], None)
+    update_job(job["id"], {"enabled": False, "prompt": SECRET_PROMPT + " more"})
+    assert json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]["name"] is None
+
+
+@pytest.mark.parametrize("cleared", ["", None, " \ufeff"], ids=["empty", "null", "blank"])
+def test_clear_names_the_job_after_its_current_prompt(jobs_file, cleared):
+    """After a clear, readers show the name derived from the updated payload
+    and the marker is gone; a later prompt edit pins that name."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt="old prompt", schedule="every 1h", name="vault rotation")
+    assert get_job(job["id"])["name_explicit"] is True
+    update_job(job["id"], {"name": cleared, "prompt": SECRET_PROMPT})
+    shown = get_job(job["id"])
+    assert shown["name"] == SECRET_PROMPT[:50].strip()
+    assert "name_explicit" not in shown
+    # A later prompt edit keeps that name, and re-sending it is no rename.
+    update_job(job["id"], {"prompt": "harmless replacement prompt"},
+               mark_name_explicit=False)
+    assert get_job(job["id"])["name"] == shown["name"]
+    update_job(job["id"], {"name": shown["name"]})
+    _assert_secret_redacted(job["id"])
+
+
+def test_rename_and_case_only_rename_after_pin_are_shown(jobs_file):
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    _set_raw_name(jobs_file, job["id"], None)
+    update_job(job["id"], {"prompt": "agent replacement prompt"},
+               mark_name_explicit=False)
+    update_job(job["id"], {"name": "vault rotation"})
+    assert get_job(job["id"])["name_explicit"] is True
+    update_job(job["id"], {"name": "Vault Rotation"}, mark_name_explicit=False)
+    assert "name_explicit" not in get_job(job["id"])
+    update_job(job["id"], {"name": "VAULT ROTATION"})
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] == "VAULT ROTATION"
+    assert entry["name_redacted"] is False
+
+
+def test_unnamed_create_keeps_its_stored_derived_name(jobs_file):
+    """``create_job`` still stores the derived name without the marker, and
+    a prompt edit keeps it."""
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    before = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+    assert before["name"] == SECRET_PROMPT[:50].strip()
+    assert "name_explicit" not in before
+    update_job(job["id"], {"prompt": "harmless replacement prompt"})
+    after = json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]
+    assert after["name"] == before["name"]
+    assert "name_explicit" not in after
+
+
+# -- Unicode normalization in the audit's name guard -------------------------
+
+NFC_PROMPT = "Caf\u00e9 r\u00e9sum\u00e9 SECRET_PROMPT_MARKER rotate the vault token now"
+
+
+def _nfd(text):
+    import unicodedata
+
+    return unicodedata.normalize("NFD", text)
+
+
+def _nfc(text):
+    import unicodedata
+
+    return unicodedata.normalize("NFC", text)
+
+
+# A decomposed prompt cut after the "e" of a decomposed "\u00e9" at 49/50.
+_CUT_PROMPT = (
+    _nfd("Caf\u00e9 SECRET_PROMPT_MARKER rotate the vault").ljust(49, "_")
+    + "e\u0301 token now"
+)
+assert _CUT_PROMPT[49:51] == "e\u0301"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "name"),
+    [
+        (NFC_PROMPT, _nfd(NFC_PROMPT[:40])),
+        (_nfd(NFC_PROMPT), NFC_PROMPT[:40]),
+        ("\uff33\uff25\uff23\uff32\uff25\uff34 SECRET_PROMPT_MARKER", "SECRET SECRET_PROMPT"),
+        (_CUT_PROMPT, _nfc(_CUT_PROMPT[:50])),
+        ("Cafe\u0325\u0301 SECRET_PROMPT_MARKER", "Caf\u00e9"),
+        ("Caf\uff45\u0325\u0301 SECRET_PROMPT_MARKER", "Caf\u00e9"),
+    ],
+    ids=[
+        "nfd_name_nfc_prompt",
+        "nfc_name_nfd_prompt",
+        "fullwidth_prompt",
+        "cut_combining_mark",
+        "reordered_marks",
+        "fullwidth_reordered_marks",
+    ],
+)
+def test_prefix_guard_normalizes_unicode(jobs_file, prompt, name):
+    """A name that is the start of the prompt in another Unicode form is
+    still the prompt's text and is withheld."""
+    assert not prompt.startswith(name)
+    _write(jobs_file, {"jobs": [
+        {"id": "a", "name": name, "prompt": prompt, "name_explicit": True},
+        {"id": "b", "name": name, "prompt": "p", "no_agent": True,
+         "script": prompt, "name_explicit": True},
+    ]})
+    for entry in cron_unbound_jobs_report()["jobs"]:
+        assert entry["name"] is None
+        assert entry["name_redacted"] is True
+
+
+def test_normalized_rename_through_update_job_is_withheld(jobs_file):
+    """An operator surface that sends the shown name decomposed renames the
+    job as far as ``update_job`` is concerned; the audit still withholds it."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt=NFC_PROMPT, schedule="every 1h")
+    update_job(job["id"], {"name": _nfd(get_job(job["id"])["name"])})
+    assert get_job(job["id"])["name_explicit"] is True
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] is None
+
+
+def test_prefix_guard_keeps_distinct_accented_names(jobs_file):
+    _write(jobs_file, {"jobs": [
+        {"id": "a", "name": "r\u00e9sum\u00e9 digest", "prompt": NFC_PROMPT,
+         "name_explicit": True},
+    ]})
+    (entry,) = cron_unbound_jobs_report()["jobs"]
+    assert entry["name"] == "r\u00e9sum\u00e9 digest"
+
+
 AGENT_PROMPT ="Summarize the deploy notes for AGENT_PROMPT_MARKER each hour"
 
 

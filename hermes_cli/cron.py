@@ -8,6 +8,7 @@ pause/resume/run/remove, status, and tick.
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -749,6 +750,20 @@ def _read_jobs_for_audit() -> List[Dict[str, Any]]:
     return [job for job in jobs if isinstance(job, dict)]
 
 
+# Unicode forms the audit's name guard also compares under, besides the raw
+# text. A client or input method can send the same visible name composed or
+# decomposed, so the prompt and name may differ only in form. NFKC is used
+# rather than NFC: it composes the same way and also folds compatibility
+# variants such as fullwidth letters and ligatures, which only withholds
+# more, the safe direction for this guard. It also catches a prompt that
+# puts a second combining mark between a letter and the mark the name
+# composed into it, since normalizing reorders the marks before composing.
+# NFKD catches a derived name cut between a base letter and its combining
+# mark: composition merges the mark into the prompt's letter, so the cut name
+# is a prefix only once both sides are decomposed.
+_NAME_GUARD_FORMS = ("NFKC", "NFKD")
+
+
 def _explicit_job_name(job: Dict[str, Any]) -> Optional[str]:
     """Return the job's name only when a caller set it explicitly.
 
@@ -758,20 +773,29 @@ def _explicit_job_name(job: Dict[str, Any]) -> Optional[str]:
     marked ``name_explicit`` by ``create_job`` or ``update_job`` is returned.
     Anything else (no marker, a legacy job, a non-string name, a name that
     is blank after stripping whitespace and U+FEFF, or a name that is still
-    a prefix of the prompt or script) returns ``None``.
+    a prefix of the prompt or script) returns ``None``. The blank and prefix
+    checks run on the raw text and again after normalizing both sides to
+    each of ``_NAME_GUARD_FORMS``; a match in any form withholds the name.
     """
     from cron.jobs import strip_job_name
 
     name = job.get("name")
     if job.get("name_explicit") is not True or not isinstance(name, str):
         return None
-    stripped = strip_job_name(name)
-    if not stripped:
+    forms = [(None, strip_job_name(name))] + [
+        (form, strip_job_name(unicodedata.normalize(form, name)))
+        for form in _NAME_GUARD_FORMS
+    ]
+    if any(not stripped for _, stripped in forms):
         return None
     for field in ("prompt", "script"):
         payload = job.get(field)
-        if isinstance(payload, str) and strip_job_name(payload).startswith(stripped):
-            return None
+        if not isinstance(payload, str):
+            continue
+        for form, stripped in forms:
+            text = payload if form is None else unicodedata.normalize(form, payload)
+            if strip_job_name(text).startswith(stripped):
+                return None
     return name
 
 

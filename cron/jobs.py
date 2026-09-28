@@ -2579,7 +2579,13 @@ def update_job(
     ``mark_name_explicit`` says whether a rename (a non-empty name that
     differs from the name readers show) records ``name_explicit``. Operator
     surfaces keep the default; the agent-facing ``cronjob`` tool passes
-    False. Re-sending the stored name never changes the marker.
+    False. Re-sending the shown name never changes the marker.
+
+    The shown name never follows a payload edit. When the stored name is
+    blank and this update would change the name readers derive from the
+    prompt, skills or script, the name they showed before the update is
+    stored. A cleared name stays blank, so readers show the name derived
+    from the updated payload until a later payload edit pins it.
     """
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
@@ -2654,8 +2660,10 @@ def update_job(
             # as a rename: an operator rename sets the marker, an agent
             # rename clears it, and clearing the name clears it. Re-sending
             # the shown name, or omitting the name, keeps the stored marker.
-            # A client cannot be told apart from a stale editor that
-            # re-sends a name derived from an older prompt, which is why
+            # The shown name is pinned below, so a client that loaded the job
+            # before a later payload edit still re-sends the current name.
+            # A client that loaded it before another surface renamed or
+            # cleared it cannot be told apart from a rename, which is why
             # the editors omit an unedited name.
             updated.pop("name_explicit", None)
             _stored_explicit = job.get("name_explicit") is True
@@ -2715,6 +2723,20 @@ def update_job(
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+
+            # Pin the shown name. Readers derive a name from the payload when
+            # the stored one is blank, so that name used to follow every
+            # prompt, skill or script edit, and a client that had loaded the
+            # job before the edit re-sent the older derived name, which the
+            # comparison above counted as a rename. Storing the name readers
+            # showed before this update keeps the re-sent name equal to the
+            # shown one.
+            if "name" not in updates and not strip_job_name(
+                _coerce_job_text(job.get("name"))
+            ):
+                _shown_name = _job_display_name(job)
+                if _job_display_name(updated) != _shown_name:
+                    updated["name"] = _shown_name
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]

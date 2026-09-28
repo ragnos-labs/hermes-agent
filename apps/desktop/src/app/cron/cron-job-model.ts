@@ -1,6 +1,12 @@
+import { asText as displayText } from '@/lib/text'
 import type { CronJob, CronJobUpdates } from '@/types/hermes'
 
 const asText = (value: unknown): string => (typeof value === 'string' ? value : '')
+
+/** The name the desktop shows for a job, and pre-fills the editor with. */
+export function jobName(job: Pick<CronJob, 'name'>): string {
+  return displayText(job.name).trim()
+}
 
 /** Script-only cron jobs run a shell script on schedule with no LLM prompt. */
 export function jobIsScriptOnly(job: Pick<CronJob, 'no_agent' | 'script'>): boolean {
@@ -110,4 +116,13 @@ export function cronEditorUpdates(values: CronEditorSaveValues, options: CronEdi
   }
 
   return updates
+}
+
+/**
+ * Build the update payload for saving the editor opened on `job`. The editor
+ * was pre-filled with `jobName(job)`, so that is the shown name
+ * `cronEditorUpdates` compares the name field against.
+ */
+export function cronJobEditUpdates(job: CronJob, values: CronEditorSaveValues): CronJobUpdates {
+  return cronEditorUpdates(values, { scriptOnlyJob: jobIsScriptOnly(job), shownName: jobName(job) })
 }

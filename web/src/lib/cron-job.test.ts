@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildCronJobEditPayload,
   buildCronJobPayload,
   cronJobHasExecutionContent,
   cronJobFormFromJob,
@@ -198,5 +199,43 @@ describe("cronJobFormFromJob", () => {
     expect(cronJobFormFromJob(job)).toMatchObject({
       schedule: "2026-02-03T14:00:00+08:00",
     });
+  });
+});
+
+describe("buildCronJobEditPayload", () => {
+  // The server shows an unnamed job under the start of its prompt.
+  const unnamedJob: CronJob = {
+    id: "abc123def456",
+    enabled: true,
+    name: "sk-live-7f3a9c rotate the vault token",
+    prompt: "sk-live-7f3a9c rotate the vault token and post it",
+    schedule_display: "every 1h",
+  };
+
+  it("omits the name the edit form was pre-filled with", () => {
+    const edited = { ...cronJobFormFromJob(unnamedJob), prompt: "harmless" };
+    const payload = buildCronJobEditPayload(unnamedJob, edited);
+
+    expect(payload).not.toHaveProperty("name");
+    expect(payload.prompt).toBe("harmless");
+  });
+
+  it("omits a padded stored name the form showed", () => {
+    const job: CronJob = { ...unnamedJob, name: "  vault  " };
+    const edited = { ...cronJobFormFromJob(job), name: "vault" };
+
+    expect(buildCronJobEditPayload(job, edited)).not.toHaveProperty("name");
+  });
+
+  it("sends a rename and a cleared name", () => {
+    const form = cronJobFormFromJob(unnamedJob);
+
+    expect(
+      buildCronJobEditPayload(unnamedJob, { ...form, name: "Vault rotation" })
+        .name,
+    ).toBe("Vault rotation");
+    expect(buildCronJobEditPayload(unnamedJob, { ...form, name: "" }).name).toBe(
+      "",
+    );
   });
 });
