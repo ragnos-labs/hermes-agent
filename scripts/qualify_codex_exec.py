@@ -81,7 +81,7 @@ def main():
             + prior + ". Report the archive checkword from its actual tool result. Do not guess it."
         )
         assert marker in result.get("final_response", ""), "session lookup did not return the archived marker"
-        assert lesson in (home / "memories" / "MEMORY.md").read_text(), "memory was not persisted"
+        assert lesson in (home / "memories" / "MEMORY.md").read_text(encoding="utf-8"), "memory was not persisted"
         used = set()
         for message in result.get("messages", []):
             for tool in message.get("tool_calls") or []:
@@ -109,9 +109,9 @@ def main():
     db.close()
     receipt = {
         "schema_version": 1, "source_commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, encoding="utf-8",
         ).strip(),
-        "source_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True)),
+        "source_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True, encoding="utf-8")),
         "model": args.model, "calls": calls,
         "checks": ["native_memory_write", "native_session_search", "fresh_session_recall", "auxiliary_learning", "cli_only"],
         "status": "passed", "runtime_qualification": False,

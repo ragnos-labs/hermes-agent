@@ -221,13 +221,13 @@ def _stop(process: subprocess.Popen) -> None:
         if os.name == "nt":
             process.terminate()
         else:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGTERM)  # windows-footgun: ok - POSIX-only branch (nt handled above)
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
         if os.name == "nt":
             process.kill()
         else:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGKILL)  # windows-footgun: ok - POSIX-only branch (nt handled above)
         process.wait(timeout=3)
     except ProcessLookupError:
         pass
