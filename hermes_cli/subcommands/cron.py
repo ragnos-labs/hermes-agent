@@ -324,6 +324,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron doctor
     cron_subparsers.add_parser("doctor", help="Check scheduled jobs for common health issues")
 
+    # cron unbound-jobs (read-only JSON audit)
+    cron_subparsers.add_parser(
+        "unbound-jobs",
+        help=(
+            "List jobs with no recorded toolset bound as JSON (read-only); "
+            "exit 1 when any exist"
+        ),
+    )
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)

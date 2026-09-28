@@ -1485,6 +1485,7 @@ def cronjob(
     task_id: str = None,
     session_id: Optional[str] = None,
     toolset_bound: Optional[List[str]] = None,
+    name_from_agent: bool = False,
 ) -> str:
     """Unified cron job management tool.
 
@@ -1493,6 +1494,11 @@ def cronjob(
     update narrows the job's existing bound with it, so the scheduler never
     runs an agent-authored job wider than its author. ``None`` (programmatic
     and CLI callers) records no bound.
+
+    ``name_from_agent`` is True when a model chose ``name``. Such a name can
+    carry prompt content, so it is never marked explicit and stays redacted
+    in ``hermes cron unbound-jobs``. Operator callers (CLI, TUI) keep the
+    default.
     """
     del task_id  # unused but kept for handler signature compatibility
 
@@ -1607,6 +1613,7 @@ def cronjob(
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
                     toolset_bound=toolset_bound,
+                    mark_name_explicit=not name_from_agent,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1950,7 +1957,9 @@ def cronjob(
                 updates["toolset_bound"] = _narrow_toolset_bound(
                     job.get("toolset_bound"), toolset_bound
                 )
-            updated = update_job(job_id, updates)
+            updated = update_job(
+                job_id, updates, mark_name_explicit=not name_from_agent
+            )
             _notify_provider_jobs_changed_safe()
             _upd_result: Dict[str, Any] = {"success": True, "job": _format_job(updated)}
             # An update can switch a job into monitor / no_agent mode or
@@ -2098,10 +2107,15 @@ def _creator_toolset_bound(
     Uses the agent's own enabled list when dispatch supplies it. Otherwise
     falls back to the allowlist cap of the session's platform. ``None``
     means the caller is unbounded (no enabled list and no cap).
+
+    Disabled toolsets are removed at the tool level: an enabled composite
+    that still holds a disabled tool is replaced by the toolsets it covers
+    without that tool (see ``subtract_disabled_toolsets``).
     """
-    disabled = {str(t) for t in (creator_disabled or [])}
+    from hermes_cli.tools_config import subtract_disabled_toolsets
+
     if creator_enabled is not None:
-        return sorted({str(t) for t in creator_enabled} - disabled)
+        return subtract_disabled_toolsets(list(creator_enabled), creator_disabled)
     from gateway.session_context import get_session_env
     from hermes_cli.config import load_config
     from hermes_cli.tools_config import toolset_cap
@@ -2110,7 +2124,7 @@ def _creator_toolset_bound(
     cap = toolset_cap(load_config(), platform)
     if cap is None:
         return None
-    return sorted({str(t) for t in cap} - disabled)
+    return subtract_disabled_toolsets(sorted(cap), creator_disabled)
 
 
 def _cronjob_handler(args, **kw):
@@ -2171,6 +2185,8 @@ def _cronjob_handler(args, **kw):
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         toolset_bound=_bound,
+        # A model-chosen name can copy prompt content; never mark it explicit.
+        name_from_agent=True,
     )
 
 

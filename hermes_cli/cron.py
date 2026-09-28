@@ -645,7 +645,14 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
 
 
 def cron_doctor() -> int:
-    """Run read-only cron health checks and return a shell-friendly status."""
+    """Run cron health checks and return a shell-friendly status.
+
+    Not read-only. Loading jobs through ``list_jobs()`` can create the cron
+    ``output/`` directory, ``executions.db`` and ``.jobs.lock``, and can
+    rewrite ``jobs.json`` when the store is not in the standard wrapped
+    shape. The
+    unbound-jobs warning at the end reads the store without writing.
+    """
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=False)
@@ -661,6 +668,7 @@ def cron_doctor() -> int:
             print(color(f"  Checked {len(jobs)} active job(s).", Colors.DIM))
         else:
             print(color("  No active jobs configured.", Colors.DIM))
+        _print_unbound_jobs_warning()
         return 0
 
     issue_count = sum(len(issues) for _, issues in findings)
@@ -674,7 +682,161 @@ def cron_doctor() -> int:
             print(f"    - {issue}")
     print()
     print(color("Next: fix the listed job config, then run `hermes cron doctor` again.", Colors.DIM))
+    _print_unbound_jobs_warning()
     return 1
+
+
+def _print_unbound_jobs_warning() -> None:
+    """Warn when jobs carry no toolset bound. Counts only; no exit change.
+
+    The full list is ``hermes cron unbound-jobs``. Doctor stays a health
+    check, so this warning never changes its exit status.
+    """
+    report = cron_unbound_jobs_report()
+    if report["status"] == "unreadable":
+        print(color(
+            "! Could not audit jobs for a toolset bound; run `hermes cron unbound-jobs`.",
+            Colors.YELLOW,
+        ))
+    elif report["unbound_count"]:
+        print(color(
+            f"! {report['unbound_count']} job(s) have no recorded toolset bound and "
+            "run under the full cron cap; run `hermes cron unbound-jobs`.",
+            Colors.YELLOW,
+        ))
+
+
+UNBOUND_JOBS_SCHEMA = "hermes.cron.unbound_jobs.v1"
+
+
+def _read_jobs_for_audit() -> List[Dict[str, Any]]:
+    """Read the job store without repairing, migrating or writing it.
+
+    ``load_jobs()`` may rewrite a damaged store, so the audit parses the file
+    itself with the scheduler's own tolerant parser (``_parse_jobs_file``:
+    BOM accepted, control characters retried with ``strict=False``) and
+    accepts the same shapes ``load_jobs()`` returns jobs from:
+
+    - a bare list of jobs;
+    - a dict whose ``jobs`` value is a list, or an id-keyed map of jobs;
+    - a dict without a ``jobs`` key, which ``load_jobs()`` also reads as no
+      jobs, so the scheduler runs nothing from it.
+
+    Raises when the file cannot be parsed, when the top level is neither a
+    list nor a dict, or when ``jobs`` is present but is neither a list nor a
+    dict. Those are reported as unreadable, never as clean.
+    """
+    from cron.jobs import _current_cron_store, _parse_jobs_file
+
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+    data, _ = _parse_jobs_file(jobs_file)
+    if isinstance(data, list):
+        jobs = data
+    elif isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        if isinstance(jobs, dict):
+            jobs = [
+                {**value, "id": value.get("id") or key}
+                for key, value in jobs.items()
+                if isinstance(value, dict)
+            ]
+    else:
+        raise ValueError("jobs file has an unknown shape")
+    if not isinstance(jobs, list):
+        raise ValueError("jobs file has an unknown shape")
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def _explicit_job_name(job: Dict[str, Any]) -> Optional[str]:
+    """Return the job's name only when a caller set it explicitly.
+
+    An unnamed job gets its first 50 characters of prompt, skill or script as
+    its name, and a later prompt edit keeps that derived name, so the name
+    can carry payload text that no longer matches the prompt. Only a name
+    marked ``name_explicit`` by ``create_job`` or ``update_job`` is returned.
+    Anything else (no marker, a legacy job, a non-string name, or a name that
+    is still a prefix of the prompt or script) returns ``None``.
+    """
+    name = job.get("name")
+    if job.get("name_explicit") is not True or not isinstance(name, str):
+        return None
+    stripped = name.strip()
+    if not stripped:
+        return None
+    for field in ("prompt", "script"):
+        payload = job.get(field)
+        if isinstance(payload, str) and payload.lstrip().startswith(stripped):
+            return None
+    return name
+
+
+def cron_unbound_jobs_report() -> Dict[str, Any]:
+    """Build the read-only report of jobs that carry no ``toolset_bound``.
+
+    Jobs created or edited with the ``cronjob`` tool since the toolset bound
+    shipped record their author's toolsets as ``toolset_bound``. Jobs created
+    before then, and every job created with ``hermes cron``, the dashboard,
+    blueprints or suggestions, carry none and run under the full ``cron``
+    platform cap. The store records no reliable author, so the report lists
+    every unbound job; the operator decides which ones an agent created.
+
+    ``name`` is included only when it was set explicitly (see
+    ``_explicit_job_name``). Otherwise it is ``null`` and ``name_redacted``
+    is ``true``, because a derived name is payload text.
+    """
+    try:
+        jobs = _read_jobs_for_audit()
+    except Exception as exc:
+        return {
+            "schema": UNBOUND_JOBS_SCHEMA,
+            "status": "unreadable",
+            "error": type(exc).__name__,
+            "total_jobs": None,
+            "unbound_count": None,
+            "jobs": [],
+        }
+    unbound = []
+    for job in jobs:
+        if job.get("toolset_bound") is not None:
+            continue
+        origin = job.get("origin")
+        name = _explicit_job_name(job)
+        unbound.append(
+            {
+                "id": str(job.get("id", "")),
+                "name": name,
+                "name_redacted": name is None,
+                "created_at": job.get("created_at"),
+                "enabled": bool(job.get("enabled", True)),
+                "no_agent": bool(job.get("no_agent", False)),
+                "enabled_toolsets": job.get("enabled_toolsets"),
+                "origin_platform": origin.get("platform") if isinstance(origin, dict) else None,
+            }
+        )
+    unbound.sort(key=lambda item: item["id"])
+    return {
+        "schema": UNBOUND_JOBS_SCHEMA,
+        "status": "unbound_jobs_found" if unbound else "no_unbound_jobs",
+        "error": None,
+        "total_jobs": len(jobs),
+        "unbound_count": len(unbound),
+        "jobs": unbound,
+    }
+
+
+def cron_unbound_jobs() -> int:
+    """Print the unbound-jobs report as JSON. Read-only.
+
+    Exit status: 0 when no job is unbound, 1 when at least one is, 2 when the
+    job store cannot be read (never reported as clean).
+    """
+    report = cron_unbound_jobs_report()
+    print(json.dumps(report, indent=2, sort_keys=True))
+    if report["status"] == "unreadable":
+        return 2
+    return 1 if report["unbound_count"] else 0
 
 
 def cron_create(args):
@@ -967,6 +1129,12 @@ def cron_command(args):
     if subcmd == "doctor":
         return cron_doctor()
 
+    if subcmd == "unbound-jobs":
+        rc = cron_unbound_jobs()
+        if rc:
+            sys.exit(rc)
+        return 0
+
     if subcmd == "tick":
         return cron_tick()
 
@@ -999,5 +1167,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|unbound-jobs|tick]")
     sys.exit(1)

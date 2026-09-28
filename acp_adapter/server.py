@@ -1136,10 +1136,48 @@ class HermesACPAgent(acp.Agent):
             from hermes_cli.config import load_config
             from hermes_cli.tools_config import (
                 bound_enabled_toolsets,
+                configured_mcp_server_names,
                 mcp_disabled_for_platform,
             )
+            from tools.mcp_tool import sanitize_mcp_name_component
 
             cfg = load_config()
+            # A client server must not reuse the name of a server the
+            # operator configured. The cap admits configured server names,
+            # so a reused name would register the client's own command or
+            # URL under the operator's server. Compare the sanitized form
+            # too, because tool names are built from it. If configured or
+            # plugin server names cannot be read, this raises and the
+            # handler below refuses every client server.
+            configured = configured_mcp_server_names(cfg)
+            configured_keys = configured | {
+                sanitize_mcp_name_component(name) for name in configured
+            }
+            colliding = sorted(
+                {
+                    server.name
+                    for server in mcp_servers
+                    if server.name in configured_keys
+                    or sanitize_mcp_name_component(server.name) in configured_keys
+                }
+            )
+            if colliding:
+                # Names only: the client's command, URL, env and headers
+                # can carry credentials and are never logged. The names are
+                # client-supplied, so they are logged with repr to keep
+                # control characters and newlines out of the log line.
+                logger.warning(
+                    "Session %s: refusing %d ACP-provided MCP server(s) whose "
+                    "names match configured MCP servers: %r",
+                    state.session_id,
+                    len(colliding),
+                    colliding,
+                )
+                mcp_servers = [
+                    server for server in mcp_servers if server.name not in colliding
+                ]
+                if not mcp_servers:
+                    return
             mcp_off = mcp_disabled_for_platform(cfg, "acp")
             enabled_toolsets = None
             if not mcp_off:

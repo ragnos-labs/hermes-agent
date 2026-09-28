@@ -208,3 +208,162 @@ class TestHandleFunctionCallPassesCreatorToolsets:
         assert seen["name"] == "cronjob"
         assert seen["creator_enabled_toolsets"] == ["web"]
         assert seen["creator_disabled_toolsets"] == ["terminal"]
+
+
+# -- composites and malformed bounds -------------------------------------------
+
+
+def _tools_of(names):
+    from toolsets import resolve_toolset
+
+    tools: set = set()
+    for name in names:
+        tools |= set(resolve_toolset(name))
+    return tools
+
+
+class TestDisabledComposites:
+    """A disabled toolset is removed tool by tool, not only by name."""
+
+    def test_composite_creator_does_not_keep_disabled_toolset(self, cron_dir):
+        from cron.jobs import get_job
+
+        created = _dispatch(
+            {
+                "action": "create",
+                "schedule": "every 1h",
+                "prompt": "Check",
+                "enabled_toolsets": ["web", "file"],
+            },
+            creator_enabled_toolsets=["hermes-acp"],
+            creator_disabled_toolsets=["web"],
+        )
+        assert created["success"] is True
+        job = get_job(created["job_id"])
+        bound = job["toolset_bound"]
+        assert "hermes-acp" not in bound
+        assert "web" not in bound
+        assert {"file", "terminal"} <= set(bound)
+        assert not _tools_of(bound) & _tools_of(["web"])
+        resolved = _resolve_cron_enabled_toolsets(job, NO_MCP_CFG)
+        assert resolved == ["file"]
+        assert not _tools_of(resolved) & _tools_of(["web"])
+
+    def test_cap_fallback_decomposes_composite(self, cron_dir, monkeypatch):
+        from tools.cronjob_tools import _creator_toolset_bound
+
+        cfg = dict(NO_MCP_CFG, platform_toolsets={"telegram": ["debugging"]})
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: dict(cfg))
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+        bound = _creator_toolset_bound(None, ["web"])
+        assert "debugging" not in bound
+        assert "web" not in bound
+        assert "file" in bound
+        assert not _tools_of(bound) & _tools_of(["web"])
+
+    def test_disabled_platform_bundle_keeps_core_tools(self):
+        from toolsets import bundle_non_core_tools
+
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        bound = subtract_disabled_toolsets(["hermes-gateway"], ["hermes-discord"])
+        assert "hermes-gateway" not in bound
+        # A disabled platform bundle removes only its platform tools, as
+        # model_tools does; the shared core toolsets survive.
+        assert {"file", "terminal", "web"} <= set(bound)
+        assert not _tools_of(bound) & set(bundle_non_core_tools("hermes-discord"))
+
+    def test_disabled_by_name_is_dropped(self):
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        assert subtract_disabled_toolsets(["web", "file"], ["web"]) == ["file"]
+        assert subtract_disabled_toolsets(["hermes-acp"], ["hermes-acp"]) == []
+
+    def test_unrelated_and_mcp_names_are_kept(self):
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        assert subtract_disabled_toolsets(["file", "mcp-demo"], ["web"]) == [
+            "file",
+            "mcp-demo",
+        ]
+        assert subtract_disabled_toolsets(["web", "web"], None) == ["web"]
+
+    def test_resolution_error_propagates(self):
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        with patch("toolsets.resolve_toolset", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                subtract_disabled_toolsets(["hermes-acp"], ["web"])
+
+    def test_unresolvable_enabled_composite_is_not_kept_whole(self, cron_dir):
+        """A composite that fails to resolve raises instead of passing
+        through whole, and the cronjob tool refuses the create."""
+        import toolsets
+
+        from cron.jobs import load_jobs
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        real_resolve = toolsets.resolve_toolset
+
+        def resolve(name, *args, **kwargs):
+            if name == "hermes-acp":
+                raise RuntimeError("composite unresolvable")
+            return real_resolve(name, *args, **kwargs)
+
+        with patch("toolsets.resolve_toolset", side_effect=resolve):
+            with pytest.raises(RuntimeError):
+                subtract_disabled_toolsets(["hermes-acp", "file"], ["web"])
+            result = _dispatch(
+                {"action": "create", "schedule": "every 1h", "prompt": "Check"},
+                creator_enabled_toolsets=["hermes-acp"],
+                creator_disabled_toolsets=["web"],
+            )
+        assert result["success"] is False
+        assert load_jobs() == []
+
+    def test_unresolvable_candidate_is_skipped(self):
+        """A replacement candidate that fails to resolve only narrows."""
+        import toolsets
+
+        from hermes_cli.tools_config import subtract_disabled_toolsets
+
+        real_resolve = toolsets.resolve_toolset
+
+        def resolve(name, *args, **kwargs):
+            if name == "file":
+                raise RuntimeError("candidate unresolvable")
+            return real_resolve(name, *args, **kwargs)
+
+        with patch("toolsets.resolve_toolset", side_effect=resolve):
+            bound = subtract_disabled_toolsets(["hermes-acp"], ["web"])
+        assert "hermes-acp" not in bound
+        assert "file" not in bound
+        assert "terminal" in bound
+
+
+class TestMalformedExistingBound:
+    def test_update_turns_malformed_bound_into_empty(self, cron_dir):
+        from cron.jobs import get_job, update_job
+
+        created = _dispatch(
+            {"action": "create", "schedule": "every 1h", "prompt": "Check"},
+            creator_enabled_toolsets=["web"],
+        )
+        job_id = created["job_id"]
+        update_job(job_id, {"toolset_bound": "web"})
+        assert get_job(job_id)["toolset_bound"] == "web"
+
+        updated = _dispatch(
+            {"action": "update", "job_id": job_id, "name": "renamed"},
+            creator_enabled_toolsets=["terminal", "web"],
+        )
+        assert updated["success"] is True
+        job = get_job(job_id)
+        assert job["toolset_bound"] == []
+        assert _resolve_cron_enabled_toolsets(job, NO_MCP_CFG) == []
+
+    @pytest.mark.parametrize("existing", ["web", {"web": True}, 3])
+    def test_narrow_rejects_non_list(self, existing):
+        from tools.cronjob_tools import _narrow_toolset_bound
+
+        assert _narrow_toolset_bound(existing, ["web"]) == []

@@ -852,12 +852,20 @@ toolsets") request. A platform with no entry of its own is capped by the
 capped. The skills curator is capped by its `curator` entry, else the `cli`
 entry, and skips its run when `skills` falls outside it.
 
-Two more bounds follow from the cap:
+More bounds follow from the cap:
 
 - **Agent-created cron jobs.** When an agent creates or edits a cron job with
   the `cronjob` tool, the job records that agent's toolsets and never runs
   with more, whatever toolsets the job asks for. Jobs created with
-  `hermes cron` or the dashboard carry no such bound.
+  `hermes cron` or the dashboard carry no such bound. The agent's
+  `agent.disabled_toolsets` are removed tool by tool, so a composite such as
+  `hermes-acp` is recorded as the toolsets it covers without the disabled
+  tools.
+- **Client MCP servers in ACP.** A server that an ACP client supplies is
+  refused (and logged by name only) in session new, load, resume and fork
+  when its name matches an MCP server in `mcp_servers` or from a plugin,
+  including a disabled one. The cap admits configured server names, so the
+  client could otherwise run its own command under the operator's name.
 - **Hosted rooms on the API server.** A room's execution policy is honored
   only on a request that carries a room grant, and its toolsets are capped by
   the `api_server` entry (else `cli`). A capped deployment that uses hosted
@@ -873,6 +881,35 @@ A composite is kept only when the cap covers all of its tools; otherwise it is
 replaced by the cap toolsets it fully contains. MCP servers are on by default
 (upstream behavior), so an MCP server passes the cap unless the entry (or the
 `cli` fallback) lists `no_mcp`, or `agent.no_mcp` is set.
+
+#### Deploy precondition: cron jobs without a bound
+
+Jobs created before the toolset bound shipped have no `toolset_bound` and
+keep running under the full `cron` cap until an agent edits them. The job
+store does not record who created a job, so Hermes cannot tell those
+agent-created jobs from jobs the operator created, and does not guess.
+Before relying on the bound, run the read-only audit and review each job it
+lists:
+
+```sh
+hermes cron unbound-jobs
+```
+
+It prints JSON (`schema: hermes.cron.unbound_jobs.v1`) listing every job
+without a bound (id, name, creation time, enabled state, per-job toolsets
+and origin platform, never the prompt) and exits 0 when there are none, 1
+when there are some and 2 when the job store cannot be read. Remove or
+recreate any job an agent created, or edit it with `hermes cron edit` to
+narrow its toolsets.
+
+A job created without a name is named after the start of its prompt, skill
+or script, and a name an agent chose through the `cronjob` tool can copy
+prompt content. The audit therefore prints a name only when an operator set
+or changed it (CLI, dashboard, desktop app). Re-sending the stored name with
+an edit does not count. Every other name, including the names of jobs
+created before this marker existed, is printed as `"name": null` with
+`"name_redacted": true`; use the id to find the job. `hermes cron doctor` also prints a one-line warning with
+the number of unbound jobs, without changing its exit status.
 
 ### Turning MCP off everywhere
 

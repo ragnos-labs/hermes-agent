@@ -580,6 +580,29 @@ def _schedule_display_for_job(job: Dict[str, Any]) -> str:
     return "?"
 
 
+def _job_display_name(job: Dict[str, Any]) -> str:
+    """Return the name readers show for ``job`` (``get_job``, ``list_jobs``).
+
+    A stored name that is missing, null or blank is replaced by the first 50
+    characters of the prompt, first skill, script or id. A non-blank stored
+    name is returned stripped. Editors pre-fill this name and send it back,
+    so ``update_job`` compares a new name against it.
+    """
+    normalized = _apply_skill_fields(job)
+    name = _coerce_job_text(normalized.get("name")).strip()
+    if name:
+        return name
+    script = _coerce_job_text(normalized.get("script")).strip()
+    label_source = (
+        _coerce_job_text(normalized.get("prompt"))
+        or (normalized["skills"][0] if normalized.get("skills") else "")
+        or script
+        or _coerce_job_text(normalized.get("id"), "unknown")
+        or "cron job"
+    )
+    return label_source[:50].strip() or "cron job"
+
+
 def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """Return a read-safe cron job shape for UI/API/tool/scheduler consumers.
 
@@ -593,18 +616,7 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized["id"] = job_id
     normalized["prompt"] = prompt
 
-    name = _coerce_job_text(normalized.get("name")).strip()
-    if not name:
-        script = _coerce_job_text(normalized.get("script")).strip()
-        label_source = (
-            prompt
-            or (normalized["skills"][0] if normalized.get("skills") else "")
-            or script
-            or job_id
-            or "cron job"
-        )
-        name = label_source[:50].strip() or "cron job"
-    normalized["name"] = name
+    normalized["name"] = _job_display_name(normalized)
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
 
     # Display state is derived from the scheduler-honoured ``enabled`` flag so a
@@ -2226,6 +2238,7 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     toolset_bound: Optional[List[str]] = None,
+    mark_name_explicit: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2293,6 +2306,13 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        toolset_bound: The creating agent's effective toolsets. None for
+                jobs created by the user.
+        mark_name_explicit: Whether a supplied ``name`` records
+                ``name_explicit``. Operator surfaces (CLI, dashboard,
+                desktop, blueprints) keep the default. The agent-facing
+                ``cronjob`` tool passes False, because a model-chosen name
+                can carry prompt content.
 
     Returns:
         The created job dict
@@ -2451,6 +2471,14 @@ def create_job(
         job["toolset_bound"] = sorted(
             {str(t).strip() for t in toolset_bound if str(t).strip()}
         )
+    # Mark a name an operator set. Without it the name was derived from the
+    # prompt, skills or script, or was chosen by an agent (which can copy
+    # prompt content into it), and readers that must not expose the payload
+    # (``hermes cron unbound-jobs``) withhold it. Absent key = derived,
+    # agent-chosen or unknown, so existing and unnamed jobs stay
+    # byte-identical.
+    if mark_name_explicit and name and str(name).strip():
+        job["name_explicit"] = True
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2523,8 +2551,19 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    *,
+    mark_name_explicit: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Update a job by ID, refreshing derived schedule fields when needed.
+
+    ``mark_name_explicit`` says whether a rename (a non-empty name that
+    differs from the stored one) records ``name_explicit``. Operator
+    surfaces keep the default; the agent-facing ``cronjob`` tool passes
+    False. Re-sending the stored name never changes the marker.
+    """
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2587,6 +2626,29 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            # ``name_explicit`` follows the name, never the payload. Editors
+            # re-send the name they were shown with every edit: the stored
+            # name (stripped), or the name ``get_job`` derives from the
+            # prompt when the stored one is missing, null or blank.
+            # ``_job_display_name`` returns exactly that shown name. Only a
+            # name that differs from it counts as a rename: an operator
+            # rename sets the marker, an agent rename clears it, and
+            # clearing the name clears it. Re-sending the shown name, or
+            # omitting the name, keeps the stored marker.
+            updated.pop("name_explicit", None)
+            _stored_explicit = job.get("name_explicit") is True
+            if "name" in updates:
+                _new_name = str(updates.get("name") or "").strip()
+                if not _new_name:
+                    _name_explicit = False
+                elif _new_name == _job_display_name(job):
+                    _name_explicit = _stored_explicit
+                else:
+                    _name_explicit = bool(mark_name_explicit)
+            else:
+                _name_explicit = _stored_explicit
+            if _name_explicit:
+                updated["name_explicit"] = True
 
             if (
                 is_terminal_job(job)
