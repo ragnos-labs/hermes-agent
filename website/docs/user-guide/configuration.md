@@ -912,8 +912,11 @@ Hermes showed for it therefore does not count as a change, even if the
 prompt changed in the meantime. The dashboard and desktop app send the name
 only when you edit the name field. An older client that re-sends the name
 it loaded after another surface renamed or cleared the job changes the name
-back, and that counts as a change. To stop the audit printing a name, clear
-it in the dashboard or desktop app. Every other name, including the names
+back, and that counts as a change, so the audit prints the restored name even
+when it is the start of an older prompt. To stop the audit printing a name,
+clear it in the dashboard or desktop app. After you remove a secret from a
+prompt, clear the job's name as well: a name kept from before the edit still
+holds the start of the old prompt. Every other name, including the names
 of jobs created before this marker existed, is printed as `"name": null`
 with `"name_redacted": true`; use the id to find the job.
 `hermes cron doctor` also prints a one-line warning with the number of

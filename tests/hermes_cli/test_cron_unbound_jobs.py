@@ -588,6 +588,126 @@ def test_edit_that_keeps_the_derived_name_leaves_a_blank_name_alone(jobs_file):
     assert json.loads(jobs_file.read_text(encoding="utf-8"))["jobs"][0]["name"] is None
 
 
+def _stored_record(path):
+    (stored,) = json.loads(path.read_text(encoding="utf-8"))["jobs"]
+    return stored
+
+
+def test_skills_edit_without_prompt_pins_the_old_first_skill(jobs_file):
+    """A skills-only job shows its first skill. Editing the skills, with no
+    prompt key in the update, pins the skill readers showed before."""
+    from cron.jobs import create_job, get_job, update_job
+
+    job = create_job(prompt="", schedule="every 1h", skills=["  old-digest  "])
+    _set_raw_name(jobs_file, job["id"], None)
+    assert get_job(job["id"])["name"] == "old-digest"
+    update_job(job["id"], {"skills": ["new-digest"]})
+    stored = _stored_record(jobs_file)
+    assert stored["name"] == "old-digest"
+    assert "name_explicit" not in stored
+    assert get_job(job["id"])["name"] == "old-digest"
+
+
+def test_script_edit_without_prompt_pins_the_old_script(jobs_file):
+    """A script-only job shows the first 50 characters of its script.
+    Editing the script, with no prompt key in the update, pins that name."""
+    from cron.jobs import create_job, get_job, update_job
+
+    old_script = "  " + "old-collector-" * 5 + ".sh"
+    job = create_job(prompt=None, schedule="every 1h", script=old_script,
+                     no_agent=True)
+    _set_raw_name(jobs_file, job["id"], None)
+    shown = old_script.strip()[:50]
+    assert get_job(job["id"])["name"] == shown
+    update_job(job["id"], {"script": "new-collector.sh"})
+    stored = _stored_record(jobs_file)
+    assert stored["name"] == shown
+    assert "name_explicit" not in stored
+    assert get_job(job["id"])["name"] == shown
+
+
+@pytest.mark.parametrize("raw_name", [None, "", " \ufeff "], ids=["null", "empty", "blank"])
+def test_pin_drops_a_stale_marker_on_a_blank_name(jobs_file, raw_name):
+    """A hand edit or a foreign writer can leave ``name_explicit: true`` on a
+    blank name. The pinned name is derived, so the update drops the marker and
+    the audit keeps the old prompt prefix redacted."""
+    from cron.jobs import create_job, update_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    data = json.loads(jobs_file.read_text(encoding="utf-8"))
+    data["jobs"][0]["name"] = raw_name
+    data["jobs"][0]["name_explicit"] = True
+    jobs_file.write_text(json.dumps(data), encoding="utf-8")
+
+    update_job(job["id"], {"prompt": "harmless replacement prompt"},
+               mark_name_explicit=False)
+    stored = _stored_record(jobs_file)
+    assert stored["name"] == SECRET_PROMPT[:50].strip()
+    assert "name_explicit" not in stored
+    _assert_secret_redacted(job["id"])
+
+
+def _stale_marker_on_blank_name(path, raw_name):
+    """A hand edit or a foreign writer left ``name_explicit: true`` on a
+    blank name. Readers show the first 50 characters of the prompt."""
+    from cron.jobs import create_job, get_job
+
+    job = create_job(prompt=SECRET_PROMPT, schedule="every 1h")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["jobs"][0]["name"] = raw_name
+    data["jobs"][0]["name_explicit"] = True
+    path.write_text(json.dumps(data), encoding="utf-8")
+    shown = get_job(job["id"])["name"]
+    assert shown == SECRET_PROMPT[:50].strip()
+    return job["id"], shown
+
+
+def _assert_prefix_not_explicit(path, job_id, shown):
+    stored = _stored_record(path)
+    assert stored["name"] in (None, "", " \ufeff ", shown)
+    assert "name_explicit" not in stored
+    _assert_secret_redacted(job_id)
+
+
+@pytest.mark.parametrize("raw_name", [None, "", " \ufeff "], ids=["null", "empty", "blank"])
+def test_operator_resend_of_shown_name_ignores_a_stale_marker(jobs_file, raw_name):
+    """An older client re-sends the name it was shown with a prompt edit.
+    The stale marker on the blank name must not make that name explicit."""
+    from cron.jobs import update_job
+
+    job_id, shown = _stale_marker_on_blank_name(jobs_file, raw_name)
+    update_job(job_id, {"prompt": "harmless replacement prompt", "name": shown})
+    assert _stored_record(jobs_file)["name"] == shown
+    _assert_prefix_not_explicit(jobs_file, job_id, shown)
+
+
+@pytest.mark.parametrize("raw_name", [None, "", " \ufeff "], ids=["null", "empty", "blank"])
+def test_agent_resend_of_shown_name_ignores_a_stale_marker(jobs_file, monkeypatch, raw_name):
+    """The ``cronjob`` tool re-sends the whole schema, shown name included."""
+    job_id, shown = _stale_marker_on_blank_name(jobs_file, raw_name)
+    resent = _agent_cronjob(monkeypatch, {
+        "action": "update", "job_id": job_id,
+        "prompt": "harmless replacement prompt", "name": shown,
+    })
+    assert resent["success"] is True
+    assert _stored_record(jobs_file)["name"] == shown
+    _assert_prefix_not_explicit(jobs_file, job_id, shown)
+
+
+@pytest.mark.parametrize("raw_name", [None, "", " \ufeff "], ids=["null", "empty", "blank"])
+def test_resend_then_later_prompt_edit_ignores_a_stale_marker(jobs_file, raw_name):
+    """A schedule-only edit re-sends the shown name and stores it; a later
+    prompt edit must not find an explicit name to keep."""
+    from cron.jobs import update_job
+
+    job_id, shown = _stale_marker_on_blank_name(jobs_file, raw_name)
+    update_job(job_id, {"schedule": "every 2h", "name": shown})
+    _assert_prefix_not_explicit(jobs_file, job_id, shown)
+    update_job(job_id, {"prompt": "harmless replacement prompt"})
+    assert _stored_record(jobs_file)["name"] == shown
+    _assert_prefix_not_explicit(jobs_file, job_id, shown)
+
+
 @pytest.mark.parametrize("cleared", ["", None, " \ufeff"], ids=["empty", "null", "blank"])
 def test_clear_names_the_job_after_its_current_prompt(jobs_file, cleared):
     """After a clear, readers show the name derived from the updated payload

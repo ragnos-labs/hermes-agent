@@ -2665,8 +2665,14 @@ def update_job(
             # A client that loaded it before another surface renamed or
             # cleared it cannot be told apart from a rename, which is why
             # the editors omit an unedited name.
+            # A blank stored name was never chosen, so a stale marker on it
+            # (a hand edit or a foreign writer can leave one) does not count.
+            # Otherwise re-sending the shown name, the old prompt prefix,
+            # would store that prefix as an operator-chosen name.
             updated.pop("name_explicit", None)
-            _stored_explicit = job.get("name_explicit") is True
+            _stored_explicit = job.get("name_explicit") is True and bool(
+                strip_job_name(_coerce_job_text(job.get("name")))
+            )
             if "name" in updates:
                 _new_name = strip_job_name(str(updates.get("name") or ""))
                 if not _new_name:
@@ -2736,6 +2742,9 @@ def update_job(
             ):
                 _shown_name = _job_display_name(job)
                 if _job_display_name(updated) != _shown_name:
+                    # The pinned name is derived, never chosen: the stored
+                    # name is blank, so ``_stored_explicit`` above is False
+                    # and no marker was carried over.
                     updated["name"] = _shown_name
 
             if schedule_changed:
