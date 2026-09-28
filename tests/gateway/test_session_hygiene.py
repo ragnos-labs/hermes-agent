@@ -2026,3 +2026,370 @@ async def test_hygiene_fence_cancel_still_takes_the_timeout_path(
     finally:
         release_worker.set()
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups to the worker ``TimeoutError`` fix: cooldown label, slow wake,
+# and a cancelled worker future
+# ---------------------------------------------------------------------------
+
+
+def _hygiene_stub_agent(session_id, compress, cleanup_done, **attrs):
+    """Build a fake hygiene ``AIAgent`` class around ``compress``."""
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id", session_id)
+        self._session_db = kwargs.get("session_db")
+        self.context_compressor = SimpleNamespace(
+            bind_session_state=MagicMock(),
+            _last_compress_aborted=False,
+            _last_aux_model_failure_model=None,
+        )
+        self.shutdown_memory_provider = MagicMock()
+        self.close = MagicMock(side_effect=cleanup_done.set)
+
+    namespace = {"__init__": __init__, "_compress_context": compress}
+    namespace.setdefault("_last_compaction_in_place", False)
+    namespace.update(attrs)
+    return type("HygieneStubAgent", (), namespace)
+
+
+def _count_extend_calls(monkeypatch, limit=50):
+    """Count host wait-loop passes whose slice expired before the worker
+    finished. Raises after ``limit`` passes so a regressed spin fails fast."""
+    gateway_run = importlib.import_module("gateway.run")
+    real_extend = gateway_run.hygiene_wait_should_extend
+    calls = []
+
+    def _counting_extend(**kwargs):
+        calls.append(kwargs)
+        if len(calls) > limit:
+            raise _SpinDetected(f"host wait loop ran {len(calls)} passes")
+        return real_extend(**kwargs)
+
+    monkeypatch.setattr(gateway_run, "hygiene_wait_should_extend", _counting_extend)
+    return calls
+
+
+def _wait_for_expired_slices(calls, count, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while len(calls) < count:
+        if time.monotonic() > deadline:
+            raise AssertionError(f"host saw {len(calls)} expired slices, wanted {count}")
+        time.sleep(0.005)
+
+
+class _WorkerRuntimeError(RuntimeError):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_cls", "expired_slices"),
+    [
+        (_ProviderReadTimeout, 0),
+        (_ProviderReadTimeout, 2),
+        (_WorkerRuntimeError, 0),
+    ],
+)
+async def test_hygiene_worker_error_cooldown_names_the_failure_class(
+    monkeypatch, tmp_path, error_cls, expired_slices
+):
+    """A worker failure records its own class as the cooldown reason.
+
+    The unwind path used to record "cancelled at commit fence" for every
+    exception, the same label the timeout path uses for a fence cancel, so a
+    provider read timeout or a plain worker error read as a hygiene timeout.
+    The label carries the class name only: the reason reaches users and
+    provider exception text may carry credentials.
+    """
+    from hermes_state import SessionDB
+
+    session_id = f"sess-worker-label-{error_cls.__name__}-{expired_slices}"
+    cleanup_done = threading.Event()
+    extend_calls = _count_extend_calls(monkeypatch)
+
+    def _compress(self, messages, *_args, **_kwargs):
+        _wait_for_expired_slices(extend_calls, expired_slices)
+        raise error_cls("provider said sk-test-not-a-real-key")
+
+    agent_cls = _hygiene_stub_agent(session_id, _compress, cleanup_done)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, agent_cls, db, session_id
+        )
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+
+        assert result == "ok"
+        assert runner._run_agent.await_count == 1
+        assert len(extend_calls) >= expired_slices
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None and state["remaining_seconds"] > 0
+        assert state["error"] == (
+            f"session hygiene compression failed: {error_cls.__name__}"
+        )
+        assert "sk-test" not in state["error"]
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_host_cancel_keeps_the_fence_cancel_cooldown_label(
+    monkeypatch, tmp_path
+):
+    """Host cancellation (restart drain) is not a worker failure: it keeps
+    the fence-cancel label that the unwind path has always recorded."""
+    from hermes_state import SessionDB
+
+    session_id = "sess-host-cancel-label"
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cleanup_done = threading.Event()
+
+    def _compress(self, messages, *_args, **_kwargs):
+        worker_started.set()
+        release_worker.wait(timeout=5)
+        return (messages, None)
+
+    agent_cls = _hygiene_stub_agent(session_id, _compress, cleanup_done)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, agent_cls, db, session_id
+        )
+        task = asyncio.create_task(runner._handle_message(event))
+        assert await asyncio.to_thread(worker_started.wait, 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None
+        assert state["error"] == "session hygiene compression cancelled at commit fence"
+        release_worker.set()
+        await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+    finally:
+        release_worker.set()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_wait_wakes_promptly_for_a_worker_slower_than_a_slice(
+    monkeypatch, tmp_path, caplog
+):
+    """Slow wake: the worker outlives two wait slices, then finishes partway
+    through the third. The host must keep waiting through the expired slices
+    and then resume as soon as the worker finishes, not at the end of the
+    0.25s slice it is sleeping in.
+
+    Host resumption is timed at its first read after the wait loop, the
+    ``_last_compaction_in_place`` check.
+    """
+    from hermes_state import SessionDB
+
+    session_id = "sess-slow-wake"
+    cleanup_done = threading.Event()
+    extend_calls = _count_extend_calls(monkeypatch)
+    finished_at = []
+    resumed_at = []
+
+    def _compress(self, messages, *_args, **_kwargs):
+        _wait_for_expired_slices(extend_calls, 2)
+        time.sleep(0.03)
+        finished_at.append(time.monotonic())
+        return (messages, None)
+
+    def _in_place(self):
+        resumed_at.append(time.monotonic())
+        return False
+
+    agent_cls = _hygiene_stub_agent(
+        session_id,
+        _compress,
+        cleanup_done,
+        _last_compaction_in_place=property(_in_place),
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, agent_cls, db, session_id
+        )
+        caplog.set_level("INFO", logger="gateway.run")
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=15)
+
+        assert result == "ok"
+        assert runner._run_agent.await_count == 1
+        assert len(extend_calls) >= 2, (
+            f"expected two expired slices before the wake, got {len(extend_calls)}"
+        )
+        assert finished_at and resumed_at, "the worker result was never consumed"
+        wake_latency = resumed_at[0] - finished_at[0]
+        assert wake_latency < 0.15, (
+            f"host resumed {wake_latency:.3f}s after the worker finished; "
+            "it slept out the slice instead of waiting on completion"
+        )
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("auto-compress failed" in m for m in messages)
+        assert not any("no progress" in m or "total ceiling" in m for m in messages)
+        assert db.get_compression_failure_cooldown(session_id) is None
+    finally:
+        db.close()
+
+
+def _capture_hygiene_future(monkeypatch, loop, agent_created, replace=None):
+    """Record the executor future created for the hygiene worker.
+
+    The hygiene worker is the first ``run_in_executor`` call after the stub
+    agent is built. ``replace`` substitutes that future, for a worker that
+    the executor cancelled before it ever started.
+    """
+    captured = {}
+    real_run_in_executor = loop.run_in_executor
+
+    def _run_in_executor(executor, func, *args):
+        if agent_created.is_set() and "future" not in captured:
+            future = replace() if replace else real_run_in_executor(executor, func, *args)
+            captured["future"] = future
+            return future
+        return real_run_in_executor(executor, func, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", _run_in_executor)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_hygiene_cancelled_worker_future_while_running_is_handled(
+    monkeypatch, tmp_path, caplog
+):
+    """The worker's executor future is cancelled while the worker still runs.
+
+    ``future.result()`` used to raise ``CancelledError`` into the host. That
+    escaped the ``except Exception`` guard around hygiene and cancelled the
+    whole user turn, and deferred cleanup waited on the cancelled future, so
+    the agent was never closed. The turn now continues uncompressed, the
+    cooldown names the cancellation, commit admission is revoked, and cleanup
+    waits for the worker thread itself to exit.
+    """
+    from hermes_state import SessionDB
+
+    session_id = "sess-cancelled-future-running"
+    agent_created = threading.Event()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cleanup_done = threading.Event()
+    late_commit = []
+
+    def _compress(self, messages, *_args, commit_fence=None, **_kwargs):
+        worker_started.set()
+        release_worker.wait(timeout=5)
+        late_commit.append(commit_fence.begin_commit())
+        return (messages, None)
+
+    base_cls = _hygiene_stub_agent(session_id, _compress, cleanup_done)
+
+    class CancelledFutureAgent(base_cls):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            agent_created.set()
+
+    captured = _capture_hygiene_future(
+        monkeypatch, asyncio.get_running_loop(), agent_created
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, CancelledFutureAgent, db, session_id
+        )
+        caplog.set_level("WARNING", logger="gateway.run")
+        task = asyncio.create_task(runner._handle_message(event))
+        assert await asyncio.to_thread(worker_started.wait, 2)
+        assert captured["future"].cancel()
+
+        result = await asyncio.wait_for(task, timeout=5)
+
+        assert result == "ok"
+        assert runner._run_agent.await_count == 1
+        assert any(
+            "Session hygiene auto-compress failed" in r.getMessage()
+            and "cancelled" in r.getMessage()
+            for r in caplog.records
+        )
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None and state["remaining_seconds"] > 0
+        assert state["error"] == "session hygiene compression worker was cancelled"
+        # The worker thread is still running: its agent must not be closed.
+        await asyncio.sleep(0.05)
+        assert not cleanup_done.is_set()
+
+        release_worker.set()
+        assert await asyncio.to_thread(cleanup_done.wait, 2), (
+            "deferred cleanup never ran after the worker thread exited"
+        )
+        assert late_commit == [False], "a cancelled worker must not commit"
+        for _ in range(100):
+            if not getattr(runner, "_deferred_agent_cleanup_tasks", set()):
+                break
+            await asyncio.sleep(0.01)
+        assert not getattr(runner, "_deferred_agent_cleanup_tasks", set())
+    finally:
+        release_worker.set()
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_hygiene_worker_future_cancelled_before_start_is_handled(
+    monkeypatch, tmp_path
+):
+    """The executor cancelled the worker before it started (for example a
+    shutdown with ``cancel_futures=True``). No thread will ever use the agent,
+    so the turn continues and the agent is cleaned up at once."""
+    from hermes_state import SessionDB
+
+    session_id = "sess-cancelled-future-queued"
+    agent_created = threading.Event()
+    cleanup_done = threading.Event()
+    compress_calls = []
+
+    def _compress(self, messages, *_args, **_kwargs):
+        compress_calls.append(1)
+        return (messages, None)
+
+    base_cls = _hygiene_stub_agent(session_id, _compress, cleanup_done)
+
+    class QueuedCancelAgent(base_cls):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            agent_created.set()
+
+    loop = asyncio.get_running_loop()
+
+    def _cancelled_future():
+        future = loop.create_future()
+        future.cancel()
+        return future
+
+    _capture_hygiene_future(monkeypatch, loop, agent_created, replace=_cancelled_future)
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id, "telegram")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, QueuedCancelAgent, db, session_id
+        )
+        result = await asyncio.wait_for(runner._handle_message(event), timeout=5)
+
+        assert result == "ok"
+        assert runner._run_agent.await_count == 1
+        assert compress_calls == []
+        state = db.get_compression_failure_cooldown(session_id)
+        assert state is not None
+        assert state["error"] == "session hygiene compression worker was cancelled"
+        assert await asyncio.to_thread(cleanup_done.wait, 2), (
+            "an agent whose worker never started was never cleaned up"
+        )
+    finally:
+        db.close()

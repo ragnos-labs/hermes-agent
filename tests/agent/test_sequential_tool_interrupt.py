@@ -354,3 +354,115 @@ def test_genuine_wall_clock_timeout_still_synthesizes_timeout(
     assert 0.25 <= elapsed < 3.0
     assert 1 <= agent.polls <= 20
     assert any(kw.get("status") == "timeout" for kw in _fast_polls)
+
+
+# ---------------------------------------------------------------------------
+# Slow wake: the tool outlives one or more wait slices
+# ---------------------------------------------------------------------------
+
+
+def _finish_after_polls(agent, polls, outcome):
+    """Middleware that finishes once the host loop has polled ``polls`` times.
+
+    The loop polls the interrupt flag only after a wait slice expired with
+    the tool still running, so ``polls`` counts expired slices.
+    """
+
+    def _fake_middleware(agent_arg, **kwargs):
+        deadline = time.monotonic() + 5
+        while agent.polls < polls and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    return _fake_middleware
+
+
+def _run_web_extract(agent, call_id):
+    return _run_sequential_tool_execution_middleware(
+        agent,
+        function_name="web_extract",
+        function_args={},
+        effective_task_id="t",
+        tool_call_id=call_id,
+        execute=lambda a: "unused",
+    )
+
+
+def test_slow_tool_result_returns_after_slices_expire(monkeypatch, _fast_polls):
+    """A tool slower than several slices still returns its own result."""
+
+    agent = _PollCountingAgent()
+    managed = _ManagedToolResult(
+        result="slow result", args={}, middleware_trace=[],
+        blocked=False, dispatched=True,
+    )
+    monkeypatch.setattr(
+        tool_executor, "_run_agent_tool_execution_middleware",
+        _finish_after_polls(agent, 3, managed),
+    )
+    monkeypatch.setattr(
+        tool_executor, "_resolve_sequential_tool_timeout", lambda: 5.0
+    )
+
+    result = _run_web_extract(agent, "call_slow_1")
+
+    assert result is managed
+    assert agent.polls >= 3
+    assert not _fast_polls, "a slow result is not a synthesized terminal result"
+
+
+def test_slow_tool_timeout_error_propagates_after_slices_expire(
+    monkeypatch, _fast_polls
+):
+    """A tool that raises ``TimeoutError`` after several slices expired
+    propagates it at once instead of spinning on the finished future."""
+
+    agent = _PollCountingAgent()
+    exc = _ProviderReadTimeout("provider read timed out")
+    monkeypatch.setattr(
+        tool_executor, "_run_agent_tool_execution_middleware",
+        _finish_after_polls(agent, 3, exc),
+    )
+    monkeypatch.setattr(
+        tool_executor, "_resolve_sequential_tool_timeout", lambda: None
+    )
+
+    with pytest.raises(_ProviderReadTimeout) as raised:
+        _run_web_extract(agent, "call_slow_2")
+
+    assert raised.value is exc
+    assert agent.polls >= 3
+    assert not _fast_polls
+
+
+def test_wait_wakes_when_tool_finishes_mid_slice(monkeypatch, _fast_polls):
+    """The loop waits on completion, so a tool that finishes 0.2s into a 5s
+    slice returns in about 0.2s, not at the end of the slice."""
+
+    monkeypatch.setattr(tool_executor, "_SEQUENTIAL_INTERRUPT_POLL_SECONDS", 5.0)
+    agent = _PollCountingAgent()
+    managed = _ManagedToolResult(
+        result="quick result", args={}, middleware_trace=[],
+        blocked=False, dispatched=True,
+    )
+
+    def _fake_middleware(agent_arg, **kwargs):
+        time.sleep(0.2)
+        return managed
+
+    monkeypatch.setattr(
+        tool_executor, "_run_agent_tool_execution_middleware", _fake_middleware
+    )
+    monkeypatch.setattr(
+        tool_executor, "_resolve_sequential_tool_timeout", lambda: None
+    )
+
+    t0 = time.monotonic()
+    result = _run_web_extract(agent, "call_wake_1")
+    elapsed = time.monotonic() - t0
+
+    assert result is managed
+    assert elapsed < 2.0, f"loop slept out the slice ({elapsed:.2f}s)"
+    assert agent.polls == 0
