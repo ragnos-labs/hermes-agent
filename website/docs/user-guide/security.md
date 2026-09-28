@@ -291,6 +291,14 @@ These categories are always denied, even when `HERMES_WRITE_SAFE_ROOT` is unset:
 | OS credential stores | `~/.ssh/` (keys, `authorized_keys`), `~/.aws/`, `~/.kube/`, `/etc/sudoers`, `~/.netrc` |
 | Hermes credential stores | `auth.json`, `.env`, `.anthropic_oauth.json`, `mcp-tokens/`, `pairing/` under HERMES_HOME (active profile and global root) |
 | Project secret files | `.env`, `.env.local`, `.env.production`, `.envrc` anywhere on disk |
+| Hermes control state | `config.yaml`, `plugins/`, `hooks/`, `scripts/`, `cron/jobs.json`, `webhook_subscriptions.json`, `profile.yaml`, `governance.env` and other profiles under HERMES_HOME |
+| Startup code | the running Hermes install's source directory, its Python environment (`sys.prefix` of a virtual environment and every site-packages directory, where a `.pth` file runs at interpreter start), `~/.config/systemd/user/` and `~/Library/LaunchAgents/` |
+
+On case-insensitive filesystems (macOS and Windows defaults) these checks ignore
+case, so `PLUGINS/x.py` is denied like `plugins/x.py`. The startup-code
+directories are resolved from the running process. Running Hermes from a
+source checkout therefore stops the agent from editing that checkout with
+`write_file` or `patch`; use a separate clone for work on Hermes itself.
 
 Sensitive paths inside the safe root are still blocked — pointing `HERMES_WRITE_SAFE_ROOT` at `$HOME` does not allow writing `~/.ssh/id_rsa`.
 
@@ -321,6 +329,8 @@ export HERMES_WRITE_SAFE_ROOT=/path/to/project:/home/you/.hermes
 ```
 
 Unset the variable to restore unrestricted writes (subject to the protected-path denylist). Full reference: [HERMES_WRITE_SAFE_ROOT](../reference/environment-variables.md#hermes_write_safe_root).
+
+**Recommended for deployments.** The denylist covers known control and startup paths; it cannot list every file some other program on the host will later execute. On a server or shared deployment, set `HERMES_WRITE_SAFE_ROOT` to the directories the agent is meant to change (for example its workspace and `HERMES_HOME`) so everything else is blocked by default.
 
 ### Cron and other Hermes state
 

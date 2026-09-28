@@ -701,8 +701,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
     # this file.
+    from agent.file_safety import _same_path
+
     hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+    if hermes_config and (
+        _same_path(resolved, hermes_config) or _same_path(normalized, hermes_config)
+    ):
         return (
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
@@ -711,10 +715,14 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # Same reasoning for the rest of the HERMES_HOME control state: plugins,
     # hooks, cron jobs, webhook routes and profiles each let a write widen the
     # agent's tools or run code on the next start (see agent/file_safety.py).
-    from agent.file_safety import get_write_denied_error, is_hermes_control_path
+    from agent.file_safety import (
+        get_write_denied_error,
+        is_hermes_control_path,
+        is_startup_code_path,
+    )
 
     for candidate in (resolved, normalized):
-        if is_hermes_control_path(candidate):
+        if is_hermes_control_path(candidate) or is_startup_code_path(candidate):
             return get_write_denied_error(candidate) or (
                 f"Refusing to write to Hermes control state: {filepath}"
             )

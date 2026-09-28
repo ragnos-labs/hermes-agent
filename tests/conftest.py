@@ -598,6 +598,29 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _allow_writes_in_source_checkout(monkeypatch):
+    """Let file-tool tests write inside this checkout.
+
+    ``agent.file_safety`` denies writes to the running install's source root
+    (see tests/agent/test_file_safety_startup_code.py). Tests run with the
+    checkout as their working directory and write relative paths there, so
+    the source root is dropped from the deny list here; the interpreter's
+    environment stays denied. The startup-code tests restore the real roots.
+    """
+    try:
+        import agent.file_safety as _file_safety
+    except Exception:
+        return
+    _real_roots = _file_safety._install_code_roots
+    _source_root = os.path.realpath(str(Path(_file_safety.__file__).resolve().parent.parent))
+
+    def _roots_without_source_root():
+        return tuple(root for root in _real_roots() if root != _source_root)
+
+    monkeypatch.setattr(_file_safety, "_install_code_roots", _roots_without_source_root)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser

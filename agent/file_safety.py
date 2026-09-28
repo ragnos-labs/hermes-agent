@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import os
+import site
+import sys
+import sysconfig
 from pathlib import Path
 from typing import Optional
 
@@ -132,12 +136,12 @@ def build_write_approval_paths(home: str) -> set[str]:
 # HERMES_HOME entries that decide which code runs and which tools the model
 # gets. A model that can write these can widen its own tool surface on the
 # next start or tick (a user plugin overrides a bundled one of the same name,
-# gateway hooks run any handler, a cron job or webhook route carries its own
-# toolset list, a profile.yaml marks the install as bot-managed,
-# governance.env holds the tool-call gate policy). They sit
-# next to config.yaml and .env as write-denied control state; change them
-# with the ``hermes`` CLI instead.
-_HERMES_CONTROL_DIRS = ("plugins", "hooks")
+# gateway hooks run any handler, cron job scripts run on the next tick, a
+# cron job or webhook route carries its own toolset list, a profile.yaml
+# marks the install as bot-managed, governance.env holds the tool-call gate
+# policy). They sit next to config.yaml and .env as write-denied control
+# state; change them with the ``hermes`` CLI instead.
+_HERMES_CONTROL_DIRS = ("plugins", "hooks", "scripts")
 _HERMES_CONTROL_FILES = (
     os.path.join("cron", "jobs.json"),
     "webhook_subscriptions.json",
@@ -146,8 +150,92 @@ _HERMES_CONTROL_FILES = (
 )
 
 
+#: Filesystems that ignore case by default. On these, ``PLUGINS/x.py`` and
+#: ``plugins/x.py`` name the same file, so path checks compare case-folded.
+_CASE_INSENSITIVE_PLATFORMS = ("darwin", "win32", "cygwin")
+
+
+def _fold(path: str) -> str:
+    """Normalize ``path`` for comparison on case-insensitive filesystems."""
+    if sys.platform in _CASE_INSENSITIVE_PLATFORMS:
+        return os.path.normcase(path).casefold()
+    return path
+
+
 def _is_under(resolved: str, base: str) -> bool:
+    resolved, base = _fold(resolved), _fold(base)
     return resolved == base or resolved.startswith(base + os.sep)
+
+
+def _same_path(resolved: str, other: str) -> bool:
+    return _fold(resolved) == _fold(other)
+
+
+@functools.lru_cache(maxsize=1)
+def _install_code_roots() -> tuple[str, ...]:
+    """Directories holding the code this process runs, resolved at runtime.
+
+    The source root of the running Hermes install (the directory above this
+    package) and the interpreter's environment: ``sys.prefix`` for a virtual
+    environment, and every site-packages directory the interpreter reads
+    (including the user site), where a dropped ``.pth`` file runs at every
+    interpreter start. A default install keeps both the source and its
+    virtual environment under ``$HERMES_HOME/hermes-agent``; these are
+    resolved from the running process rather than assumed.
+    """
+    candidates: list[str] = [str(Path(__file__).resolve().parent.parent)]
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        candidates.append(sys.prefix)
+    for key in ("purelib", "platlib"):
+        try:
+            value = sysconfig.get_paths().get(key)
+        except Exception:
+            value = None
+        if value:
+            candidates.append(value)
+    try:
+        candidates.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        if site.ENABLE_USER_SITE:
+            candidates.append(site.getusersitepackages())
+    except Exception:
+        pass
+    roots: list[str] = []
+    for candidate in candidates:
+        try:
+            real = os.path.realpath(candidate)
+        except Exception:
+            continue
+        if real and real != os.sep and real not in roots:
+            roots.append(real)
+    return tuple(roots)
+
+
+def _autostart_dirs(home: str) -> list[str]:
+    """User service directories whose entries start programs at login."""
+    return [
+        os.path.realpath(os.path.join(home, ".config", "systemd", "user")),
+        os.path.realpath(os.path.join(home, "Library", "LaunchAgents")),
+    ]
+
+
+def is_startup_code_path(path: str) -> bool:
+    """True when ``path`` is code the running install or the user session starts.
+
+    Covers the running install's source root, its interpreter's
+    ``sys.prefix`` (virtual environments) and site-packages directories, and
+    the per-user autostart directories (``~/.config/systemd/user`` and
+    ``~/Library/LaunchAgents``). A write there persists code that runs
+    outside the agent's tool bounds on the next start.
+    """
+    resolved = os.path.realpath(os.path.expanduser(str(path)))
+    home = os.path.realpath(os.path.expanduser("~"))
+    for base in (*_install_code_roots(), *_autostart_dirs(home)):
+        if _is_under(resolved, base):
+            return True
+    return False
 
 
 def is_hermes_control_path(path: str) -> bool:
@@ -175,7 +263,7 @@ def is_hermes_control_path(path: str) -> bool:
             if _is_under(resolved, os.path.join(base_real, name)):
                 return True
         for name in _HERMES_CONTROL_FILES:
-            if resolved == os.path.join(base_real, name):
+            if _same_path(resolved, os.path.join(base_real, name)):
                 return True
 
     try:
@@ -187,7 +275,7 @@ def is_hermes_control_path(path: str) -> bool:
     if _is_under(resolved, profiles_real):
         # The active profile's home is handled by the per-base rules above.
         if (
-            home_real != root_real
+            not _same_path(home_real, root_real)
             and _is_under(home_real, profiles_real)
             and _is_under(resolved, home_real)
         ):
@@ -197,7 +285,8 @@ def is_hermes_control_path(path: str) -> bool:
 
 
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Return ``'credential'``, ``'hermes_control'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    """Return ``'credential'``, ``'hermes_control'``, ``'startup_code'``,
+    ``'safe_root'``, or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
@@ -206,17 +295,20 @@ def _classify_write_denial(path: str) -> Optional[str]:
     # their approval prompt, and only blocked for non-interactive callers
     # via get_write_approval_error(). Checked before the credential deny so
     # the ``.ssh/`` directory prefix below doesn't swallow the config file.
-    if resolved in build_write_approval_paths(home):
+    folded = _fold(resolved)
+    if folded in {_fold(p) for p in build_write_approval_paths(home)}:
         return None
 
-    if resolved in build_write_denied_paths(home):
+    if folded in {_fold(p) for p in build_write_denied_paths(home)}:
         return "credential"
     for prefix in build_write_denied_prefixes(home):
-        if resolved.startswith(prefix):
+        if folded.startswith(_fold(prefix)):
             return "credential"
 
     if is_hermes_control_path(resolved):
         return "hermes_control"
+    if is_startup_code_path(resolved):
+        return "startup_code"
 
     mcp_tokens_dir_name = "mcp-tokens"
 
@@ -234,22 +326,22 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # generic file tools rewrite state.db or legacy JSON snapshots can
         # falsify conversation history and invalidate resume/compression state.
         try:
-            if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
+            if _same_path(resolved, os.path.realpath(os.path.join(base_real, "state.db"))):
                 return True
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
-            if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
+            if _is_under(resolved, sessions_real):
                 return True
         except Exception:
             pass
         try:
             mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
-            if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
+            if _is_under(resolved, mcp_real):
                 return "credential"
         except Exception:
             pass
         try:
             pairing_real = os.path.realpath(os.path.join(base_real, "pairing"))
-            if resolved == pairing_real or resolved.startswith(pairing_real + os.sep):
+            if _is_under(resolved, pairing_real):
                 return "credential"
         except Exception:
             pass
@@ -283,6 +375,13 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
             "cron jobs, webhook routes, profiles or governance settings). The "
             "agent cannot change which code runs or which tools it gets; ask "
             "the user to make this change with the 'hermes' CLI or an editor."
+        )
+    if denial == "startup_code":
+        return (
+            f"{verb} denied: '{path}' is code that runs on the next start (the "
+            "Hermes install, its Python environment or a login autostart "
+            "directory). The agent cannot change the code that enforces its "
+            "own limits; ask the user to make this change."
         )
     if denial == "safe_root":
         roots_display = os.pathsep.join(sorted(get_safe_write_roots()))
