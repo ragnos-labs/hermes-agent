@@ -84,6 +84,18 @@ export function buildCronJobPayload(
   };
 }
 
+/** Build the update payload for saving the edit form opened on `job`. The
+ * form was pre-filled from `cronJobFormFromJob(job)`, so its name is the
+ * shown name `buildCronJobPayload` compares the name field against. */
+export function buildCronJobEditPayload(
+  job: CronJob,
+  form: CronJobFormState,
+): CronJobMutation {
+  return buildCronJobPayload(form, {
+    shownName: cronJobFormFromJob(job).name,
+  });
+}
+
 export function cronJobHasExecutionContent(
   job: Pick<CronJobMutation, "prompt" | "skills" | "script">,
 ): boolean {

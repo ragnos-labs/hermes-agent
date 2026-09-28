@@ -76,8 +76,9 @@ import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 import { BlueprintSlotControl, blueprintSlotHelp, cleanBlueprintFieldError, initialBlueprintValues } from './blueprints'
 import { mutateAndRefreshCronJobs, refreshCronJobs, triggerAndRefreshCronJobs } from './cron-actions'
 import {
-  cronEditorUpdates,
+  cronJobEditUpdates,
   jobIsScriptOnly,
+  jobName,
   parseCronDeliveryTargets,
   toggleCronDeliveryTarget,
   validateCronEditor
@@ -119,10 +120,6 @@ const STATE_TONE: Record<string, PanelPillTone> = {
 }
 
 const truncate = (value: string, max = 80): string => (value.length > max ? `${value.slice(0, max)}…` : value)
-
-function jobName(job: CronJob): string {
-  return asText(job.name).trim()
-}
 
 function jobPrompt(job: CronJob): string {
   return asText(job.prompt)
@@ -578,14 +575,12 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
 
       notify({ kind: 'success', title: c.created, message: truncate(jobTitle(created), 60) })
     } else if (editor.mode === 'edit') {
-      const scriptOnlyJob = jobIsScriptOnly(editor.job)
-
       const {
         value: updated,
         refreshError,
         stale
       } = await mutateAndRefreshCronJobs(profile, () =>
-        updateCronJob(editor.job.id, cronEditorUpdates(values, { scriptOnlyJob, shownName: jobName(editor.job) }))
+        updateCronJob(editor.job.id, cronJobEditUpdates(editor.job, values))
       )
 
       if (stale || !updated) {

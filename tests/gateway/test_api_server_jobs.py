@@ -557,3 +557,54 @@ class TestCronPromptScanParity:
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
 
+
+
+# ---------------------------------------------------------------------------
+# PATCH from a client that loaded the job before an agent prompt edit
+# ---------------------------------------------------------------------------
+
+class TestStaleNameResend:
+    """``PATCH /api/jobs/{id}`` passes ``name`` straight to ``update_job``.
+    A client that re-sends the name it loaded after the agent changed the
+    prompt must not mark the old prompt's text as an operator name."""
+
+    SECRET_PROMPT = "sk-live-7f3a9c SECRET_PROMPT_MARKER rotate the vault token now"
+
+    @pytest.fixture
+    def cron_store(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+        return jobs
+
+    @pytest.mark.asyncio
+    async def test_stale_resend_is_not_a_rename(self, adapter, cron_store):
+        from hermes_cli.cron import cron_unbound_jobs_report
+
+        job = cron_store.create_job(
+            prompt=self.SECRET_PROMPT, schedule="every 1h", name="vault rotation"
+        )
+        url = f"/api/jobs/{job['id']}"
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_get", cron_store.get_job
+            ), patch(f"{_MOD}._cron_update", cron_store.update_job), patch(
+                f"{_MOD}._notify_cron_provider_jobs_changed", lambda: None
+            ):
+                assert (await cli.patch(url, json={"name": ""})).status == 200
+                shown = (await (await cli.get(url)).json())["job"]["name"]
+                assert "SECRET_PROMPT_MARKER" in shown
+                cron_store.update_job(
+                    job["id"], {"prompt": "agent replacement prompt"},
+                    mark_name_explicit=False,
+                )
+                resp = await cli.patch(url, json={"name": shown, "enabled": False})
+                assert resp.status == 200
+
+        assert "name_explicit" not in cron_store.get_job(job["id"])
+        (entry,) = cron_unbound_jobs_report()["jobs"]
+        assert entry["name"] is None
+        assert entry["name_redacted"] is True

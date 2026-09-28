@@ -905,13 +905,19 @@ narrow its toolsets.
 A job created without a name is named after the start of its prompt, skill
 or script, and a name an agent chose through the `cronjob` tool can copy
 prompt content. The audit therefore prints a name only when an operator set
-or changed it (CLI, dashboard, desktop app). The dashboard and desktop app
-send the name only when you edit the name field, and re-sending the name an
-editor showed does not count. Every other name, including the names of jobs
-created before this marker existed, is printed as `"name": null` with
-`"name_redacted": true`; use the id to find the job. `hermes cron doctor`
-also prints a one-line warning with the number of unbound jobs, without
-changing its exit status.
+or changed it (CLI, dashboard, desktop app). A name does not follow later
+prompt, skill or script edits, and clearing a name names the job after the
+start of its current prompt, skill or script. Saving a job with the name
+Hermes showed for it therefore does not count as a change, even if the
+prompt changed in the meantime. The dashboard and desktop app send the name
+only when you edit the name field. An older client that re-sends the name
+it loaded after another surface renamed or cleared the job changes the name
+back, and that counts as a change. To stop the audit printing a name, clear
+it in the dashboard or desktop app. Every other name, including the names
+of jobs created before this marker existed, is printed as `"name": null`
+with `"name_redacted": true`; use the id to find the job.
+`hermes cron doctor` also prints a one-line warning with the number of
+unbound jobs, without changing its exit status.
 
 ### Turning MCP off everywhere
 
