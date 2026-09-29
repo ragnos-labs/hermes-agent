@@ -169,6 +169,57 @@ def test_multiple_messages_keep_turn_and_usage_checks():
     assert failure.value.code == "unexpected_tool_execution"
 
 
+def after_completion(texts, *late):
+    return "\n".join([events(messages=texts), *(json.dumps(event) for event in late)])
+
+
+def late_message(text):
+    return {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+
+
+def test_message_after_turn_completed_is_refused():
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(after_completion([envelope("First")], late_message(envelope("Late"))))
+    assert failure.value.code == "invalid_events"
+    assert str(failure.value) == "Codex event after turn completed"
+
+
+def test_only_message_after_turn_completed_is_refused():
+    # Behavior change: the base accepted a lone message that followed turn.completed.
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(after_completion([], late_message(envelope("Late"))))
+    assert failure.value.code == "invalid_events"
+    assert str(failure.value) == "Codex event after turn completed"
+
+
+@pytest.mark.parametrize("late", [
+    {"type": "item.started", "item": {"type": "agent_message"}},
+    {"type": "item.updated", "item": {"type": "agent_message", "text": "partial"}},
+    {"type": "item.completed", "item": {"type": "reasoning", "text": "late"}},
+    {"type": "turn.started"},
+])
+def test_item_or_turn_event_after_turn_completed_is_refused(late):
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(after_completion([envelope("First")], late))
+    assert failure.value.code == "invalid_events"
+
+
+def test_normal_stream_with_events_before_completion_passes():
+    stream = "\n".join(json.dumps(event) for event in [
+        {"type": "thread.started", "thread_id": "test"},
+        {"type": "turn.started"},
+        {"type": "item.started", "item": {"type": "reasoning"}},
+        {"type": "item.completed", "item": {"type": "reasoning", "text": "thinking"}},
+        {"type": "item.started", "item": {"type": "agent_message"}},
+        {"type": "item.updated", "item": {"type": "agent_message", "text": "partial"}},
+        late_message(envelope("Final")),
+        {"type": "turn.completed", "usage": USAGE},
+    ])
+    answer, usage = parse_events(stream)
+    assert answer == envelope("Final")
+    assert usage["agent_message_count"] == 1
+
+
 def test_schema_validation_applies_to_the_last_message(monkeypatch):
     spawn_printing(monkeypatch, events(messages=[envelope("Earlier"), "not the JSON envelope"]))
     with pytest.raises(CodexExecError) as failure:

@@ -273,6 +273,8 @@ def parse_events(text: str) -> tuple[str, dict[str, int]]:
                     raise CodexExecError("invalid_events", "Invalid Codex assistant response")
                 answer = item["text"]
                 messages += 1
+        if completed and kind != "turn.completed" and kind.startswith(("item.", "turn.")):
+            raise CodexExecError("invalid_events", "Codex event after turn completed")
         if kind == "turn.completed":
             if completed:
                 raise CodexExecError("invalid_events", "Multiple Codex turns in one response")

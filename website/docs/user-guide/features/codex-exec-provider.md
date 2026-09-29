@@ -11,6 +11,7 @@ dispatch, memory, session search and auxiliary tasks. Each model request runs
 `codex exec` and translates a schema-validated response into Hermes text or
 tool calls. It requires a separately installed Codex CLI with its native login
 already configured, plus the `hermes-agent[codex-exec]` dependency extra.
+When a turn has several assistant messages, the last one is used and validated.
 
 ```yaml
 model:
