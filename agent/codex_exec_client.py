@@ -234,7 +234,17 @@ def _stop(process: subprocess.Popen) -> None:
 
 
 def parse_events(text: str) -> tuple[str, dict[str, int]]:
+    """Return the turn's last assistant message and its token usage.
+
+    Codex may complete more than one agent_message in a turn (for example a
+    progress note before the schema-constrained answer). Codex itself treats
+    the last one as the turn's result (``--output-last-message``), so the last
+    message is returned and still passes through ``decode_response``. The
+    returned usage carries ``agent_message_count``, a count only: message text
+    is never recorded.
+    """
     answer = None
+    messages = 0
     usage = None
     completed = False
     for line in text.splitlines():
@@ -259,9 +269,12 @@ def parse_events(text: str) -> tuple[str, dict[str, int]]:
             if item.get("type") not in {"reasoning", "agent_message"}:
                 raise CodexExecError("unexpected_tool_execution", "Model-only Codex attempted tool execution")
             if kind == "item.completed" and item.get("type") == "agent_message":
-                if answer is not None or not isinstance(item.get("text"), str):
-                    raise CodexExecError("invalid_events", "Ambiguous Codex assistant response")
+                if not isinstance(item.get("text"), str):
+                    raise CodexExecError("invalid_events", "Invalid Codex assistant response")
                 answer = item["text"]
+                messages += 1
+        if completed and kind != "turn.completed" and kind.startswith(("item.", "turn.")):
+            raise CodexExecError("invalid_events", "Codex event after turn completed")
         if kind == "turn.completed":
             if completed:
                 raise CodexExecError("invalid_events", "Multiple Codex turns in one response")
@@ -274,7 +287,7 @@ def parse_events(text: str) -> tuple[str, dict[str, int]]:
             raise CodexExecError("invalid_usage", "Codex returned invalid token usage")
     if usage["cached_input_tokens"] > usage["input_tokens"]:
         raise CodexExecError("invalid_usage", "Cached usage exceeds input usage")
-    return answer, usage
+    return answer, {**usage, "agent_message_count": messages}
 
 
 class CodexExecClient:
@@ -391,6 +404,8 @@ class CodexExecClient:
                 prompt_tokens=usage["input_tokens"], completion_tokens=usage["output_tokens"],
                 total_tokens=usage["input_tokens"] + usage["output_tokens"],
                 prompt_tokens_details=SimpleNamespace(cached_tokens=usage["cached_input_tokens"]),
+                **({"agent_message_count": usage["agent_message_count"]}
+                   if type(usage.get("agent_message_count")) is int else {}),
             ),
         )
         return completion_to_stream_chunks(completion) if kwargs.get("stream") else completion

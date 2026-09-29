@@ -28,13 +28,24 @@ def envelope(content="Ready", calls=None):
     return json.dumps({"content": content, "tool_calls": calls or []})
 
 
-def events(answer=None, usage=None):
+def events(answer=None, usage=None, messages=None):
+    texts = [answer or envelope()] if messages is None else messages
     return "\n".join(json.dumps(event) for event in [
         {"type": "thread.started", "thread_id": "test"},
         {"type": "turn.started"},
-        {"type": "item.completed", "item": {"type": "agent_message", "text": answer or envelope()}},
+        *({"type": "item.completed", "item": {"type": "agent_message", "text": text}} for text in texts),
         {"type": "turn.completed", "usage": usage or USAGE},
     ])
+
+
+_POPEN = subprocess.Popen
+
+
+def spawn_printing(monkeypatch, output):
+    def spawn(argv, **kwargs):
+        return _POPEN([sys.executable, "-c", "print(" + repr(output) + ")"], **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
 
 
 def call(name="memory", arguments='{"content":"A tested lesson"}', call_id="call_1"):
@@ -89,11 +100,166 @@ def test_remote_schema_references_are_not_fetched():
 def test_usage_and_success_must_both_be_present():
     answer, usage = parse_events(events())
     assert answer == envelope()
-    assert usage == USAGE
+    assert usage == {**USAGE, "agent_message_count": 1}
     with pytest.raises(CodexExecError):
         parse_events(events().splitlines()[2])
     with pytest.raises(CodexExecError):
         parse_events(events(usage={**USAGE, "cached_input_tokens": 18}))
+
+
+def test_single_agent_message_is_the_answer():
+    answer, usage = parse_events(events(messages=[envelope("Only")]))
+    assert answer == envelope("Only")
+    assert usage["agent_message_count"] == 1
+
+
+@pytest.mark.parametrize("texts", [
+    ["Checking the request.", envelope("Final")],
+    ["Checking the request.", "Still working.", envelope("Final")],
+    [envelope("Earlier"), envelope("Middle"), envelope("Final")],
+])
+def test_last_agent_message_in_the_turn_is_the_answer(texts):
+    answer, usage = parse_events(events(messages=texts))
+    assert answer == envelope("Final")
+    assert usage["agent_message_count"] == len(texts)
+    assert {key: usage[key] for key in USAGE} == USAGE
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+@pytest.mark.parametrize("text", [None, 5, ["x"], {"text": "x"}])
+def test_non_string_agent_message_is_refused_in_any_position(position, text):
+    texts = [envelope("a"), envelope("b"), envelope("c")]
+    texts[position] = text
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(events(messages=texts))
+    assert failure.value.code == "invalid_events"
+
+
+def test_missing_agent_message_text_is_refused():
+    stream = events(messages=[]).splitlines()
+    stream.insert(2, json.dumps({"type": "item.completed", "item": {"type": "agent_message"}}))
+    with pytest.raises(CodexExecError) as failure:
+        parse_events("\n".join(stream))
+    assert failure.value.code == "invalid_events"
+
+
+def test_turn_without_agent_message_is_refused():
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(events(messages=[]))
+    assert failure.value.code == "incomplete_response"
+
+
+def test_multiple_messages_keep_turn_and_usage_checks():
+    texts = ["Checking.", envelope("Final")]
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(events(messages=texts) + "\n" + json.dumps({"type": "turn.completed", "usage": USAGE}))
+    assert failure.value.code == "invalid_events"
+    with pytest.raises(CodexExecError) as failure:
+        parse_events("\n".join(events(messages=texts).splitlines()[:-1]))
+    assert failure.value.code == "incomplete_response"
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(events(messages=texts, usage={**USAGE, "output_tokens": -1}))
+    assert failure.value.code == "invalid_usage"
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(events(messages=texts) + "\n" + json.dumps({"type": "error", "message": "boom"}))
+    assert failure.value.code == "provider_failed"
+    attempted = json.dumps({"type": "item.started", "item": {"type": "command_execution"}})
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(events(messages=texts) + "\n" + attempted)
+    assert failure.value.code == "unexpected_tool_execution"
+
+
+def after_completion(texts, *late):
+    return "\n".join([events(messages=texts), *(json.dumps(event) for event in late)])
+
+
+def late_message(text):
+    return {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+
+
+def test_message_after_turn_completed_is_refused():
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(after_completion([envelope("First")], late_message(envelope("Late"))))
+    assert failure.value.code == "invalid_events"
+    assert str(failure.value) == "Codex event after turn completed"
+
+
+def test_only_message_after_turn_completed_is_refused():
+    # Behavior change: the base accepted a lone message that followed turn.completed.
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(after_completion([], late_message(envelope("Late"))))
+    assert failure.value.code == "invalid_events"
+    assert str(failure.value) == "Codex event after turn completed"
+
+
+@pytest.mark.parametrize("late", [
+    {"type": "item.started", "item": {"type": "agent_message"}},
+    {"type": "item.updated", "item": {"type": "agent_message", "text": "partial"}},
+    {"type": "item.completed", "item": {"type": "reasoning", "text": "late"}},
+    {"type": "turn.started"},
+])
+def test_item_or_turn_event_after_turn_completed_is_refused(late):
+    with pytest.raises(CodexExecError) as failure:
+        parse_events(after_completion([envelope("First")], late))
+    assert failure.value.code == "invalid_events"
+
+
+def test_normal_stream_with_events_before_completion_passes():
+    stream = "\n".join(json.dumps(event) for event in [
+        {"type": "thread.started", "thread_id": "test"},
+        {"type": "turn.started"},
+        {"type": "item.started", "item": {"type": "reasoning"}},
+        {"type": "item.completed", "item": {"type": "reasoning", "text": "thinking"}},
+        {"type": "item.started", "item": {"type": "agent_message"}},
+        {"type": "item.updated", "item": {"type": "agent_message", "text": "partial"}},
+        late_message(envelope("Final")),
+        {"type": "turn.completed", "usage": USAGE},
+    ])
+    answer, usage = parse_events(stream)
+    assert answer == envelope("Final")
+    assert usage["agent_message_count"] == 1
+
+
+def test_schema_validation_applies_to_the_last_message(monkeypatch):
+    spawn_printing(monkeypatch, events(messages=[envelope("Earlier"), "not the JSON envelope"]))
+    with pytest.raises(CodexExecError) as failure:
+        CodexExecClient(settings={}).create(model="test-model", messages=[])
+    assert failure.value.code == "invalid_response"
+
+    spawn_printing(monkeypatch, events(messages=["Checking the request.", envelope("Final")]))
+    result = CodexExecClient(settings={}).create(model="test-model", messages=[])
+    assert result.choices[0].message.content == "Final"
+
+
+def test_structured_output_validation_applies_to_the_last_message(monkeypatch):
+    request = {"response_format": {"type": "json_schema", "json_schema": {"schema": {
+        "type": "object", "required": ["learned"], "properties": {"learned": {"type": "boolean"}},
+    }}}}
+    spawn_printing(monkeypatch, events(messages=[envelope('{"learned":true}'), envelope('{"learned":"maybe"}')]))
+    with pytest.raises(CodexExecError) as failure:
+        CodexExecClient(settings={}).create(model="test-model", messages=[], **request)
+    assert failure.value.code == "invalid_response"
+
+    spawn_printing(monkeypatch, events(messages=[envelope('{"learned":"maybe"}'), envelope('{"learned":true}')]))
+    result = CodexExecClient(settings={}).create(model="test-model", messages=[], **request)
+    assert result.choices[0].message.content == '{"learned":true}'
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_completion_usage_reports_agent_message_count_only(monkeypatch, count):
+    texts = [f"Private commentary {index}" for index in range(count - 1)] + [envelope("Final")]
+    spawn_printing(monkeypatch, events(messages=texts))
+    result = CodexExecClient(settings={}).create(model="test-model", messages=[])
+    assert result.usage.agent_message_count == count
+    assert type(result.usage.agent_message_count) is int
+    assert "Private commentary" not in repr(result.usage)
+
+
+def test_executor_usage_without_count_is_unchanged():
+    client = CodexExecClient(settings={}, executor=lambda request, reasoning: (envelope(), USAGE))
+    result = client.create(model="test-model", messages=[])
+    assert not hasattr(result.usage, "agent_message_count")
+    assert result.usage.prompt_tokens == 17
 
 
 def test_native_cli_tool_execution_is_rejected():
