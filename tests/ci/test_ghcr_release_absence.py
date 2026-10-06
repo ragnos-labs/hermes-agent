@@ -57,9 +57,7 @@ def test_audited_classifier_runs_outside_an_old_source_checkout(tmp_path):
         capture_output=True,
         text=True,
     ).stdout.strip()
-    classifier_spec = (
-        f"{workflow_sha}:scripts/ci/classify_ghcr_release_absence.py"
-    )
+    classifier_spec = f"{workflow_sha}:scripts/ci/classify_ghcr_release_absence.py"
     expected_blob = subprocess.run(
         ["git", "rev-parse", "--verify", classifier_spec],
         cwd=repo,
@@ -161,3 +159,13 @@ def test_audited_classifier_runs_outside_an_old_source_checkout(tmp_path):
         check=False,
     )
     assert result.returncode == 0
+
+
+def test_exact_fork_digest_absence_can_reconcile_pending_delivery():
+    assert is_explicit_absence(
+        f"ghcr.io/ragnos-labs/hermes-agent@sha256:{'a' * 64}: not found"
+    )
+    assert not is_explicit_absence(f"ghcr.io/other/image@sha256:{'a' * 64}: not found")
+    assert not is_explicit_absence(
+        f"ghcr.io/ragnos-labs/hermes-agent@sha256:{'a' * 64}: not found\nunauthorized"
+    )

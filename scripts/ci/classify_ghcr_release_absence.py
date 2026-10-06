@@ -8,9 +8,7 @@ import sys
 from pathlib import Path
 
 
-FORK_RELEASE_TAG_PATTERN = (
-    r"v[0-9]{4}\.[0-9]+\.[0-9]+(?:\.[0-9]+)?-ragnos\.[1-9][0-9]*"
-)
+FORK_RELEASE_TAG_PATTERN = r"v[0-9]{4}\.[0-9]+\.[0-9]+(?:\.[0-9]+)?-ragnos\.[1-9][0-9]*"
 IMMUTABLE_IMAGE_TAG_PATTERN = rf"(?:sha-[0-9a-f]{{40}}|{FORK_RELEASE_TAG_PATTERN})"
 
 _AMBIGUOUS_ERROR = re.compile(
@@ -24,6 +22,8 @@ _EXPLICIT_ABSENCE = re.compile(
     rf"(?:MANIFEST_UNKNOWN|manifest unknown|"
     rf"ghcr\.io/v2/ragnos-labs/hermes-agent/manifests/{IMMUTABLE_IMAGE_TAG_PATTERN}: not found|"
     rf"ghcr\.io/ragnos-labs/hermes-agent:{IMMUTABLE_IMAGE_TAG_PATTERN}: not found|"
+    r"ghcr\.io/ragnos-labs/hermes-agent@sha256:[0-9a-f]{64}: not found|"
+    r"ghcr\.io/v2/ragnos-labs/hermes-agent/manifests/sha256:[0-9a-f]{64}: not found|"
     rf"unexpected status from HEAD request to "
     rf"https://ghcr\.io/v2/ragnos-labs/hermes-agent/manifests/"
     rf"{IMMUTABLE_IMAGE_TAG_PATTERN}: 404 Not Found)"
